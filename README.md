@@ -79,6 +79,16 @@ npm run build          # 产出 web/dist（index.html + assets）
 - 改界面只需重建 `web/dist`，不必重编 Rust。
 - 三个页面：任务列表（进度/速度/暂停/移除/删除文件）、添加下载、设置（目录/并发/限速/代理/插件模式/HTTP1）。
 
+## 浏览器接管（M6）
+
+ADL 启动后会监听本机 `127.0.0.1:17800`（可用环境变量 `ADL_API_PORT` 改），配合 `browser-extension/` 里的 MV3 扩展，把浏览器下载转交给 ADL。
+
+- 安装：`edge://extensions` 或 `chrome://extensions` → 开启开发者模式 → 「加载解压缩的扩展」→ 选 `browser-extension/` 目录。
+- 浏览器产生下载时，扩展调用本地 API `/add`；成功则取消浏览器原生下载，失败（ADL 未运行/接管关闭）则原样放行，不会丢链接。
+- 需要登录的站：扩展会转发该 URL 的 Cookie。
+- 安全：本地 API 只绑 127.0.0.1 + 随机 token + Origin 校验；细节见 `browser-extension/README.md`。
+- 注意：当前版本**关闭窗口即退出**，所以接管期间 ADL 需保持运行（关闭到托盘为后续项）。未做剪贴板监听。
+
 ## 插件
 
 插件放在 `plugins/<id>/`，由 `plugin.toml` + `main.js` 组成。示例：
@@ -124,7 +134,7 @@ globalThis.onBeforeRequest = function (ctx) {
 - ✅ M3 插件系统（QuickJS + TOML manifest + 权限 + 安全模式）
 - ✅ M4 CLI 完整（配置 + 历史 + 子命令），v0.1 可用
 - ✅ M5 图形界面（wry + WebView2 + 托盘 + Vue SFC 前端）
-- ⬜ M6 浏览器接管（扩展 + 本地 API）
+- ✅ M6 浏览器接管（MV3 扩展 + 本地 API，未做剪贴板）
 
 设计文档见 [docs/DESIGN.md](docs/DESIGN.md)。
 

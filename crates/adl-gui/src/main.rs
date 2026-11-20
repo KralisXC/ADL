@@ -4,6 +4,7 @@
 //! 前端是 Vue SFC（vite 构建产物），通过 `window.ipc.postMessage` 和
 //! `window.__ipcResolve/__ipcEmit` 与 Rust 通信（复用上一版验证过的 IPC 协议）。
 
+mod api_server;
 mod static_server;
 
 use adl_app::config::Config;
@@ -41,11 +42,11 @@ struct Task {
 }
 
 struct Gui {
-    tasks: Mutex<Vec<Task>>,
-    next_id: AtomicU64,
-    rt: tokio::runtime::Runtime,
-    proxy: EventLoopProxy<UserEvent>,
-    cfg: Mutex<Config>,
+    pub(crate) tasks: Mutex<Vec<Task>>,
+    pub(crate) next_id: AtomicU64,
+    pub(crate) rt: tokio::runtime::Runtime,
+    pub(crate) proxy: EventLoopProxy<UserEvent>,
+    pub(crate) cfg: Mutex<Config>,
 }
 
 fn main() {
@@ -78,6 +79,16 @@ fn main() {
         proxy: proxy.clone(),
         cfg: Mutex::new(cfg),
     });
+
+    // 本地 API：供浏览器扩展把下载转交给 ADL
+    let api_port = std::env::var("ADL_API_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(api_server::DEFAULT_PORT);
+    match api_server::start(gui.clone(), api_port) {
+        Ok(p) => eprintln!("[gui] 本地 API http://127.0.0.1:{}", p),
+        Err(e) => eprintln!("[gui] 本地 API 启动失败（{}），浏览器接管不可用", e),
+    }
 
     let window = WindowBuilder::new()
         .with_title("ADL")
@@ -234,7 +245,7 @@ fn handle_ipc(gui: &Arc<Gui>, body: &str) -> Option<String> {
     ))
 }
 
-fn gui_snapshot(gui: &Arc<Gui>) -> Value {
+pub(crate) fn gui_snapshot(gui: &Arc<Gui>) -> Value {
     let tasks = gui.tasks.lock().unwrap();
     let arr: Vec<Value> = tasks
         .iter()
@@ -293,7 +304,7 @@ fn set_settings(gui: &Arc<Gui>, args: &Value) -> Result<Value, String> {
     Ok(settings_json(&cfg))
 }
 
-fn add_task(gui: &Arc<Gui>, args: &Value) -> Result<Value, String> {
+pub(crate) fn add_task(gui: &Arc<Gui>, args: &Value) -> Result<Value, String> {
     let url = args
         .get("url")
         .and_then(|x| x.as_str())
@@ -319,6 +330,29 @@ fn add_task(gui: &Arc<Gui>, args: &Value) -> Result<Value, String> {
     opts.proxy = cfg.proxy_opt();
     if let Some(ua) = cfg.user_agent_opt() {
         opts.user_agent = ua;
+    }
+    // 浏览器接管时可带过来的额外信息
+    if let Some(r) = args.get("referer").and_then(|x| x.as_str()) {
+        if !r.is_empty() {
+            opts.referer = Some(r.to_string());
+        }
+    }
+    if let Some(ua) = args.get("user_agent").and_then(|x| x.as_str()) {
+        if !ua.is_empty() {
+            opts.user_agent = ua.to_string();
+        }
+    }
+    if let Some(obj) = args.get("headers").and_then(|x| x.as_object()) {
+        for (k, v) in obj {
+            if let Some(s) = v.as_str() {
+                opts.headers.push((k.clone(), s.to_string()));
+            }
+        }
+    }
+    if let Some(c) = args.get("cookies").and_then(|x| x.as_str()) {
+        if !c.is_empty() {
+            opts.headers.push(("Cookie".to_string(), c.to_string()));
+        }
     }
 
     let mode = if cfg.mode_trusted() { Mode::Trusted } else { Mode::Safe };

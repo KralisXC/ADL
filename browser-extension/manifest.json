@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "ADL Download Bridge",
+  "version": "0.1.0",
+  "description": "把浏览器里的下载转交给 ADL 下载器（走本机 127.0.0.1 的 API）。",
+  "permissions": ["downloads", "cookies", "storage", "contextMenus"],
+  "host_permissions": ["<all_urls>", "http://127.0.0.1/*", "http://localhost/*"],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_title": "ADL 下载桥", "default_popup": "popup.html" },
+  "options_page": "options.html"
+}

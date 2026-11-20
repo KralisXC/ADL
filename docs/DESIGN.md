@@ -897,7 +897,7 @@ cargo build --release
 | **M3** | hook 管线 + QuickJS + `--safe` | 第一个内置插件跑通 | 5–7 天 | ✅ |
 | **M4** | CLI 完整（配置文件 + 下载历史 + 子命令） | **可发布 v0.1** | 3–5 天 | ✅ |
 | **M5** | wry 窗口 + Vue SFC 前端（vite 构建） | GUI 可用 | 7–10 天 | ✅ |
-| **M6** | 浏览器扩展 + 本地 API | 接管下载 | 7–14 天 | ⬜ |
+| **M6** | 浏览器扩展 + 本地 API | 接管下载 | 7–14 天 | ✅ |
 | **M7** | WASM 后端（可选） | 插件双引擎 | 3–5 天 | ⬜ |
 
 **M1 实际交付**（`E:\ADL`，workspace `crates/adl-core` + `crates/adl-app`）：
@@ -981,6 +981,18 @@ cargo build --release
 - **实测（用 WebView2 远程调试 CDP 驱动真实窗口）**：DOM 挂载 ✓、`window.ipc` 存在 ✓、`get_tasks` → `[]` ✓、`get_settings` → `connections=16/mode=safe` ✓；经 GUI `add` 下载 8 MB 本地文件 → 状态 `completed`、**SHA256 与源文件完全一致**、服务器回显 UA 为 Chrome 浏览器 UA。`adl-gui.exe` ≈ **3.38 MB**（仍在 5 MB 预算内）。
 - **开发/运行**：`cd web; npm run build`，然后运行 `adl-gui.exe`（或设 `ADL_WEB_ROOT` 指到 dist）。改 UI 只需重建 dist，不必重编 Rust。
 - **省磁盘**：`web/node_modules` 是 junction（不占额外空间，删掉不影响源码）；构建产物可随时删 `web/dist` 与 `target/`（`cargo clean`）再重建。
+
+**M6 实际交付（浏览器接管，未做剪贴板兜底）**（新 `crates/adl-gui/src/api_server.rs` + `browser-extension/`）：
+- **本地 API**（`api_server::start(gui, port)`，默认端口 `ADL_API_PORT` 或 17800，只绑 `127.0.0.1`，每连接一线程）：
+  - `GET /ping`（探活）、`GET /status`（版本 + 任务快照，免 token）。
+  - `GET /auto-token`（下发随机 token；要求空 Origin 或 `chrome-extension://`/`moz-extension://`，否则 403）。
+  - `POST /add`、`POST /probe`、`GET /check`（**必须带 `x-adl-token`**，401 拒；Origin 非扩展来源 403）。
+  - `POST /add` 直接复用 GUI 的 `add_task`，额外接受 `referer` / `user_agent` / `headers`（对象）/ `cookies`（转成 `Cookie:` 头），使登录站与反盗链站点也能接管。
+- **三重 CSRF 防护（缺一即漏洞）**：①只绑 127.0.0.1；②改状态接口必须带启动时生成的随机 token（32 hex，经 `/auto-token` 下发并缓存在扩展 storage）；③校验 Origin（普通网页无法省略 Origin，拿不到 token、调不动）。
+- **扩展**（`browser-extension/`，MV3，Edge/Chrome 通用）：`downloads.onCreated` 捕获下载 → `POST /add` → 200 且 `ok:true` 才 `chrome.downloads.cancel()+erase()`；失败/ADL 未运行则**原样放行**不丢链接。右键链接菜单「使用 ADL 下载」（`contextMenus`）。需要登录的站由 `cookies.getAll({url})` 取 Cookie 一并转发。`popup.html`/`options.html` 可开关接管、设端口、测试连接。
+- **实测**（`E:\ADL\probe\m6test.ps1`，本地 range-server + 真实 adl-gui.exe 进程）：`/ping` ✓；`/auto-token` 返回 32 字符 token ✓；伪造 `Origin: https://evil.com` → **403** ✓；错误 token → **401** ✓；`/add` 下载 8 MB → `completed`、文件 **8,388,608 B**、SHA 与源一致 ✓；扩展 3 个 JS 通过 `node --check`、manifest 为合法 MV3 ✓。
+- **权衡**：不做剪贴板监听（用户明确否决：旧软件试过，随便复制链接就弹窗、难以控制）。
+- **限制**：ADL 必须处于运行状态（当前关闭窗口=退出，未做「关闭到托盘」，属后续项）。
 
 **M4 之后就可以开源。** UI 和插件生态是后续加分项。
 
