@@ -1,0 +1,21 @@
+# Auto Concurrency —— 按站点自动调并发
+#
+# 有些站（GitHub 的 CDN、SourceForge 等）连接开太多会拒绝或变慢。
+# 这里按域名给一个更合适的并发数；不匹配的站点保持引擎自适应。
+id = "com.adl.auto-concurrency"
+name = "Auto Concurrency"
+version = "1.0.0"
+description = "按域名调整并发连接数（需要 Transform 权限，请用 --trusted）"
+api_version = 1
+entry = "main.js"
+kind = "quickjs"
+
+[[hooks]]
+point = "onResolve"
+priority = 10
+
+[[hooks]]
+point = "onPlan"
+priority = 10
+
+[permissions]

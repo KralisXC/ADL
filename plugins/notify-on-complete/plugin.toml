@@ -1,0 +1,17 @@
+# Notify On Complete —— 下载完成后弹通知
+#
+# Observe 类插件，安全模式下也能用（不需要 --trusted）。
+id = "com.adl.notify-on-complete"
+name = "Notify On Complete"
+version = "1.0.0"
+description = "下载完成时发送一条通知"
+api_version = 1
+entry = "main.js"
+kind = "quickjs"
+
+[[hooks]]
+point = "onComplete"
+priority = 10
+
+[permissions]
+notify = true

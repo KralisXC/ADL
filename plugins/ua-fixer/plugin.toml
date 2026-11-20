@@ -1,0 +1,17 @@
+# UA Fixer —— 给指定站点换上特定浏览器的 User-Agent
+#
+# 用在"必须某个 UA 才给下载"的站点（例如部分网盘/防盗链站）。
+# 改下面两个常量即可。
+id = "com.adl.ua-fixer"
+name = "UA Fixer"
+version = "1.0.0"
+description = "按站点改写 User-Agent（需要 Transform 权限，请用 --trusted）"
+api_version = 1
+entry = "main.js"
+kind = "quickjs"
+
+[[hooks]]
+point = "onResolve"
+priority = 50
+
+[permissions]

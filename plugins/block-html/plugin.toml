@@ -1,0 +1,17 @@
+# Block HTML —— 拦下"假下载"（服务器返回的是 HTML 错误页/登录页）
+#
+# Guard 类插件，安全模式下也能用（不需要 --trusted）。
+# 很多小网站没有真实文件，直接返回一个 HTML 页；下下来是几 KB 的假文件。
+id = "com.adl.block-html"
+name = "Block HTML"
+version = "1.0.0"
+description = "响应是 HTML 时拒绝写入，避免下到错误页"
+api_version = 1
+entry = "main.js"
+kind = "quickjs"
+
+[[hooks]]
+point = "onResponse"
+priority = 10
+
+[permissions]

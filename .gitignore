@@ -1,0 +1,18 @@
+# Rust 构建产物
+/target
+**/*.rs.bk
+
+# 本地测试/探针目录（含大文件与临时服务）
+/probe
+
+# 下载产物与进度
+*.adl
+*.part
+
+# 本地用户配置与历史（每台机器不同，不入库）
+/config.toml
+history.json
+
+# 编辑器
+.vscode/
+.idea/
