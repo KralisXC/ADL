@@ -65,6 +65,20 @@ history_enabled = true
 
 命令行的显式参数会覆盖配置里的同名项。
 
+## 图形界面（M5）
+
+`adl-gui.exe` 是一个基于 tao + wry（WebView2）的桌面窗口，带托盘图标，前端是 Vue SFC + vite 构建。
+
+```bash
+cd web
+npm run build          # 产出 web/dist（index.html + assets）
+# 然后运行 adl-gui.exe（会启动 127.0.0.1:0 静态服务器托管 web/dist）
+```
+
+- 若 `web/dist` 不在默认查找位置，可用环境变量 `ADL_WEB_ROOT` 指过去。
+- 改界面只需重建 `web/dist`，不必重编 Rust。
+- 三个页面：任务列表（进度/速度/暂停/移除/删除文件）、添加下载、设置（目录/并发/限速/代理/插件模式/HTTP1）。
+
 ## 插件
 
 插件放在 `plugins/<id>/`，由 `plugin.toml` + `main.js` 组成。示例：
@@ -109,7 +123,7 @@ globalThis.onBeforeRequest = function (ctx) {
 - ✅ M2 并发分片 + 限速 + 重试 + 自适应降档
 - ✅ M3 插件系统（QuickJS + TOML manifest + 权限 + 安全模式）
 - ✅ M4 CLI 完整（配置 + 历史 + 子命令），v0.1 可用
-- ⬜ M5 图形界面（wry + WebView2 + 托盘）
+- ✅ M5 图形界面（wry + WebView2 + 托盘 + Vue SFC 前端）
 - ⬜ M6 浏览器接管（扩展 + 本地 API）
 
 设计文档见 [docs/DESIGN.md](docs/DESIGN.md)。

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/adl-core", "crates/adl-app", "crates/adl-plugin"]
+members = ["crates/adl-core", "crates/adl-app", "crates/adl-plugin", "crates/adl-gui"]
 
 [workspace.package]
 version = "0.1.0"

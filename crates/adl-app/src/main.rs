@@ -7,14 +7,13 @@
 //! `adl clean`            清空已完成历史
 //! `adl config [--init]`  查看/生成配置文件
 
-mod config;
-mod history;
-
+use adl_app::config;
+use adl_app::history;
+use adl_app::history::TaskRecord;
 use adl_core::hooks::Hooks;
 use adl_core::{download, AdlError, DownloadOptions, NoopHooks, Progress};
 use adl_plugin::{Mode, PluginHooks};
 use clap::{Args, Parser, Subcommand};
-use history::TaskRecord;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;

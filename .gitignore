@@ -13,6 +13,10 @@
 /config.toml
 history.json
 
+# 前端 node_modules（目录联接，指向外部已装依赖）与构建产物
+/web/node_modules
+/web/dist
+
 # 编辑器
 .vscode/
 .idea/

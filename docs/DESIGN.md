@@ -896,7 +896,7 @@ cargo build --release
 | **M2** | 分片并发 + 限速 + 重试 + 降档 | 大文件可用 | 5–7 天 | ✅ **已完成** |
 | **M3** | hook 管线 + QuickJS + `--safe` | 第一个内置插件跑通 | 5–7 天 | ✅ |
 | **M4** | CLI 完整（配置文件 + 下载历史 + 子命令） | **可发布 v0.1** | 3–5 天 | ✅ |
-| **M5** | wry 窗口 + Vue SFC 前端（vite 构建） | GUI 可用 | 7–10 天 | ⬜ |
+| **M5** | wry 窗口 + Vue SFC 前端（vite 构建） | GUI 可用 | 7–10 天 | ✅ |
 | **M6** | 浏览器扩展 + 本地 API | 接管下载 | 7–14 天 | ⬜ |
 | **M7** | WASM 后端（可选） | 插件双引擎 | 3–5 天 | ⬜ |
 
@@ -970,6 +970,17 @@ cargo build --release
   * `adl clean` — 只清"已完成"的记录，失败/保留。
   * `adl config [--init]` — 显示配置路径与内容 / 生成模板。
 - **测试**：adl-app **7**（config 3 + history 4）+ adl-core 66 + adl-plugin 13 全绿。实测（`LOCALAPPDATA` 指向临时目录隔离）：`config --init` 生成模板；配置里 `dir` / `connections=4` / `history_enabled=false` 全部生效（下载落到配置目录、实测 4 连接、不写历史）；`list` / `resume` / `remove --files` / `clean` 均按预期工作。
+
+**M5 实际交付（GUI：窗口 + 托盘 + 三个页面）**（新 crate `crates/adl-gui` + `adl-app` 改 lib+bin + `web/` 前端）：
+- **前端**：`web/`（Vue SFC + vite）。`npm run build` → `web/dist`（index.html 0.39 KB + CSS 2.6 KB + JS 73 KB）。为离线省内存，`web/node_modules` 用目录联接（junction）指向旧项目已有的 `E:\Aria2-Harness-Dev\client\node_modules`（vue 3.5.44 / vite 8.3.4 / @vitejs/plugin-vue 6.0.10），**不跑 npm install**。
+- **服务方式**：不用 `include_dir!` 内嵌（离线缓存没有该 crate，且改 UI 要重编 Rust），改为 `crates/adl-gui/src/static_server.rs` 起 `127.0.0.1:0` 静态服务器托管 `web/dist`（SPA 回退 index.html、`..` 穿越拒绝、`Cache-Control: no-store`）。`find_web_root()` 查找顺序：`ADL_WEB_ROOT` → exe 同级 `web-dist`/`web` → cwd `web/dist`/`web`。
+- **窗口/托盘**：`tao 0.37 + wry 0.57 + tray-icon 0.25`。⚠️ `tray-icon` 默认 feature 只含 Linux 后端（`muda-libxdo`/`libappindicator`），会把未缓存的 `libxdo`/gtk 拖进依赖解析导致离线构建失败 → 必须 `default-features = false`（Windows 不需要这些）。
+- **IPC**：复用 `window.ipc.postMessage` → Rust channel → 主线程 `handle_ipc` → `window.__ipcResolve/__ipcEmit`；`evaluate_script` **只在主线程事件循环里调**（避免回调里死锁），下载进度经 `EventLoopProxy<UserEvent>` 投递后由主循环 eval。
+- **命令**：`ping/get_tasks/get_settings/set_settings/add/pause/remove/open_dir`。`add` 从 `Config` 构造 `DownloadOptions` 并加载插件 hooks；进度 **150ms 节流**；暂停用 `handle.abort()`（进度在 `.adl`，重新添加即续传）。
+- **三个页面**：任务列表（进度条/速度/暂停/移除/删除文件）、添加下载、设置（默认目录/并发/限速/代理/插件模式/强制 HTTP1/插件目录）。
+- **实测（用 WebView2 远程调试 CDP 驱动真实窗口）**：DOM 挂载 ✓、`window.ipc` 存在 ✓、`get_tasks` → `[]` ✓、`get_settings` → `connections=16/mode=safe` ✓；经 GUI `add` 下载 8 MB 本地文件 → 状态 `completed`、**SHA256 与源文件完全一致**、服务器回显 UA 为 Chrome 浏览器 UA。`adl-gui.exe` ≈ **3.38 MB**（仍在 5 MB 预算内）。
+- **开发/运行**：`cd web; npm run build`，然后运行 `adl-gui.exe`（或设 `ADL_WEB_ROOT` 指到 dist）。改 UI 只需重建 dist，不必重编 Rust。
+- **省磁盘**：`web/node_modules` 是 junction（不占额外空间，删掉不影响源码）；构建产物可随时删 `web/dist` 与 `target/`（`cargo clean`）再重建。
 
 **M4 之后就可以开源。** UI 和插件生态是后续加分项。
 

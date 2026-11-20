@@ -135,6 +135,20 @@ impl Config {
         }
     }
 
+    /// 把当前配置写回配置文件（覆盖），用于 GUI 的设置页。
+    pub fn save(&self) -> std::io::Result<()> {
+        let path = config_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let text = toml::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, text)?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
     /// 把默认配置（带注释的模板）写到默认位置；已存在则不动。
     /// 返回实际路径。`force=true` 时覆盖。
     pub fn write_template(force: bool) -> std::io::Result<PathBuf> {

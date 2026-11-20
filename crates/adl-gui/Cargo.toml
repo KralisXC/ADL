@@ -1,0 +1,22 @@
+[package]
+name = "adl-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "adl-gui"
+path = "src/main.rs"
+
+[dependencies]
+adl-core = { path = "../adl-core" }
+adl-plugin = { path = "../adl-plugin" }
+adl-app = { path = "../adl-app" }
+tao = "0.37.1"
+wry = "0.57.0"
+# 默认 feature 只包含 Linux 专用后端（muda-libxdo / libappindicator），
+# Windows 上关掉它们可以避免拉入 libxdo/gtk 这些本机没有的依赖。
+tray-icon = { version = "0.25.1", default-features = false }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
