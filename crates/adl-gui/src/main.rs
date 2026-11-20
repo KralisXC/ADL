@@ -5,6 +5,7 @@
 //! `window.__ipcResolve/__ipcEmit` 与 Rust 通信（复用上一版验证过的 IPC 协议）。
 
 mod api_server;
+mod platform;
 mod static_server;
 
 use adl_app::config::Config;
@@ -19,15 +20,21 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tao::dpi::LogicalSize;
 use tao::event::{Event, StartCause, WindowEvent};
-use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
-use tao::window::WindowBuilder;
+use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget};
+use tao::window::{Window, WindowBuilder};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, TrayIconBuilder};
-use wry::WebViewBuilder;
+use wry::{WebView, WebViewBuilder};
 
 enum UserEvent {
     /// 向前端发一个事件：名字 + JSON 载荷
     Emit(&'static str, String),
+    /// 第二个实例唤醒本实例，把窗口显示出来
+    Show,
+    /// 系统即将休眠
+    Suspend,
+    /// 系统从休眠恢复
+    Resume,
 }
 
 struct Task {
@@ -52,6 +59,20 @@ pub(crate) struct Gui {
 }
 
 fn main() {
+    // ── 单实例：已有实例在跑就唤醒它并退出 ──
+    let _instance = match platform::acquire_single_instance() {
+        Some(i) => i,
+        None => {
+            let woke = platform::signal_existing_instance();
+            if woke {
+                eprintln!("ADL 已在运行，已唤醒现有窗口。");
+            } else {
+                eprintln!("ADL 已在运行。");
+            }
+            return;
+        }
+    };
+
     let cfg = Config::load();
     let initial_hooks = build_hooks(&cfg);
 
@@ -64,8 +85,6 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let (url, port) = static_server::start(web_root.clone()).expect("无法启动本地静态服务器");
-    eprintln!("[gui] 静态服务器 {} (根目录 {})", url, web_root.display());
 
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
@@ -94,68 +113,199 @@ fn main() {
         Err(e) => eprintln!("[gui] 本地 API 启动失败（{}），浏览器接管不可用", e),
     }
 
-    let window = WindowBuilder::new()
-        .with_title("ADL")
-        .with_inner_size(LogicalSize::new(1000.0, 700.0))
-        .with_min_inner_size(LogicalSize::new(720.0, 520.0))
-        .build(&event_loop)
-        .expect("无法创建窗口");
+    // 静态服务器（同时提供 POST /ipc，供浏览器降级模式使用）
+    let ipc_handler: Arc<dyn Fn(&str) -> String + Send + Sync> = {
+        let g = gui.clone();
+        Arc::new(move |body: &str| dispatch_ipc_json(&g, body))
+    };
+    let (url, _port) =
+        static_server::start(web_root.clone(), Some(ipc_handler)).expect("无法启动本地静态服务器");
+    eprintln!("[gui] 静态服务器 {} (根目录 {})", url, web_root.display());
+
+    // WebView2 检测：缺失/残缺时降级为「浏览器模式」，UI 跑在默认浏览器里，
+    // 通过本地 HTTP 的 POST /ipc 与后端通信，功能完整。
+    let has_webview2 = std::env::var_os("ADL_FORCE_BROWSER").is_none()
+        && platform::webview2_available();
+    if !has_webview2 {
+        eprintln!(
+            "[gui] ⚠ 未检测到 WebView2 运行时，已降级为「浏览器模式」：界面开在你的默认浏览器里。"
+        );
+        eprintln!(
+            "[gui]   安装 WebView2（Edge 自带或微软官方 Runtime）后即可使用原生窗口，功能完全一致。"
+        );
+    }
 
     let (ipc_tx, ipc_rx) = std::sync::mpsc::channel::<String>();
-    let webview = WebViewBuilder::new()
-        .with_url(&url)
-        .with_ipc_handler(move |req| {
-            let _ = ipc_tx.send(req.body().clone());
-        })
-        .build(&window)
-        .expect("无法创建 WebView");
+    let mut window: Option<Window> = None;
+    let mut webview: Option<WebView> = None;
+    if has_webview2 {
+        let (w, v) = make_window(&event_loop, &url, &ipc_tx);
+        window = Some(w);
+        webview = Some(v);
+    } else {
+        platform::open_in_browser(&url);
+    }
 
     // 托盘
     let tray = build_tray();
 
-    let _ = port;
+    // 唤醒监听（单实例第二个进程 → 本进程显示窗口）
+    {
+        let p = proxy.clone();
+        platform::spawn_wakeup_listener(move || {
+            let _ = p.send_event(UserEvent::Show);
+        });
+    }
+    // 系统休眠/唤醒通知
+    let _power = {
+        let p = proxy.clone();
+        platform::register_power(move |ev| {
+            let ue = match ev {
+                platform::PowerEvent::Suspend => UserEvent::Suspend,
+                platform::PowerEvent::Resume => UserEvent::Resume,
+                platform::PowerEvent::Other => return,
+            };
+            let _ = p.send_event(ue);
+        })
+    };
+    if _power.is_some() {
+        eprintln!("[gui] 已注册系统休眠/唤醒通知");
+    } else {
+        eprintln!("[gui] 休眠/唤醒通知注册失败（不影响下载，仅少了自动暂停）");
+    }
 
-    event_loop.run(move |event, _target, control_flow| {
+    let url_for_show = url.clone();
+
+    event_loop.run(move |event, target, control_flow| {
         *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(120));
 
         match event {
             Event::NewEvents(StartCause::ResumeTimeReached { .. }) | Event::MainEventsCleared => {
                 // IPC 请求（在主线程统一处理，保证 webview 调用线程安全）
                 while let Ok(body) = ipc_rx.try_recv() {
-                    if let Some(script) = handle_ipc(&gui, &body) {
-                        let _ = webview.evaluate_script(&script);
+                    if let Some(wv) = &webview {
+                        if let Some(script) = handle_ipc(&gui, &body) {
+                            let _ = wv.evaluate_script(&script);
+                        }
                     }
                 }
                 // 托盘菜单
                 while let Ok(ev) = MenuEvent::receiver().try_recv() {
                     match ev.id.0.as_str() {
-                        "show" => {
-                            window.set_visible(true);
-                            window.set_focus();
-                        }
+                        "show" => show_window(
+                            &mut window,
+                            &mut webview,
+                            target,
+                            &url_for_show,
+                            &ipc_tx,
+                            has_webview2,
+                        ),
                         "quit" => *control_flow = ControlFlow::Exit,
                         _ => {}
                     }
                 }
             }
             Event::UserEvent(UserEvent::Emit(name, payload)) => {
-                let script = format!(
-                    "window.__ipcEmit({}, {})",
-                    serde_json::to_string(name).unwrap_or_else(|_| "\"\"".into()),
-                    payload
-                );
-                let _ = webview.evaluate_script(&script);
+                if let Some(wv) = &webview {
+                    let script = format!(
+                        "window.__ipcEmit({}, {})",
+                        serde_json::to_string(name).unwrap_or_else(|_| "\"\"".into()),
+                        payload
+                    );
+                    let _ = wv.evaluate_script(&script);
+                }
+            }
+            Event::UserEvent(UserEvent::Show) => show_window(
+                &mut window,
+                &mut webview,
+                target,
+                &url_for_show,
+                &ipc_tx,
+                has_webview2,
+            ),
+            Event::UserEvent(UserEvent::Suspend) => {
+                eprintln!("[gui] 系统即将休眠：暂停进行中的任务（进度已保存在 .adl 文件）");
+                for t in gui.tasks.lock().unwrap().iter_mut() {
+                    if let Some(h) = t.handle.take() {
+                        h.abort();
+                    }
+                    if t.status == "downloading" {
+                        t.status = "paused".into();
+                    }
+                }
+                if let Some(wv) = &webview {
+                    let _ = wv.evaluate_script("window.__ipcEmit('system_suspend', '{}')");
+                }
+            }
+            Event::UserEvent(UserEvent::Resume) => {
+                eprintln!("[gui] 系统已恢复：任务保持暂停，请手动继续（避免链接失效）");
+                if let Some(wv) = &webview {
+                    let _ = wv.evaluate_script("window.__ipcEmit('system_resume', '{}')");
+                }
             }
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
             } => {
-                *control_flow = ControlFlow::Exit;
+                // 关闭到托盘：销毁窗口（避免 WebView2 隐藏后白屏），唤醒时重建。
+                webview.take();
+                window.take();
+                eprintln!("[gui] 已最小化到托盘（程序仍在后台运行）");
             }
             _ => {}
         }
         let _ = &tray; // 保持托盘存活
+        let _ = &_power; // 保持电源通知注册存活
     });
+}
+
+/// 创建窗口 + WebView（首次启动与从托盘唤醒时复用）。
+fn make_window(
+    target: &EventLoopWindowTarget<UserEvent>,
+    url: &str,
+    ipc_tx: &std::sync::mpsc::Sender<String>,
+) -> (Window, WebView) {
+    let window = WindowBuilder::new()
+        .with_title("ADL")
+        .with_inner_size(LogicalSize::new(1000.0, 700.0))
+        .with_min_inner_size(LogicalSize::new(720.0, 520.0))
+        .build(target)
+        .expect("无法创建窗口");
+    let tx = ipc_tx.clone();
+    let webview = WebViewBuilder::new()
+        .with_url(url)
+        .with_ipc_handler(move |req| {
+            let _ = tx.send(req.body().clone());
+        })
+        .build(&window)
+        .expect("无法创建 WebView");
+    (window, webview)
+}
+
+/// 显示主界面：原生模式重建/唤回窗口；浏览器模式重新打开浏览器。
+fn show_window(
+    window: &mut Option<Window>,
+    webview: &mut Option<WebView>,
+    target: &EventLoopWindowTarget<UserEvent>,
+    url: &str,
+    ipc_tx: &std::sync::mpsc::Sender<String>,
+    has_webview2: bool,
+) {
+    if !has_webview2 {
+        platform::open_in_browser(url);
+        return;
+    }
+    if webview.is_none() {
+        let (w, v) = make_window(target, url, ipc_tx);
+        *window = Some(w);
+        *webview = Some(v);
+        return;
+    }
+    if let Some(w) = window {
+        let _ = w.set_minimized(false);
+        w.set_visible(true);
+        w.set_focus();
+    }
 }
 
 fn build_tray() -> Option<tray_icon::TrayIcon> {
@@ -217,7 +367,7 @@ fn find_web_root() -> Option<PathBuf> {
 
 // ─────────────────────────── IPC ───────────────────────────
 
-fn handle_ipc(gui: &Arc<Gui>, body: &str) -> Option<String> {
+fn dispatch_ipc(gui: &Arc<Gui>, body: &str) -> Option<(Value, Value)> {
     let v: Value = serde_json::from_str(body).ok()?;
     let id = v.get("id").cloned().unwrap_or(Value::Null);
     let cmd = v.get("cmd").and_then(|c| c.as_str()).unwrap_or("");
@@ -289,11 +439,29 @@ fn handle_ipc(gui: &Arc<Gui>, body: &str) -> Option<String> {
         Ok(v) => v,
         Err(msg) => json!({"__err": {"message": msg}}),
     };
+    Some((id, payload))
+}
+
+/// wry / WebView2 模式的 IPC：把结果包成调用页面回调的脚本。
+fn handle_ipc(gui: &Arc<Gui>, body: &str) -> Option<String> {
+    let (id, payload) = dispatch_ipc(gui, body)?;
     Some(format!(
         "window.__ipcResolve({}, {})",
         serde_json::to_string(&id).ok()?,
         serde_json::to_string(&payload).ok()?
     ))
+}
+
+/// 浏览器降级模式的 IPC：`POST /ipc` 的响应体，形如 `{"id":..,"payload":..}`。
+fn dispatch_ipc_json(gui: &Arc<Gui>, body: &str) -> String {
+    match dispatch_ipc(gui, body) {
+        Some((id, payload)) => json!({"id": id, "payload": payload}).to_string(),
+        None => json!({
+            "id": Value::Null,
+            "payload": {"__err": {"message": "bad request"}}
+        })
+        .to_string(),
+    }
 }
 
 fn plugins_root(cfg: &Config) -> Option<PathBuf> {

@@ -992,7 +992,7 @@ cargo build --release
 - **扩展**（`browser-extension/`，MV3，Edge/Chrome 通用）：`downloads.onCreated` 捕获下载 → `POST /add` → 200 且 `ok:true` 才 `chrome.downloads.cancel()+erase()`；失败/ADL 未运行则**原样放行**不丢链接。右键链接菜单「使用 ADL 下载」（`contextMenus`）。需要登录的站由 `cookies.getAll({url})` 取 Cookie 一并转发。`popup.html`/`options.html` 可开关接管、设端口、测试连接。
 - **实测**（`E:\ADL\probe\m6test.ps1`，本地 range-server + 真实 adl-gui.exe 进程）：`/ping` ✓；`/auto-token` 返回 32 字符 token ✓；伪造 `Origin: https://evil.com` → **403** ✓；错误 token → **401** ✓；`/add` 下载 8 MB → `completed`、文件 **8,388,608 B**、SHA 与源一致 ✓；扩展 3 个 JS 通过 `node --check`、manifest 为合法 MV3 ✓。
 - **权衡**：不做剪贴板监听（用户明确否决：旧软件试过，随便复制链接就弹窗、难以控制）。
-- **限制**：ADL 必须处于运行状态（当前关闭窗口=退出，未做「关闭到托盘」，属后续项）。
+- **限制**：ADL 必须处于运行状态。**现已支持「关闭到托盘」**（见下节），关闭窗口不再退出进程，所以接管期间把窗口关掉也没关系。
 
 **插件 UI 扩展点 实际交付（M6 之后，按用户"插件为大"的要求补上）**
 - **目标**：让插件能改 ADL 自己的界面（加页面/按钮/设置项/命令，甚至在信任模式下替换内置页面），且**插件永远拿不到 DOM、不能注入 `<script>`、读不到 cookie**——插件返回的是**声明式 JSON 组件树**，由宿主用白名单渲染器画成真实界面。
@@ -1003,6 +1003,15 @@ cargo build --release
 - **代码**：`crates/adl-plugin/src/{manifest.rs(UiDecl/…),ui.rs(collect 聚合),plugin_hooks.rs(ui_snapshot/render/run_action/run_command),runtime.rs(PRELUDE 增 onUiRender/onAction/onCommand)}`；`crates/adl-app/src/config.rs(PluginCfg/plugins/plugin_enabled)`；`crates/adl-gui/src/main.rs(Gui.hooks、build_hooks、load_plugin_settings/save_plugin_setting、IPC 增 ui_snapshot/ui_render/run_action/run_command/plugin_setting_set、set_settings 后重建 hooks)`；前端 `web/src/RenderNode.vue`（递归白名单渲染器）+ `App.vue`（插件页侧栏、动作按钮、插件设置区、Ctrl+K 命令面板、trusted 替换内置页）。
 - **示例插件**：`plugins/ui-demo/`（页面 + 工具栏动作 + 两个设置项 + 一个命令）。
 - **实测**（CDP 驱动真实 WebView2）：`ui_snapshot` 返回 trusted/pages/actions/commands/settings；`ui_render` 返回组件树并在真实 DOM 渲染出 `示例插件页面 · demo`；`run_action`/`run_command` 返回插件消息；`plugin_setting_set` 写入 `plugin-settings/ui-demo.json` 并即时回显；`safe` 模式下 `trusted=false`、`actions=[]`、`commands=[]`、`settings[].editable=false`（页面仍在）；侧栏出现"插件页面"分组、设置页出现"插件设置"区（2 项）、Ctrl+K 命令面板可弹出（1 项）。`cargo test`：adl-app 7 + adl-core 66 + adl-plugin 13 全绿。
+
+**桌面集成补强 实际交付（M6 之后）：单实例 / 关闭到托盘 / 休眠唤醒 / WebView2 降级**
+- **新增 `crates/adl-gui/src/platform.rs`**（Win32 胶水，全用 `windows-sys 0.61.2`）：
+  - **单实例**：命名互斥量 `Global\ADL_SingleInstance_v1`（`CreateMutexW` + `GetLastError()==ERROR_ALREADY_EXISTS`）；第二个实例通过命名事件 `Global\ADL_Wakeup_v1`（`OpenEventW` + `SetEvent`）唤醒第一个实例后退出。第一个实例起后台线程 `WaitForSingleObject` 等事件 → `UserEvent::Show`。创建互斥量失败（受限令牌）时**放行启动**，不挡用户。
+  - **休眠/唤醒**：`PowerRegisterSuspendResumeNotification` + `DEVICE_NOTIFY_CALLBACK`（回调方式，**不用**需要窗口消息泵的 `RegisterSuspendResumeNotification`），回调里把 `PBT_APMSUSPEND(0x0004)` / `PBT_APMRESUMESUSPEND(0x0007)` / `PBT_APMRESUMEAUTOMATIC(0x0012)` 转成 `UserEvent::Suspend`/`Resume`。休眠时把所有进行中任务 `handle.abort()` 并置 `paused`（进度已在 `.adl`）。**唤醒后不自动续传**（用户要求：自动恢复时服务器可能已不发数据/链接失效，须手动点）。
+  - **WebView2 检测**：先查 `C:\Program Files (x86)\Microsoft\EdgeWebView\Application\*\msedgewebview2.exe`（及 64 位目录），再查注册表三个视图（HKLM WOW6432Node / HKLM / HKCU 的 `EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}`）。
+- **关闭到托盘（销毁/重建，避免白屏）**：`WindowEvent::CloseRequested` 不再 Exit，而是 `webview.take(); window.take();`（**先 drop webview 再 drop window**）——tao 的 `Window::drop` 只发 `Destroyed`，事件循环与 tokio 全存活；托盘「显示主界面」或第二个实例唤醒时用 `make_window(target,...)` **重新创建**窗口与 WebView（`EventLoopWindowTarget` 允许在运行中建窗）。因为前端走同一个本地静态服务器 URL，重建后状态由 `get_tasks`/`ui_snapshot` 拉回。
+- **WebView2 缺失 → 浏览器模式（完整功能降级）**：检测不到 WebView2 时**不建窗口**，改为 `cmd /C start "" <url>` 用默认浏览器打开同一个本地 URL；前端 `web/src/ipc.js` 自动探测 `window.ipc`，没有就用 `fetch('POST /ipc')` 走**同一个 `dispatch_ipc` 后端**（静态服务器新增 `POST /ipc`，读 Content-Length 收 body，返回 `{id,payload}`），因此任务列表/添加/设置/插件 UI **全部照常工作**，只是界面在浏览器标签页里。`ADL_FORCE_BROWSER=1` 可强制走浏览器模式（测试用），`ADL_NO_OPEN_BROWSER=1` 跳过自动拉起浏览器。
+- **实测**：单实例 ✓（第二进程打印「ADL 已在运行，已唤醒现有窗口。」并退出 0）；关闭到托盘 ✓（`WM_CLOSE` 后进程存活、CDP target 消失；再起第二实例 → target 重新出现、窗口重建）；浏览器模式 ✓（`POST /ipc` 的 `get_settings`/`ping`/`ui_snapshot` 全部正确、`GET /` 返回 index.html）；休眠/唤醒注册成功（运行日志打印「已注册系统休眠/唤醒通知」）。`cargo build --release` 无警告；exe ≈3.5 MB。
 
 **M4 之后就可以开源。** UI 和插件生态是后续加分项。
 

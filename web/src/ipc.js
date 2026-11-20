@@ -10,12 +10,27 @@ const handlers = new Map()
 export function invoke(cmd, args = {}) {
   return new Promise((resolve, reject) => {
     const id = ++seq
-    pending.set(id, { resolve, reject })
     if (window.ipc && typeof window.ipc.postMessage === 'function') {
+      // 原生 WebView2 窗口：wry 自定义 IPC
+      pending.set(id, { resolve, reject })
       window.ipc.postMessage(JSON.stringify({ id, cmd, args }))
     } else {
-      pending.delete(id)
-      reject(new Error('当前不在 ADL 窗口内（无 window.ipc）'))
+      // 浏览器降级模式（没有 WebView2 时）：走本地静态服务器的 POST /ipc
+      fetch('/ipc', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, cmd, args }),
+      })
+        .then((r) => r.json())
+        .then((data) => {
+          const payload = data && data.payload !== undefined ? data.payload : null
+          if (payload && payload.__err) {
+            reject(new Error(payload.__err.message || '未知错误'))
+          } else {
+            resolve(payload)
+          }
+        })
+        .catch((e) => reject(e))
     }
   })
 }
