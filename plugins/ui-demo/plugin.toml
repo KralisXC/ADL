@@ -1,0 +1,43 @@
+id = "com.adl.ui-demo"
+name = "示例 UI 插件"
+description = "演示插件 UI 扩展点：页面、动作、设置、命令"
+version = "0.1.0"
+api_version = 1
+entry = "main.js"
+kind = "quickjs"
+
+[permissions]
+notify = true
+
+[limits]
+timeout_ms = 3000
+memory_mb = 32
+
+[[ui.pages]]
+id = "demo"
+title = "示例页面"
+icon = "✨"
+
+[[ui.actions]]
+id = "hello"
+label = "示例动作"
+place = "toolbar"
+
+[[ui.settings]]
+key = "greeting"
+label = "问候语"
+kind = "string"
+default = "你好"
+
+[[ui.settings]]
+key = "show_tip"
+label = "显示小贴士"
+kind = "boolean"
+default = "true"
+
+[[ui.commands]]
+id = "say-hi"
+title = "示例：打个招呼"
+
+[ui.theme]
+accent = "#4a9e9e"

@@ -9,6 +9,7 @@ pub mod hostapi;
 pub mod manifest;
 pub mod plugin_hooks;
 pub mod runtime;
+pub mod ui;
 
 pub use hostapi::Mode;
 pub use manifest::{HookPoint, Manifest, API_VERSION, MANIFEST_FILE};

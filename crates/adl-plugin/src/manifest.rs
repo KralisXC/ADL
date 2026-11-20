@@ -118,6 +118,72 @@ fn default_memory() -> usize {
     32
 }
 
+/// 插件声明的 UI 扩展点（M7，the agent harness 式：插件只声明、不注入代码）。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct UiDecl {
+    #[serde(default)]
+    pub pages: Vec<UiPage>,
+    #[serde(default)]
+    pub actions: Vec<UiAction>,
+    #[serde(default)]
+    pub settings: Vec<UiSetting>,
+    #[serde(default)]
+    pub commands: Vec<UiCommand>,
+    #[serde(default)]
+    pub theme: Option<UiTheme>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UiPage {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub icon: String,
+    /// 非空时：trusted 模式下用本页替换内置页（tasks / add / settings）。
+    #[serde(default)]
+    pub replaces: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UiAction {
+    pub id: String,
+    pub label: String,
+    /// toolbar | task
+    #[serde(default)]
+    pub place: String,
+    #[serde(default)]
+    pub icon: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UiSetting {
+    pub key: String,
+    pub label: String,
+    /// boolean | string | number | select
+    #[serde(default = "default_setting_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub options: Vec<String>,
+    #[serde(default)]
+    pub default: String,
+}
+
+fn default_setting_kind() -> String {
+    "string".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UiCommand {
+    pub id: String,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct UiTheme {
+    #[serde(default)]
+    pub accent: String,
+}
+
 impl Default for Limits {
     fn default() -> Self {
         Self {
@@ -145,6 +211,8 @@ pub struct Manifest {
     pub permissions: Permissions,
     #[serde(default)]
     pub limits: Limits,
+    #[serde(default)]
+    pub ui: UiDecl,
 }
 
 fn default_kind() -> String {

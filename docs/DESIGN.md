@@ -994,6 +994,16 @@ cargo build --release
 - **权衡**：不做剪贴板监听（用户明确否决：旧软件试过，随便复制链接就弹窗、难以控制）。
 - **限制**：ADL 必须处于运行状态（当前关闭窗口=退出，未做「关闭到托盘」，属后续项）。
 
+**插件 UI 扩展点 实际交付（M6 之后，按用户"插件为大"的要求补上）**
+- **目标**：让插件能改 ADL 自己的界面（加页面/按钮/设置项/命令，甚至在信任模式下替换内置页面），且**插件永远拿不到 DOM、不能注入 `<script>`、读不到 cookie**——插件返回的是**声明式 JSON 组件树**，由宿主用白名单渲染器画成真实界面。
+- **manifest 新增 `[ui]` 段**（TOML）：`[[ui.pages]]`（`id/title/icon/replaces`，`replaces` 非空=替换内置页 `tasks|add|settings`）、`[[ui.actions]]`（`id/label/place=toolbar|task/icon`）、`[[ui.settings]]`（`key/label/kind=boolean|string|number|select/options/default`）、`[[ui.commands]]`（`id/title`）、`[ui.theme]`（`accent`）。
+- **JS API**：`adl.onUiRender(req)` 返回组件树；`adl.onAction(req)` 处理按钮动作；`adl.onCommand(req)` 处理 Ctrl+K 命令。组件白名单：`text/heading/badge/divider/spacer/row/col/button/input/select/toggle/progress/list`。
+- **分级（安全模式的基础，沿用"能拒绝的权限比能改写的权限安全一个数量级"）**：`safe` 只暴露页面（只读）与设置项，**不暴露** 动作/命令/替换内置页，设置只读；`trusted` 才暴露动作、命令、替换内置页、可编辑设置。
+- **设置存储（分段集中）**：主 `config.toml` 只存每插件 `enabled` 开关（`[plugins.<id>] enabled=true`）；详细设置存各插件自己的 `%LOCALAPPDATA%\ADL\plugin-settings\<id>.json`。
+- **代码**：`crates/adl-plugin/src/{manifest.rs(UiDecl/…),ui.rs(collect 聚合),plugin_hooks.rs(ui_snapshot/render/run_action/run_command),runtime.rs(PRELUDE 增 onUiRender/onAction/onCommand)}`；`crates/adl-app/src/config.rs(PluginCfg/plugins/plugin_enabled)`；`crates/adl-gui/src/main.rs(Gui.hooks、build_hooks、load_plugin_settings/save_plugin_setting、IPC 增 ui_snapshot/ui_render/run_action/run_command/plugin_setting_set、set_settings 后重建 hooks)`；前端 `web/src/RenderNode.vue`（递归白名单渲染器）+ `App.vue`（插件页侧栏、动作按钮、插件设置区、Ctrl+K 命令面板、trusted 替换内置页）。
+- **示例插件**：`plugins/ui-demo/`（页面 + 工具栏动作 + 两个设置项 + 一个命令）。
+- **实测**（CDP 驱动真实 WebView2）：`ui_snapshot` 返回 trusted/pages/actions/commands/settings；`ui_render` 返回组件树并在真实 DOM 渲染出 `示例插件页面 · demo`；`run_action`/`run_command` 返回插件消息；`plugin_setting_set` 写入 `plugin-settings/ui-demo.json` 并即时回显；`safe` 模式下 `trusted=false`、`actions=[]`、`commands=[]`、`settings[].editable=false`（页面仍在）；侧栏出现"插件页面"分组、设置页出现"插件设置"区（2 项）、Ctrl+K 命令面板可弹出（1 项）。`cargo test`：adl-app 7 + adl-core 66 + adl-plugin 13 全绿。
+
 **M4 之后就可以开源。** UI 和插件生态是后续加分项。
 
 ---

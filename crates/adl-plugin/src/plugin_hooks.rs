@@ -65,6 +65,57 @@ impl PluginHooks {
             Err(_) => p.invoke_sync(hook, payload),
         }
     }
+
+    /// 汇总所有插件的 UI 声明（页面/按钮/设置/命令/替换内置页）。
+    pub fn ui_snapshot(&self, values: &crate::ui::SettingsValues) -> Value {
+        let trusted = self.plugins.iter().any(|p| p.mode.trusted());
+        crate::ui::collect(&self.plugins, values, trusted)
+    }
+
+    fn find(&self, plugin: &str) -> Option<&LoadedPlugin> {
+        self.plugins.iter().find(|p| p.id == plugin)
+    }
+
+    /// 调插件 `onUiRender(page, ctx)`，返回声明式组件树。
+    pub fn render(&self, plugin: &str, page: &str, ctx: &Value) -> Option<Value> {
+        let p = self.find(plugin)?;
+        let payload = json!({ "page": page, "ctx": ctx }).to_string();
+        let s = self.sync_call(p, "onUiRender", &payload)?;
+        serde_json::from_str::<Value>(&s).ok()
+    }
+
+    /// 调插件 `onAction(action, payload)`（仅 trusted）。
+    pub fn run_action(&self, plugin: &str, action: &str, payload: &Value) -> Option<Value> {
+        let p = self.find(plugin)?;
+        if !p.mode.trusted() {
+            return None;
+        }
+        let body = json!({ "action": action, "payload": payload }).to_string();
+        let s = self.sync_call(p, "onAction", &body)?;
+        serde_json::from_str::<Value>(&s).ok()
+    }
+
+    /// 调插件 `onCommand(command)`（仅 trusted）。
+    pub fn run_command(&self, plugin: &str, command: &str) -> Option<Value> {
+        let p = self.find(plugin)?;
+        if !p.mode.trusted() {
+            return None;
+        }
+        let body = json!({ "command": command }).to_string();
+        let s = self.sync_call(p, "onCommand", &body)?;
+        serde_json::from_str::<Value>(&s).ok()
+    }
+
+    /// 是否有任何插件声明了 UI。
+    pub fn has_ui(&self) -> bool {
+        self.plugins.iter().any(|p| {
+            let u = &p.manifest.ui;
+            !u.pages.is_empty()
+                || !u.actions.is_empty()
+                || !u.settings.is_empty()
+                || !u.commands.is_empty()
+        })
+    }
 }
 
 fn merge_header(headers: &mut Vec<(String, String)>, k: &str, v: &str) {

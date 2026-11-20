@@ -12,6 +12,7 @@ use adl_core::hooks::Hooks;
 use adl_core::{download, DownloadOptions, Progress};
 use adl_plugin::{Mode, PluginHooks};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -41,16 +42,18 @@ struct Task {
     handle: Option<tokio::task::JoinHandle<()>>,
 }
 
-struct Gui {
+pub(crate) struct Gui {
     pub(crate) tasks: Mutex<Vec<Task>>,
     pub(crate) next_id: AtomicU64,
     pub(crate) rt: tokio::runtime::Runtime,
     pub(crate) proxy: EventLoopProxy<UserEvent>,
     pub(crate) cfg: Mutex<Config>,
+    pub(crate) hooks: Mutex<Arc<PluginHooks>>,
 }
 
 fn main() {
     let cfg = Config::load();
+    let initial_hooks = build_hooks(&cfg);
 
     let web_root = match find_web_root() {
         Some(p) => p,
@@ -78,6 +81,7 @@ fn main() {
         rt,
         proxy: proxy.clone(),
         cfg: Mutex::new(cfg),
+        hooks: Mutex::new(initial_hooks),
     });
 
     // 本地 API：供浏览器扩展把下载转交给 ADL
@@ -231,6 +235,53 @@ fn handle_ipc(gui: &Arc<Gui>, body: &str) -> Option<String> {
         "pause" => pause_task(gui, &args),
         "remove" => remove_task(gui, &args),
         "open_dir" => Ok(json!({"ok": true})),
+        "ui_snapshot" => {
+            let values = load_plugin_settings();
+            let hooks = gui.hooks.lock().unwrap().clone();
+            Ok(hooks.ui_snapshot(&values))
+        }
+        "ui_render" => {
+            let plugin = args.get("plugin").and_then(|x| x.as_str()).unwrap_or("");
+            let page = args.get("page").and_then(|x| x.as_str()).unwrap_or("");
+            let ctx = args.get("ctx").cloned().unwrap_or_else(|| json!({}));
+            let hooks = gui.hooks.lock().unwrap().clone();
+            Ok(hooks
+                .render(plugin, page, &ctx)
+                .unwrap_or_else(|| json!({"type":"text","value":"（插件没有返回内容）"})))
+        }
+        "run_action" => {
+            let plugin = args.get("plugin").and_then(|x| x.as_str()).unwrap_or("");
+            let action = args.get("action").and_then(|x| x.as_str()).unwrap_or("");
+            let payload = args.get("payload").cloned().unwrap_or_else(|| json!({}));
+            let hooks = gui.hooks.lock().unwrap().clone();
+            match hooks.run_action(plugin, action, &payload) {
+                Some(v) => Ok(v),
+                None => Err("插件动作不可用（需要 trusted 模式）".into()),
+            }
+        }
+        "run_command" => {
+            let plugin = args.get("plugin").and_then(|x| x.as_str()).unwrap_or("");
+            let command = args.get("command").and_then(|x| x.as_str()).unwrap_or("");
+            let hooks = gui.hooks.lock().unwrap().clone();
+            match hooks.run_command(plugin, command) {
+                Some(v) => Ok(v),
+                None => Err("插件命令不可用（需要 trusted 模式）".into()),
+            }
+        }
+        "plugin_setting_set" => {
+            let plugin = args.get("plugin").and_then(|x| x.as_str()).unwrap_or("");
+            let key = args.get("key").and_then(|x| x.as_str()).unwrap_or("");
+            let value = args.get("value").and_then(|x| x.as_str()).unwrap_or("");
+            if plugin.is_empty() || key.is_empty() {
+                Err("缺少 plugin 或 key".to_string())
+            } else {
+                save_plugin_setting(plugin, key, value).map(|_| {
+                    let values = load_plugin_settings();
+                    let hooks = gui.hooks.lock().unwrap().clone();
+                    hooks.ui_snapshot(&values)
+                })
+            }
+        }
         other => Err(format!("未知命令: {other}")),
     };
 
@@ -245,8 +296,84 @@ fn handle_ipc(gui: &Arc<Gui>, body: &str) -> Option<String> {
     ))
 }
 
-pub(crate) fn gui_snapshot(gui: &Arc<Gui>) -> Value {
-    let tasks = gui.tasks.lock().unwrap();
+fn plugins_root(cfg: &Config) -> Option<PathBuf> {
+    cfg.plugin_dir_opt().or_else(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("plugins")))
+    })
+}
+
+/// 按当前配置加载插件（含按主配置的 enabled 开关过滤）。
+fn build_hooks(cfg: &Config) -> Arc<PluginHooks> {
+    let mode = if cfg.mode_trusted() { Mode::Trusted } else { Mode::Safe };
+    match plugins_root(cfg) {
+        Some(dir) if dir.is_dir() => {
+            let all = adl_plugin::load_dir(&dir, mode);
+            let kept: Vec<_> = all
+                .into_iter()
+                .filter(|p| cfg.plugin_enabled(&p.id))
+                .collect();
+            Arc::new(PluginHooks::new(kept))
+        }
+        _ => Arc::new(PluginHooks::new(Vec::new())),
+    }
+}
+
+fn plugin_settings_dir() -> PathBuf {
+    adl_app::config::app_data_dir().join("plugin-settings")
+}
+
+/// 读所有插件自己的设置文件（`plugin-settings/<id>.json`）。
+fn load_plugin_settings() -> adl_plugin::ui::SettingsValues {
+    let mut out = BTreeMap::new();
+    if let Ok(rd) = std::fs::read_dir(plugin_settings_dir()) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(id) = p.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let Ok(txt) = std::fs::read_to_string(&p) else {
+                continue;
+            };
+            let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&txt) else {
+                continue;
+            };
+            let mut inner = BTreeMap::new();
+            for (k, v) in map {
+                let sv = match v {
+                    Value::String(s) => s,
+                    other => other.to_string(),
+                };
+                inner.insert(k, sv);
+            }
+            out.insert(id.to_string(), inner);
+        }
+    }
+    out
+}
+
+fn save_plugin_setting(plugin: &str, key: &str, value: &str) -> Result<(), String> {
+    let dir = plugin_settings_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join(format!("{plugin}.json"));
+    let mut map: BTreeMap<String, Value> = if let Ok(t) = std::fs::read_to_string(&path) {
+        serde_json::from_str(&t).unwrap_or_default()
+    } else {
+        BTreeMap::new()
+    };
+    map.insert(key.to_string(), Value::String(value.to_string()));
+    let txt = serde_json::to_string_pretty(&map).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, txt).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub(crate) fn gui_snapshot(gui: &Arc<Gui>) -> Value {    let tasks = gui.tasks.lock().unwrap();
     let arr: Vec<Value> = tasks
         .iter()
         .map(|t| {
@@ -301,7 +428,12 @@ fn set_settings(gui: &Arc<Gui>, args: &Value) -> Result<Value, String> {
         cfg.plugin_dir = pd.to_string();
     }
     cfg.save().map_err(|e| format!("保存配置失败: {e}"))?;
-    Ok(settings_json(&cfg))
+    let snapshot = settings_json(&cfg);
+    let new_cfg = cfg.clone();
+    drop(cfg);
+    // 设置可能改了插件目录/模式/开关，重建插件实例
+    *gui.hooks.lock().unwrap() = build_hooks(&new_cfg);
+    Ok(snapshot)
 }
 
 pub(crate) fn add_task(gui: &Arc<Gui>, args: &Value) -> Result<Value, String> {
@@ -355,23 +487,7 @@ pub(crate) fn add_task(gui: &Arc<Gui>, args: &Value) -> Result<Value, String> {
         }
     }
 
-    let mode = if cfg.mode_trusted() { Mode::Trusted } else { Mode::Safe };
-    let plugin_root = cfg.plugin_dir_opt().or_else(|| {
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.join("plugins")))
-    });
-    let hooks: Arc<dyn Hooks> = match plugin_root {
-        Some(dir) if dir.is_dir() => {
-            let ph = PluginHooks::load(&dir, mode);
-            if ph.is_empty() {
-                Arc::new(adl_core::NoopHooks)
-            } else {
-                Arc::new(ph)
-            }
-        }
-        _ => Arc::new(adl_core::NoopHooks),
-    };
+    let hooks: Arc<dyn Hooks> = gui.hooks.lock().unwrap().clone();
 
     let id = gui.next_id.fetch_add(1, Ordering::SeqCst);
     {

@@ -72,12 +72,13 @@ adl.settings.get("key", 默认值);          // 需要 --trusted
 - 有 3 秒（`timeout_ms`，默认 3000）硬超时；写死循环会被中断。
 - 内存上限默认 32 MB。
 
-## 自带的 4 个插件
+## 自带的 5 个插件
 
 - **ua-fixer**：给指定站点换上特定浏览器的 UA（默认 Edge）。改 `main.js` 里的 `UA` / `ONLY_HOSTS`。
 - **auto-concurrency**：按域名调并发（github/githubusercontent/sourceforge 用 4，tencent 用 1）。改 `RULES`。
 - **notify-on-complete**：下载完成后发通知（Observe，安全模式可用）。
 - **block-html**：服务器返回 `text/html` 时拒绝写入（拦错误页/登录页）。**如果你确实要下 HTML 网页，请关掉它。**
+- **ui-demo**：演示插件 UI 扩展点（页面 + 工具栏动作 + 设置项 + 命令）。
 
 ## 安全说明（重要）
 
@@ -91,3 +92,49 @@ adl.settings.get("key", 默认值);          // 需要 --trusted
 - 插件启动失败会打印 `[plugin] …` 到 stderr。
 - `adl.log()` 也走 stderr。
 - 单测：`cargo test -p adl-plugin`。
+
+## 插件 UI 扩展点（改界面）
+
+插件可以给 ADL 加**页面 / 工具栏按钮 / 设置项 / Ctrl+K 命令**，trusted 模式下还能**替换内置页面**。插件返回的是**声明式 JSON 组件树**，宿主用白名单渲染器画成真实界面——插件拿不到 DOM，不能注入 `<script>`，读不到 cookie。
+
+manifest 里加 `[ui]` 段：
+
+```toml
+[[ui.pages]]
+id = "demo"                    # 侧边栏「插件页面」里的一页
+title = "示例页面"
+# replaces = "tasks"           # 仅 trusted：用本页替换内置页 tasks|add|settings
+
+[[ui.actions]]
+id = "hello"
+label = "示例动作"
+place = "toolbar"              # toolbar（任务页顶部）或 task（每个任务行）
+
+[[ui.settings]]
+key = "greeting"
+label = "问候语"
+kind = "string"                # boolean | string | number | select
+default = "你好"
+
+[[ui.commands]]
+id = "say-hi"
+title = "示例：打个招呼"        # Ctrl+K 命令面板里的一条
+```
+
+```js
+adl.onUiRender((req) => ({
+  type: "col",
+  children: [
+    { type: "heading", value: "示例页面 · " + req.page },
+    { type: "progress", value: 42, total: 100 },
+    { type: "button", label: "点我", action: "hello", kind: "ghost" },
+  ],
+}));
+adl.onAction((req) => ({ message: "收到动作：" + req.action }));
+adl.onCommand((req) => ({ message: "命令响应" }));
+```
+
+- 组件白名单：`text / heading / badge / divider / spacer / row / col / button / input / select / toggle / progress / list`；每个节点可有 `children: []`。
+- 按钮的 `action` 会回调到 `adl.onAction`（仅 trusted 生效）；`input/select/toggle` 上的 `setting` 会双向绑定到插件设置。
+- **分级**：`safe` 只给页面（只读）+ 设置项（只读）；`trusted` 才给动作、命令、可编辑设置、替换内置页。
+- 设置存储：主 `config.toml` 只存每插件 `enabled` 开关；详细值在 `%LOCALAPPDATA%\ADL\plugin-settings\<id>.json`。

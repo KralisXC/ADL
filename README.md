@@ -115,17 +115,62 @@ memory_mb = 32
 
 ```js
 // main.js
-globalThis.onBeforeRequest = function (ctx) {
+adl.onBeforeRequest(function (ctx) {
   // ctx = { url, segIndex, start, end }
   return { action: "pass" };            // 或 { action: "deny", reason: "..." }
   //      或 { action: "rewrite", headers: { "User-Agent": "..." } }
-};
+});
 ```
 
 - 9 个 hook 点：`onResolve` / `onPlan` / `onBeforeRequest` / `onResponse` / `onProgress` / `onRetry` / `onPreempt` / `onDegrade` / `onComplete`。
 - **安全模式**：`--safe`（默认）只允许 Observe（观察类）+ Guard（拦截类，只能放行/拒绝）；`--trusted` 才允许 Transform（改写 URL / 请求头 / 分片方案）。默认从配置文件 `mode` 读取。
 - 权限**声明 ≠ 授权**：manifest 里声明了才可能被允许，未声明的调用一律拒绝并审计。
-- 详见 [plugins/README.md](plugins/README.md)。内置示例：`ua-fixer`、`auto-concurrency`、`notify-on-complete`、`block-html`。
+- 详见 [plugins/README.md](plugins/README.md)。内置示例：`ua-fixer`、`auto-concurrency`、`notify-on-complete`、`block-html`、`ui-demo`。
+
+## 插件 UI 扩展点
+
+插件不仅能改下载行为，还能改**界面本身**（"插件为大"）。插件返回**声明式 JSON 组件树**，由宿主用白名单渲染器画成真实界面——插件**拿不到 DOM、不能注入 `<script>`、读不到 cookie**。
+
+manifest 里加 `[ui]` 段即可：
+
+```toml
+[[ui.pages]]
+id = "demo"
+title = "示例页面"
+
+[[ui.actions]]
+id = "hello"
+label = "示例动作"
+place = "toolbar"
+
+[[ui.settings]]
+key = "greeting"
+label = "问候语"
+kind = "string"
+default = "你好"
+
+[[ui.commands]]
+id = "say-hi"
+title = "示例：打个招呼"
+```
+
+```js
+adl.onUiRender((req) => ({
+  type: "col",
+  children: [
+    { type: "heading", value: "示例页面" },
+    { type: "progress", value: 42, total: 100 },
+    { type: "button", label: "点我", action: "hello" },
+  ],
+}));
+adl.onAction((req) => ({ message: "动作：" + req.action }));
+adl.onCommand(() => ({ message: "命令响应" }));
+```
+
+- 组件白名单：`text/heading/badge/divider/spacer/row/col/button/input/select/toggle/progress/list`。
+- **分级**：`safe` 只给页面（只读）与设置项；`trusted` 才给动作、Ctrl+K 命令、可编辑设置，以及"替换内置页面"（`replaces = "tasks|add|settings"`）。
+- 设置存储分两处：主 `config.toml` 只存每插件 `enabled` 开关；详细设置在各插件自己的 `plugin-settings/<id>.json`。
+- 示例见 `plugins/ui-demo/`。
 
 ## 状态
 
@@ -135,6 +180,7 @@ globalThis.onBeforeRequest = function (ctx) {
 - ✅ M4 CLI 完整（配置 + 历史 + 子命令），v0.1 可用
 - ✅ M5 图形界面（wry + WebView2 + 托盘 + Vue SFC 前端）
 - ✅ M6 浏览器接管（MV3 扩展 + 本地 API，未做剪贴板）
+- ✅ 插件 UI 扩展点（页面/动作/设置/命令，trusted 可替换内置页面）
 
 设计文档见 [docs/DESIGN.md](docs/DESIGN.md)。
 

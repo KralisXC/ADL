@@ -7,7 +7,26 @@
 //! 命令行显式给出的参数总是覆盖配置里的同名项。
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+
+/// 主配置里每个插件只写一小段（开关等），详细设置在各自的
+/// `%LOCALAPPDATA%\ADL\plugin-settings\<id>.json` 里，避免主配置膨胀。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginCfg {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for PluginCfg {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
 
 /// 应用数据目录（历史记录、默认配置都放这）。
 pub fn app_data_dir() -> PathBuf {
@@ -60,6 +79,8 @@ pub struct Config {
     pub plugin_dir: String,
     /// 是否记录下载历史
     pub history_enabled: bool,
+    /// 每个插件的一小段主配置（只用 enabled 开关；详细设置在各插件自己的 json 里）
+    pub plugins: BTreeMap<String, PluginCfg>,
 }
 
 impl Default for Config {
@@ -75,6 +96,7 @@ impl Default for Config {
             mode: "safe".to_string(),
             plugin_dir: String::new(),
             history_enabled: true,
+            plugins: BTreeMap::new(),
         }
     }
 }
@@ -105,6 +127,11 @@ impl Config {
 
     pub fn mode_trusted(&self) -> bool {
         self.mode.eq_ignore_ascii_case("trusted")
+    }
+
+    /// 插件是否启用（主配置里没有该条目时默认启用）。
+    pub fn plugin_enabled(&self, id: &str) -> bool {
+        self.plugins.get(id).map(|p| p.enabled).unwrap_or(true)
     }
 
     pub fn dir_path(&self) -> PathBuf {
