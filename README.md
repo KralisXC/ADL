@@ -172,6 +172,8 @@ adl.onCommand(() => ({ message: "命令响应" }));
 - 设置存储分两处：主 `config.toml` 只存每插件 `enabled` 开关；详细设置在各插件自己的 `plugin-settings/<id>.json`。
 - 示例见 `plugins/ui-demo/`。
 
+![插件 UI 示例页面](docs/images/plugin-ui.png)
+
 ## 状态
 
 - ✅ M1 单流 + 断点续传
