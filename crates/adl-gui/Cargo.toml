@@ -12,6 +12,8 @@ path = "src/main.rs"
 adl-core = { path = "../adl-core" }
 adl-plugin = { path = "../adl-plugin" }
 adl-app = { path = "../adl-app" }
+# 自研 UI 组件库（主题令牌 + 控件 + 声明式表单/表格）
+adl-ui = { path = "../adl-ui" }
 # 纯 Rust 原生 GUI：不依赖 WebView2，跨 Windows/Linux/macOS。
 # 同时编入两个渲染后端，运行时用 ADL_RENDERER 选择：
 #   - glow (OpenGL)  —— 默认，兼容性最好（虚拟机/远程桌面/老核显都能开）

@@ -1273,9 +1273,78 @@ M5 的界面是 tao + wry + WebView2 + Vue。WebView2 缺失或"残缺版 Window
 - 不要用 `Get-Content`/`Set-Content` 批量改 Rust 源文件里的中文 —— 会把 UTF-8 字符串写坏成 `\u{3220}` 之类，rustc 报 `unknown start of token`。用编辑工具改。
 - 调试辅助：`ADL_TAB=tasks|add|settings` 可让程序直接落到指定页，省去模拟点击。
 
-### 13.9 待续
+### 13.9 自研 UI 组件库（`crates/adl-ui`）
+
+手写 egui 到第三页时已经明显低效：每加一行设置要写 `label_cell` + `add_sized` +
+`end_row`，每加一列表格要写五遍 `table_cell`。所以把重复样板抽成独立 crate。
+
+**为什么不直接用 `egui_extras`**：`TableBuilder` 自带虚拟化与列宽拖拽，但为列宽
+拖拽要拉 `enum-map` 等依赖，而我们要的只是"固定列宽 + 一列吃剩余 + 截断"这种
+最朴素的语义。自己的 `table.rs` 149 行、零新增依赖，正好够用。
+
+**三层结构**（合计 854 行）：
+
+| 文件 | 行数 | 职责 |
+|---|---|---|
+| `theme.rs` | 285 | 全部主题令牌：`Palette`（颜色）/ `Spacing`（间距）/ `Radius`（圆角）/ `TextSize`（字号），外加 `install_and_apply(ctx)` 一次性装好 `Visuals` 与 `TextStyle`。换肤只改这里 |
+| `widgets.rs` | 176 | egui 表达力不足、需要反复手写的控件：`cell` / `label_cell` / `nav_item` / `small_button` / `mode_pill` / `badge` / `card` / `section_title` / `hint` / `empty_state` |
+| `form.rs` | 229 | `Field` 枚举 + `form()`：一个字段一行，自动画"标签格 + 控件 + 说明" |
+| `table.rs` | 149 | `Column` / `table()` / `virtual_table()` / `truncated()`：定宽列 + 一列吃剩余 + 视口虚拟化 |
+
+**收益（实测）**：
+
+- `crates/adl-gui/src/main.rs` 从 1857 行降到 **1625 行**（−232 行）
+- 胶水调用基本清零：`ui.end_row` 8→0、`Grid::new` 3→1（只在注释里）、
+  `add_sized` 5→0、`table_cell` 15→0
+- 设置页从 201 行降到约 45 行；任务列表从 176 行降到约 150 行（且列宽逻辑内聚）
+- 体积代价：可忽略（exe 10.6 MB，比加组件库前的 12.45 MB 还小——省掉的重复
+  代码与常量折叠都有贡献）
+
+**新增一页的标准写法**：
+
+```rust
+let mut fields = vec![
+    adl_ui::Field::text("默认下载目录", &mut self.s_dir).hint("留空 = 当前目录"),
+    adl_ui::Field::number("并发数", &mut self.s_conn, 1..=64).note("服务器不给满会自动降"),
+    adl_ui::Field::select("插件模式", &mut self.s_mode, &opts),
+    adl_ui::Field::checkbox("HTTP/1.1", &mut self.s_http1, "强制使用 HTTP/1.1"),
+];
+adl_ui::form(ui, "下载", &mut fields);
+```
+
+```rust
+let cols = [
+    adl_ui::Column::new("状态", 72.0),
+    adl_ui::Column::remainder("文件"),   // 吃掉剩余宽度
+    adl_ui::Column::new("进度", 150.0),
+];
+adl_ui::table(ui, &cols, tasks.len(), |ui, i, w| {
+    adl_ui::widgets::cell(ui, w[0], |ui| { ui.label(&tasks[i].status); });
+    // ...
+});
+```
+
+**为什么这和插件 UI 是同一套**：`lib.rs` 的文档注释写明本体 GUI 与插件渲染器
+共用这一套，所以插件的声明式组件树画出来与本体的界面是同一个视觉语言，而不是
+"插件的东西看着像另一个软件"。
+
+**踩过的坑**：
+
+- `cell()` 里 `set_min_width` **必须**有：`allocate_ui_with_layout` 只给 max_rect，
+  水平布局前进时用的是子 Ui 的"已用宽度"，表头文字窄就会各列挤在一起（这就是
+  v4 之前六列全挤在左边的根因）。
+- `label_cell` 不能用 `ui.add_sized([w,h], Label::new(..).halign(Align::LEFT))`：
+  那样观感是居中（看起来像右对齐），必须显式建 `Layout::left_to_right(Align::Center)`。
+- 表单的 `Field::Text { value: &'a mut String }` 在 `iter_mut()` 解构后是
+  `&mut &mut String`，传给 `TextEdit::singleline` 要解两层（`&mut **value`）。
+- 失败原因**不要**塞进"进度"列：150px 装不下，实测被截成"资源不存在（HTTP 4…"。
+  改成进度列给短标记"已中断"，完整原因挂到状态列的悬停提示。
+
+### 13.10 待续
 - 托盘菜单已接；"关闭到托盘"= `CancelClose` + `Visible(false)`，靠托盘"显示主界面"恢复。
 - Linux/macOS 需在 `eframe` features 补 `x11`/`wayland`；`platform.rs` 的 Win32 部分已用 `#[cfg(windows)]` 隔离。
 - 旧的 `web/`（Vue）与 `static_server.rs` 已不再编入（保留仅作历史），后续可清理。
+- `adl-ui` 尚未接管插件渲染器 `render_node`（目前直接调 egui，观感已一致但没共用
+  代码）；下一步可让 `render_node` 也走 `adl_ui::widgets`。
 
 

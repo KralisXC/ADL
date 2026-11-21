@@ -1,0 +1,11 @@
+[package]
+name = "adl-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ADL 自研 UI 组件库：主题令牌 + 控件 + 声明式表单/表格"
+
+# 只依赖 egui（不依赖 eframe）：这样本体 GUI 与插件渲染器共用同一套组件，
+# 将来若换窗口层（eframe/winit）这套组件不受影响。
+[dependencies]
+egui = "0.37"
