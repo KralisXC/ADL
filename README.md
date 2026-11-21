@@ -65,9 +65,28 @@ history_enabled = true
 
 命令行的显式参数会覆盖配置里的同名项。
 
-## 图形界面（M5）
+## 原生界面（纯 Rust · egui，不依赖 WebView2）✅ 推荐
 
-`adl-gui.exe` 是一个基于 tao + wry（WebView2）的桌面窗口，带托盘图标，前端是 Vue SFC + vite 构建。
+`adl-gui.exe` 现在是 **纯 Rust 原生桌面界面**：`eframe`(`egui`) + `glow`(OpenGL) 后端，**不需要 WebView2、不需要 Node/vite**，单个 exe，跨 Windows / Linux / macOS。
+
+```bash
+cargo build --release -p adl-gui
+# 产物：target/release/adl-gui.exe（Windows 为 target/x86_64-pc-windows-msvc/release/adl-gui.exe）
+```
+
+- 三个页面：任务列表（进度/暂停/删除）、添加下载、设置（目录/并发/限速/代理/插件模式）。
+- 支持插件声明式 UI 页面、动作按钮、插件设置、命令面板（Ctrl+K）。
+- 单实例（再次启动会唤醒已有窗口）、关闭到托盘（点托盘「显示主界面」恢复）、系统休眠自动暂停。
+- 与 CLI 共用 `adl-core` 引擎、`adl-plugin` 插件、`adl-app` 配置/历史；浏览器接管 API 同进程运行。
+
+> 为什么用 glow 而不是默认的 wgpu：wgpu 后端在部分虚拟机 / 远程桌面环境会因 surface 丢失让进程静默退出；glow 稳定且体积更小。
+
+## 图形界面（M5 · 旧方案：tao + wry + WebView2，已弃用）
+
+> 已被上面的「原生界面」取代，仅保留说明。旧的 `web/`（Vue）与 `static_server.rs` 不再编入。
+
+`adl-gui.exe` 曾是基于 tao + wry（WebView2）的桌面窗口，前端是 Vue SFC + vite 构建。
+
 
 ```bash
 cd web
@@ -187,10 +206,11 @@ adl.onCommand(() => ({ message: "命令响应" }));
 - ✅ M2 并发分片 + 限速 + 重试 + 自适应降档
 - ✅ M3 插件系统（QuickJS + TOML manifest + 权限 + 安全模式）
 - ✅ M4 CLI 完整（配置 + 历史 + 子命令），v0.1 可用
-- ✅ M5 图形界面（wry + WebView2 + 托盘 + Vue SFC 前端）
+- ✅ M5 图形界面（先 wry + WebView2 + Vue；**已迁移为纯 Rust 原生界面 egui，不再依赖 WebView2**）
 - ✅ M6 浏览器接管（MV3 扩展 + 本地 API，未做剪贴板）
 - ✅ 插件 UI 扩展点（页面/动作/设置/命令，trusted 可替换内置页面）
-- ✅ 桌面集成（单实例 + 关闭到托盘 + 休眠/唤醒自动暂停 + WebView2 缺失时降级浏览器模式）
+- ✅ 桌面集成（单实例 + 关闭到托盘 + 休眠/唤醒自动暂停）
+- ✅ 原生 UI（egui + glow，跨 Windows/Linux/macOS，无 WebView2）
 
 设计文档见 [docs/DESIGN.md](docs/DESIGN.md)。
 

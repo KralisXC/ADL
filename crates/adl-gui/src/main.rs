@@ -1,468 +1,965 @@
-//! ADL 图形界面（M5 最小可用版）。
+//! ADL 图形界面：纯 Rust 原生 UI（egui / eframe），**不依赖 WebView2**。
+//! 跨平台：Windows / Linux / macOS 均可编译运行。
 //!
-//! 结构：tao 事件循环 + wry(WebView2) 窗口 + 本地静态服务器 + 托盘图标。
-//! 前端是 Vue SFC（vite 构建产物），通过 `window.ipc.postMessage` 和
-//! `window.__ipcResolve/__ipcEmit` 与 Rust 通信（复用上一版验证过的 IPC 协议）。
+//! 本文件只负责“壳”（窗口与交互）；下载引擎在 `adl-core`，插件在 `adl-plugin`，
+//! 配置与历史在 `adl-app`。浏览器接管用的本地 HTTP API 仍由 `api_server` 提供。
 
 mod api_server;
 mod platform;
-mod static_server;
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use eframe::egui;
+use serde_json::{json, Value};
+use tray_icon::menu::{Menu, MenuEvent, MenuItem};
+use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 use adl_app::config::Config;
 use adl_core::hooks::Hooks;
 use adl_core::{download, DownloadOptions, Progress};
 use adl_plugin::{Mode, PluginHooks};
-use serde_json::{json, Value};
-use std::collections::BTreeMap;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-use tao::dpi::LogicalSize;
-use tao::event::{Event, StartCause, WindowEvent};
-use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget};
-use tao::window::{Window, WindowBuilder};
-use tray_icon::menu::{Menu, MenuEvent, MenuItem};
-use tray_icon::{Icon, TrayIconBuilder};
-use wry::{WebView, WebViewBuilder};
 
-enum UserEvent {
-    /// 向前端发一个事件：名字 + JSON 载荷
-    Emit(&'static str, String),
-    /// 第二个实例唤醒本实例，把窗口显示出来
-    Show,
-    /// 系统即将休眠
-    Suspend,
-    /// 系统从休眠恢复
-    Resume,
-}
+// ───────────────────────── 共享状态 ─────────────────────────
 
-struct Task {
-    id: u64,
-    url: String,
-    status: String, // downloading | paused | completed | failed
-    completed: u64,
-    total: u64,
-    speed: u64,
-    path: Option<String>,
-    error: Option<String>,
-    handle: Option<tokio::task::JoinHandle<()>>,
+pub(crate) struct Task {
+    pub(crate) id: u64,
+    pub(crate) url: String,
+    pub(crate) status: String,
+    pub(crate) completed: u64,
+    pub(crate) total: u64,
+    pub(crate) speed: u64,
+    pub(crate) path: Option<String>,
+    pub(crate) error: Option<String>,
+    pub(crate) handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 pub(crate) struct Gui {
     pub(crate) tasks: Mutex<Vec<Task>>,
     pub(crate) next_id: AtomicU64,
     pub(crate) rt: tokio::runtime::Runtime,
-    pub(crate) proxy: EventLoopProxy<UserEvent>,
     pub(crate) cfg: Mutex<Config>,
     pub(crate) hooks: Mutex<Arc<PluginHooks>>,
 }
 
-fn main() {
-    // ── 单实例：已有实例在跑就唤醒它并退出 ──
-    let _instance = match platform::acquire_single_instance() {
-        Some(i) => i,
-        None => {
-            let woke = platform::signal_existing_instance();
-            if woke {
-                eprintln!("ADL 已在运行，已唤醒现有窗口。");
-            } else {
-                eprintln!("ADL 已在运行。");
-            }
+#[derive(Clone)]
+struct TaskView {
+    id: u64,
+    url: String,
+    status: String,
+    completed: u64,
+    total: u64,
+    speed: u64,
+    path: Option<String>,
+    error: Option<String>,
+}
+
+fn snapshot(gui: &Gui) -> Vec<TaskView> {
+    gui.tasks
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|t| TaskView {
+            id: t.id,
+            url: t.url.clone(),
+            status: t.status.clone(),
+            completed: t.completed,
+            total: t.total,
+            speed: t.speed,
+            path: t.path.clone(),
+            error: t.error.clone(),
+        })
+        .collect()
+}
+
+// ───────────────────────── 应用 ─────────────────────────
+
+#[derive(Clone, PartialEq)]
+enum Tab {
+    Tasks,
+    Add,
+    Settings,
+    Plugin(String, String),
+}
+
+enum Dispatch {
+    Action { plugin: String, action: String },
+    Setting { plugin: String, key: String, value: String },
+}
+
+struct App {
+    gui: Arc<Gui>,
+    tab: Tab,
+    // 添加下载表单
+    f_url: String,
+    f_out: String,
+    // 设置表单
+    s_dir: String,
+    s_conn: usize,
+    s_limit: u64,
+    s_proxy: String,
+    s_mode: String,
+    s_http1: bool,
+    s_plugin_dir: String,
+    // 提示
+    status: Option<(String, bool, Instant)>,
+    // 插件 UI 缓存
+    plugin_snapshot: Value,
+    plugin_snapshot_at: Instant,
+    plugin_view: Option<Value>,
+    plugin_edit: BTreeMap<(String, String), String>,
+    // 唤醒/电源标志
+    wake: Arc<AtomicBool>,
+    suspend: Arc<AtomicBool>,
+    resume: Arc<AtomicBool>,
+    cmd_open: bool,
+    cmd_query: String,
+    // 托盘图标：持有即可保活（Windows 上 tray-icon 自己带消息线程）
+    _tray: Option<TrayIcon>,
+}
+
+impl App {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        gui: Arc<Gui>,
+        wake: Arc<AtomicBool>,
+        suspend: Arc<AtomicBool>,
+        resume: Arc<AtomicBool>,
+        tray: Option<TrayIcon>,
+    ) -> Self {
+        install_cjk_font(&cc.egui_ctx);
+        let mut style = (*cc.egui_ctx.style_of(egui::Theme::Light)).clone();
+        style.visuals = egui::Visuals::light();
+        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+        style.spacing.button_padding = egui::vec2(10.0, 6.0);
+        cc.egui_ctx.set_style_of(egui::Theme::Light, style.clone());
+        cc.egui_ctx.set_style_of(egui::Theme::Dark, style);
+
+        let cfg = gui.cfg.lock().unwrap().clone();
+        Self {
+            gui,
+            tab: Tab::Tasks,
+            f_url: String::new(),
+            f_out: String::new(),
+            s_dir: cfg.dir.clone(),
+            s_conn: cfg.connections,
+            s_limit: cfg.limit,
+            s_proxy: cfg.proxy.clone(),
+            s_mode: if cfg.mode_trusted() { "trusted".into() } else { "safe".into() },
+            s_http1: cfg.http1,
+            s_plugin_dir: cfg.plugin_dir.clone(),
+            status: None,
+            plugin_snapshot: json!({}),
+            plugin_snapshot_at: Instant::now() - Duration::from_secs(3600),
+            plugin_view: None,
+            plugin_edit: BTreeMap::new(),
+            wake,
+            suspend,
+            resume,
+            cmd_open: false,
+            cmd_query: String::new(),
+            _tray: tray,
+        }
+    }
+
+    fn set_status(&mut self, msg: impl Into<String>, err: bool) {
+        self.status = Some((msg.into(), err, Instant::now()));
+    }
+
+    fn refresh_plugin_snapshot(&mut self) {
+        if self.plugin_snapshot_at.elapsed() < Duration::from_millis(1200) {
             return;
         }
-    };
+        let hooks = self.gui.hooks.lock().unwrap().clone();
+        self.plugin_snapshot = hooks.ui_snapshot(&load_plugin_settings());
+        self.plugin_snapshot_at = Instant::now();
+    }
 
-    let cfg = Config::load();
-    let initial_hooks = build_hooks(&cfg);
-
-    let web_root = match find_web_root() {
-        Some(p) => p,
-        None => {
-            eprintln!(
-                "找不到前端目录（web-dist / web/dist）。请先构建前端：cd web && npm run build"
-            );
-            std::process::exit(1);
+    fn reload_plugin_view(&mut self) {
+        if let Tab::Plugin(plugin, page) = self.tab.clone() {
+            let hooks = self.gui.hooks.lock().unwrap().clone();
+            let ctx = json!({});
+            self.plugin_view = hooks.render(&plugin, &page, &ctx);
         }
-    };
-
-    let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
-    let proxy = event_loop.create_proxy();
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("无法创建 tokio runtime");
-
-    let gui = Arc::new(Gui {
-        tasks: Mutex::new(Vec::new()),
-        next_id: AtomicU64::new(1),
-        rt,
-        proxy: proxy.clone(),
-        cfg: Mutex::new(cfg),
-        hooks: Mutex::new(initial_hooks),
-    });
-
-    // 本地 API：供浏览器扩展把下载转交给 ADL
-    let api_port = std::env::var("ADL_API_PORT")
-        .ok()
-        .and_then(|v| v.parse::<u16>().ok())
-        .unwrap_or(api_server::DEFAULT_PORT);
-    match api_server::start(gui.clone(), api_port) {
-        Ok(p) => eprintln!("[gui] 本地 API http://127.0.0.1:{}", p),
-        Err(e) => eprintln!("[gui] 本地 API 启动失败（{}），浏览器接管不可用", e),
     }
 
-    // 静态服务器（同时提供 POST /ipc，供浏览器降级模式使用）
-    let ipc_handler: Arc<dyn Fn(&str) -> String + Send + Sync> = {
-        let g = gui.clone();
-        Arc::new(move |body: &str| dispatch_ipc_json(&g, body))
-    };
-    let (url, _port) =
-        static_server::start(web_root.clone(), Some(ipc_handler)).expect("无法启动本地静态服务器");
-    eprintln!("[gui] 静态服务器 {} (根目录 {})", url, web_root.display());
-
-    // WebView2 检测：缺失/残缺时降级为「浏览器模式」，UI 跑在默认浏览器里，
-    // 通过本地 HTTP 的 POST /ipc 与后端通信，功能完整。
-    let has_webview2 = std::env::var_os("ADL_FORCE_BROWSER").is_none()
-        && platform::webview2_available();
-    if !has_webview2 {
-        eprintln!(
-            "[gui] ⚠ 未检测到 WebView2 运行时，已降级为「浏览器模式」：界面开在你的默认浏览器里。"
-        );
-        eprintln!(
-            "[gui]   安装 WebView2（Edge 自带或微软官方 Runtime）后即可使用原生窗口，功能完全一致。"
-        );
+    fn do_add(&mut self) {
+        if self.f_url.trim().is_empty() {
+            self.set_status("请填写下载地址", true);
+            return;
+        }
+        let out = self.f_out.trim();
+        let args = json!({
+            "url": self.f_url.trim(),
+            "out": if out.is_empty() { Value::Null } else { json!(out) },
+        });
+        match add_task(&self.gui, &args) {
+            Ok(v) => {
+                let id = v.get("id").and_then(|x| x.as_u64()).unwrap_or(0);
+                self.set_status(format!("已添加任务 #{id}"), false);
+                self.f_url.clear();
+                self.f_out.clear();
+                self.tab = Tab::Tasks;
+            }
+            Err(e) => self.set_status(e, true),
+        }
     }
 
-    let (ipc_tx, ipc_rx) = std::sync::mpsc::channel::<String>();
-    let mut window: Option<Window> = None;
-    let mut webview: Option<WebView> = None;
-    if has_webview2 {
-        let (w, v) = make_window(&event_loop, &url, &ipc_tx);
-        window = Some(w);
-        webview = Some(v);
-    } else {
-        platform::open_in_browser(&url);
+    fn do_save_settings(&mut self) {
+        let args = json!({
+            "dir": self.s_dir,
+            "connections": self.s_conn,
+            "limit": self.s_limit,
+            "proxy": self.s_proxy,
+            "mode": self.s_mode,
+            "http1": self.s_http1,
+            "plugin_dir": self.s_plugin_dir,
+        });
+        match set_settings(&self.gui, &args) {
+            Ok(_) => {
+                self.set_status("已保存设置", false);
+                self.plugin_snapshot_at = Instant::now() - Duration::from_secs(3600);
+            }
+            Err(e) => self.set_status(e, true),
+        }
     }
 
-    // 托盘
-    let tray = build_tray();
+    fn run_action(&mut self, plugin: &str, action: &str) {
+        let hooks = self.gui.hooks.lock().unwrap().clone();
+        match hooks.run_action(plugin, action, &json!({})) {
+            Some(v) => {
+                let msg = v
+                    .get("message")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("插件动作已执行")
+                    .to_string();
+                self.set_status(msg, false);
+                self.reload_plugin_view();
+            }
+            None => self.set_status("插件动作不可用（需要 trusted 模式）", true),
+        }
+    }
 
-    // 唤醒监听（单实例第二个进程 → 本进程显示窗口）
-    {
-        let p = proxy.clone();
-        platform::spawn_wakeup_listener(move || {
-            let _ = p.send_event(UserEvent::Show);
+    fn run_command(&mut self, plugin: &str, command: &str) {
+        let hooks = self.gui.hooks.lock().unwrap().clone();
+        match hooks.run_command(plugin, command) {
+            Some(v) => {
+                let msg = v
+                    .get("message")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("命令已执行")
+                    .to_string();
+                self.set_status(msg, false);
+            }
+            None => self.set_status("插件命令不可用（需要 trusted 模式）", true),
+        }
+        self.cmd_open = false;
+    }
+
+    fn save_plugin_setting(&mut self, plugin: &str, key: &str, value: &str) {
+        if let Err(e) = save_plugin_setting(plugin, key, value) {
+            self.set_status(e, true);
+            return;
+        }
+        self.plugin_snapshot_at = Instant::now() - Duration::from_secs(3600);
+    }
+}
+
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+
+        // 处理唤醒 / 电源事件
+        if self.wake.swap(false, Ordering::SeqCst) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+        if self.suspend.swap(false, Ordering::SeqCst) {
+            pause_all(&self.gui);
+        }
+        if self.resume.swap(false, Ordering::SeqCst) {
+            self.set_status("系统已从休眠恢复，如需继续请点「继续」", false);
+        }
+
+        // 关闭到托盘：拦截关闭，改为隐藏窗口（不销毁，egui 无白屏问题）
+        if ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+
+        // 托盘菜单事件（显示主界面 / 退出）
+        while let Ok(ev) = MenuEvent::receiver().try_recv() {
+            match ev.id.0.as_str() {
+                "show" => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                "quit" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                _ => {}
+            }
+        }
+
+        // Ctrl+K 命令面板
+        if ctx.input(|i| i.key_pressed(egui::Key::K) && i.modifiers.ctrl) {
+            self.cmd_open = !self.cmd_open;
+        }
+
+        self.refresh_plugin_snapshot();
+
+        egui::CentralPanel::default().show(ui, |ui| {
+            // 顶栏
+            ui.horizontal(|ui| {
+                ui.heading("ADL");
+                ui.label(egui::RichText::new("下载器 · 纯 Rust 原生界面").weak());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("⏻ 退出").clicked() {
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+            });
+            ui.separator();
+
+            // 状态提示（6 秒后消失）
+            if let Some((msg, err, at)) = &self.status {
+                if at.elapsed() < Duration::from_secs(6) {
+                    let color = if *err {
+                        egui::Color32::from_rgb(0xB0, 0x30, 0x30)
+                    } else {
+                        egui::Color32::from_rgb(0x2E, 0x7D, 0x6B)
+                    };
+                    ui.horizontal(|ui| {
+                        ui.colored_label(color, if *err { "⚠" } else { "✓" });
+                        ui.colored_label(color, msg.as_str());
+                    });
+                }
+            }
+
+            let avail = ui.available_height();
+            ui.horizontal_top(|ui| {
+                // 左侧导航
+                ui.allocate_ui_with_layout(
+                    egui::vec2(180.0, avail),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| self.nav(ui),
+                );
+                ui.separator();
+                // 右侧内容
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        match self.tab.clone() {
+                            Tab::Tasks => self.page_tasks(ui),
+                            Tab::Add => self.page_add(ui),
+                            Tab::Settings => self.page_settings(ui),
+                            Tab::Plugin(_, _) => self.page_plugin(ui),
+                        }
+                    });
+            });
+        });
+
+        // 命令面板
+        if self.cmd_open {
+            self.show_command_palette(&ctx);
+        }
+
+        ctx.request_repaint_after(Duration::from_millis(250));
+    }
+}
+
+impl App {
+    fn nav(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(4.0);
+        if ui
+            .selectable_label(self.tab == Tab::Tasks, "📥  任务列表")
+            .clicked()
+        {
+            self.tab = Tab::Tasks;
+        }
+        if ui
+            .selectable_label(self.tab == Tab::Add, "➕  添加下载")
+            .clicked()
+        {
+            self.tab = Tab::Add;
+        }
+        if ui
+            .selectable_label(self.tab == Tab::Settings, "⚙  设置")
+            .clicked()
+        {
+            self.tab = Tab::Settings;
+        }
+
+        // 插件页面
+        let pages = self
+            .plugin_snapshot
+            .get("pages")
+            .and_then(|x| x.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if !pages.is_empty() {
+            ui.add_space(10.0);
+            ui.label(egui::RichText::new("插件页面").weak().small());
+            for p in pages {
+                let plugin = p.get("plugin").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                let id = p.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                let title = p.get("title").and_then(|x| x.as_str()).unwrap_or(&id).to_string();
+                let selected = matches!(&self.tab, Tab::Plugin(pl, pg) if pl == &plugin && pg == &id);
+                if ui.selectable_label(selected, format!("🧩  {title}")).clicked() {
+                    self.tab = Tab::Plugin(plugin.clone(), id.clone());
+                    self.plugin_view = None;
+                    self.reload_plugin_view();
+                }
+            }
+        }
+
+        // 插件动作（工具栏型）与命令提示
+        let trusted = self
+            .plugin_snapshot
+            .get("trusted")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new(format!("模式：{}", if trusted { "信任" } else { "安全" })).weak().small());
+            ui.label(egui::RichText::new("Ctrl+K 命令面板").weak().small());
         });
     }
-    // 系统休眠/唤醒通知
-    let _power = {
-        let p = proxy.clone();
-        platform::register_power(move |ev| {
-            let ue = match ev {
-                platform::PowerEvent::Suspend => UserEvent::Suspend,
-                platform::PowerEvent::Resume => UserEvent::Resume,
-                platform::PowerEvent::Other => return,
-            };
-            let _ = p.send_event(ue);
-        })
-    };
-    if _power.is_some() {
-        eprintln!("[gui] 已注册系统休眠/唤醒通知");
-    } else {
-        eprintln!("[gui] 休眠/唤醒通知注册失败（不影响下载，仅少了自动暂停）");
-    }
 
-    let url_for_show = url.clone();
+    fn page_tasks(&mut self, ui: &mut egui::Ui) {
+        ui.heading("任务列表");
+        // 工具栏动作（插件）
+        let actions: Vec<(String, String, String)> = self
+            .plugin_snapshot
+            .get("actions")
+            .and_then(|x| x.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter(|a| a.get("place").and_then(|x| x.as_str()) == Some("toolbar"))
+                    .filter_map(|a| {
+                        Some((
+                            a.get("plugin")?.as_str()?.to_string(),
+                            a.get("id")?.as_str()?.to_string(),
+                            a.get("label")?.as_str()?.to_string(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !actions.is_empty() {
+            ui.horizontal(|ui| {
+                for (plugin, action, label) in actions {
+                    if ui.button(format!("🔧 {label}")).clicked() {
+                        self.run_action(&plugin, &action);
+                    }
+                }
+            });
+        }
 
-    event_loop.run(move |event, target, control_flow| {
-        *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(120));
+        let tasks = snapshot(&self.gui);
+        if tasks.is_empty() {
+            ui.add_space(20.0);
+            ui.label(egui::RichText::new("还没有下载任务，去「添加下载」吧。").weak());
+            return;
+        }
+        ui.add_space(6.0);
 
-        match event {
-            Event::NewEvents(StartCause::ResumeTimeReached { .. }) | Event::MainEventsCleared => {
-                // IPC 请求（在主线程统一处理，保证 webview 调用线程安全）
-                while let Ok(body) = ipc_rx.try_recv() {
-                    if let Some(wv) = &webview {
-                        if let Some(script) = handle_ipc(&gui, &body) {
-                            let _ = wv.evaluate_script(&script);
+        let mut pause_id: Option<u64> = None;
+        let mut remove_id: Option<u64> = None;
+        egui::Grid::new("tasks_grid")
+            .num_columns(6)
+            .striped(true)
+            .spacing([14.0, 8.0])
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new("状态").strong());
+                ui.label(egui::RichText::new("文件").strong());
+                ui.label(egui::RichText::new("进度").strong());
+                ui.label(egui::RichText::new("速度").strong());
+                ui.label(egui::RichText::new("大小").strong());
+                ui.label(egui::RichText::new("操作").strong());
+                ui.end_row();
+
+                for t in &tasks {
+                    let (txt, color) = status_style(&t.status);
+                    ui.colored_label(color, txt);
+                    let name = t
+                        .path
+                        .as_deref()
+                        .and_then(|p| std::path::Path::new(p).file_name())
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| t.url.clone());
+                    ui.vertical(|ui| {
+                        ui.label(name).on_hover_text(&t.url);
+                        if let Some(err) = &t.error {
+                            ui.label(
+                                egui::RichText::new(err)
+                                    .small()
+                                    .color(egui::Color32::from_rgb(0xB0, 0x30, 0x30)),
+                            );
                         }
-                    }
-                }
-                // 托盘菜单
-                while let Ok(ev) = MenuEvent::receiver().try_recv() {
-                    match ev.id.0.as_str() {
-                        "show" => show_window(
-                            &mut window,
-                            &mut webview,
-                            target,
-                            &url_for_show,
-                            &ipc_tx,
-                            has_webview2,
-                        ),
-                        "quit" => *control_flow = ControlFlow::Exit,
-                        _ => {}
-                    }
-                }
-            }
-            Event::UserEvent(UserEvent::Emit(name, payload)) => {
-                if let Some(wv) = &webview {
-                    let script = format!(
-                        "window.__ipcEmit({}, {})",
-                        serde_json::to_string(name).unwrap_or_else(|_| "\"\"".into()),
-                        payload
+                    });
+                    let frac = if t.total > 0 {
+                        (t.completed as f32 / t.total as f32).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    ui.add(
+                        egui::ProgressBar::new(frac)
+                            .desired_width(150.0)
+                            .show_percentage(),
                     );
-                    let _ = wv.evaluate_script(&script);
+                    ui.label(format_speed(t.speed));
+                    ui.label(format_bytes(t.total));
+                    ui.horizontal(|ui| {
+                        if t.status == "downloading" && ui.small_button("暂停").clicked() {
+                            pause_id = Some(t.id);
+                        }
+                        if ui.small_button("删除").clicked() {
+                            remove_id = Some(t.id);
+                        }
+                    });
+                    ui.end_row();
                 }
-            }
-            Event::UserEvent(UserEvent::Show) => show_window(
-                &mut window,
-                &mut webview,
-                target,
-                &url_for_show,
-                &ipc_tx,
-                has_webview2,
-            ),
-            Event::UserEvent(UserEvent::Suspend) => {
-                eprintln!("[gui] 系统即将休眠：暂停进行中的任务（进度已保存在 .adl 文件）");
-                for t in gui.tasks.lock().unwrap().iter_mut() {
-                    if let Some(h) = t.handle.take() {
-                        h.abort();
+            });
+
+        if let Some(id) = pause_id {
+            let _ = pause_task(&self.gui, &json!({"id": id}));
+        }
+        if let Some(id) = remove_id {
+            let _ = remove_task(&self.gui, &json!({"id": id, "files": false}));
+        }
+    }
+
+    fn page_add(&mut self, ui: &mut egui::Ui) {
+        ui.heading("添加下载");
+        ui.add_space(6.0);
+        ui.label("下载地址");
+        ui.add(
+            egui::TextEdit::singleline(&mut self.f_url)
+                .hint_text("https://…")
+                .desired_width(f32::INFINITY),
+        );
+        ui.add_space(6.0);
+        ui.label("保存文件名（可选，留空自动从地址/响应推断）");
+        ui.add(
+            egui::TextEdit::singleline(&mut self.f_out)
+                .hint_text("例如 ubuntu.iso")
+                .desired_width(f32::INFINITY),
+        );
+        ui.add_space(10.0);
+        if ui.button("开始下载").clicked() {
+            self.do_add();
+        }
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("浏览器插件接管时会自动带着来源、Cookie 等，无需手动填。")
+                .weak()
+                .small(),
+        );
+    }
+
+    fn page_settings(&mut self, ui: &mut egui::Ui) {
+        ui.heading("设置");
+        ui.add_space(6.0);
+        egui::Grid::new("settings_grid")
+            .num_columns(2)
+            .spacing([12.0, 8.0])
+            .show(ui, |ui| {
+                ui.label("默认下载目录");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.s_dir).desired_width(360.0),
+                );
+                ui.end_row();
+
+                ui.label("并发数（1–64，自适应）");
+                ui.add(egui::DragValue::new(&mut self.s_conn).range(1..=64));
+                ui.end_row();
+
+                ui.label("限速（字节/秒，0=不限）");
+                ui.add(egui::DragValue::new(&mut self.s_limit).range(0..=1_000_000_000u64));
+                ui.end_row();
+
+                ui.label("HTTP 代理（如 http://127.0.0.1:7890）");
+                ui.add(egui::TextEdit::singleline(&mut self.s_proxy).desired_width(360.0));
+                ui.end_row();
+
+                ui.label("插件模式");
+                egui::ComboBox::from_id_salt("mode")
+                    .selected_text(if self.s_mode == "trusted" { "信任（可改写/替换 UI）" } else { "安全（只读/拦截）" })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.s_mode, "safe".to_string(), "安全（只读/拦截）");
+                        ui.selectable_value(&mut self.s_mode, "trusted".to_string(), "信任（可改写/替换 UI）");
+                    });
+                ui.end_row();
+
+                ui.label("强制 HTTP/1.1");
+                ui.checkbox(&mut self.s_http1, "某些站点的 h2 有问题时勾选");
+                ui.end_row();
+
+                ui.label("插件目录（留空=exe 同级 plugins）");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.s_plugin_dir).desired_width(360.0),
+                );
+                ui.end_row();
+            });
+        ui.add_space(10.0);
+        if ui.button("保存设置").clicked() {
+            self.do_save_settings();
+        }
+
+        // 插件设置区
+        let settings = self
+            .plugin_snapshot
+            .get("settings")
+            .and_then(|x| x.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if !settings.is_empty() {
+            ui.add_space(16.0);
+            ui.separator();
+            ui.heading("插件设置");
+            let mut pending: Vec<(String, String, String)> = Vec::new();
+            egui::Grid::new("plugin_settings_grid")
+                .num_columns(3)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    for s in &settings {
+                        let plugin = s.get("plugin").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                        let key = s.get("key").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                        let label = s.get("label").and_then(|x| x.as_str()).unwrap_or(&key).to_string();
+                        let kind = s.get("kind").and_then(|x| x.as_str()).unwrap_or("string").to_string();
+                        let value = s.get("value").and_then(|x| x.as_str()).map(|v| v.to_string())
+                            .or_else(|| s.get("default").and_then(|x| x.as_str()).map(|v| v.to_string()))
+                            .unwrap_or_default();
+                        let editable = s.get("editable").and_then(|x| x.as_bool()).unwrap_or(false);
+
+                        ui.label(label);
+                        match kind.as_str() {
+                            "boolean" => {
+                                let mut b = value == "true";
+                                if ui.add_enabled(editable, egui::Checkbox::new(&mut b, "")).changed() {
+                                    pending.push((plugin.clone(), key.clone(), b.to_string()));
+                                }
+                            }
+                            "select" => {
+                                let opts: Vec<String> = s
+                                    .get("options")
+                                    .and_then(|x| x.as_array())
+                                    .map(|a| a.iter().filter_map(|o| o.as_str().map(|s| s.to_string())).collect())
+                                    .unwrap_or_default();
+                                let mut cur = value.clone();
+                                ui.add_enabled_ui(editable, |ui| {
+                                    egui::ComboBox::from_id_salt(format!("{plugin}.{key}"))
+                                        .selected_text(cur.clone())
+                                        .show_ui(ui, |ui| {
+                                            for o in &opts {
+                                                ui.selectable_value(&mut cur, o.clone(), o.clone());
+                                            }
+                                        });
+                                });
+                                if cur != value {
+                                    pending.push((plugin.clone(), key.clone(), cur));
+                                }
+                            }
+                            _ => {
+                                let buf = self
+                                    .plugin_edit
+                                    .entry((plugin.clone(), key.clone()))
+                                    .or_insert_with(|| value.clone());
+                                if ui.add_enabled(editable, egui::TextEdit::singleline(buf).desired_width(220.0)).changed() {
+                                    pending.push((plugin.clone(), key.clone(), buf.clone()));
+                                }
+                            }
+                        }
+                        ui.label(if editable { "" } else { "（只读）" });
+                        ui.end_row();
                     }
-                    if t.status == "downloading" {
-                        t.status = "paused".into();
+                });
+            for (p, k, v) in pending {
+                self.save_plugin_setting(&p, &k, &v);
+            }
+        }
+    }
+
+    fn page_plugin(&mut self, ui: &mut egui::Ui) {
+        let (plugin, page) = match self.tab.clone() {
+            Tab::Plugin(p, g) => (p, g),
+            _ => return,
+        };
+        ui.heading(format!("插件页面 · {plugin}/{page}"));
+        ui.add_space(6.0);
+        let mut dispatch: Vec<Dispatch> = Vec::new();
+        if self.plugin_view.is_none() {
+            self.reload_plugin_view();
+        }
+        if let Some(tree) = self.plugin_view.clone() {
+            if tree.get("type").and_then(|x| x.as_str()) == Some("error") {
+                let msg = tree.get("error").and_then(|x| x.as_str()).unwrap_or("插件出错");
+                ui.colored_label(egui::Color32::from_rgb(0xB0, 0x30, 0x30), msg);
+            } else {
+                render_node(ui, &plugin, &tree, &mut dispatch);
+            }
+        } else {
+            ui.label("（插件没有返回内容）");
+        }
+        for d in dispatch {
+            match d {
+                Dispatch::Action { plugin, action } => self.run_action(&plugin, &action),
+                Dispatch::Setting { plugin, key, value } => self.save_plugin_setting(&plugin, &key, &value),
+            }
+        }
+    }
+
+    fn show_command_palette(&mut self, ctx: &egui::Context) {
+        let commands: Vec<(String, String, String)> = self
+            .plugin_snapshot
+            .get("commands")
+            .and_then(|x| x.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|c| {
+                        Some((
+                            c.get("plugin")?.as_str()?.to_string(),
+                            c.get("id")?.as_str()?.to_string(),
+                            c.get("title")?.as_str()?.to_string(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut open = self.cmd_open;
+        let mut chosen: Option<(String, String)> = None;
+        egui::Window::new("命令面板")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_TOP, [0.0, 120.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.cmd_query)
+                        .hint_text("搜索命令…")
+                        .desired_width(320.0),
+                );
+                let q = self.cmd_query.to_lowercase();
+                ui.separator();
+                for (plugin, id, title) in &commands {
+                    if !q.is_empty() && !title.to_lowercase().contains(&q) {
+                        continue;
+                    }
+                    if ui.button(title).clicked() {
+                        chosen = Some((plugin.clone(), id.clone()));
                     }
                 }
-                if let Some(wv) = &webview {
-                    let _ = wv.evaluate_script("window.__ipcEmit('system_suspend', '{}')");
+                if commands.is_empty() {
+                    ui.label(egui::RichText::new("当前没有插件命令（trusted 模式可用）").weak());
+                }
+            });
+        self.cmd_open = open;
+        if let Some((p, id)) = chosen {
+            self.run_command(&p, &id);
+        }
+    }
+}
+
+// ───────────────────────── 插件组件树渲染 ─────────────────────────
+
+fn render_node(ui: &mut egui::Ui, plugin: &str, node: &Value, out: &mut Vec<Dispatch>) {
+    let ty = node.get("type").and_then(|x| x.as_str()).unwrap_or("text");
+    match ty {
+        "text" => {
+            ui.label(node.get("value").and_then(|x| x.as_str()).unwrap_or(""));
+        }
+        "heading" => {
+            ui.heading(node.get("value").and_then(|x| x.as_str()).unwrap_or(""));
+        }
+        "badge" => {
+            let v = node.get("value").and_then(|x| x.as_str()).unwrap_or("");
+            ui.label(egui::RichText::new(format!("[{v}]")).weak().small());
+        }
+        "divider" => {
+            ui.separator();
+        }
+        "spacer" => {
+            let h = node.get("height").and_then(|x| x.as_f64()).unwrap_or(8.0) as f32;
+            ui.add_space(h);
+        }
+        "row" => {
+            ui.horizontal(|ui| {
+                if let Some(ch) = node.get("children").and_then(|x| x.as_array()) {
+                    for c in ch {
+                        render_node(ui, plugin, c, out);
+                    }
+                }
+            });
+        }
+        "col" => {
+            ui.vertical(|ui| {
+                if let Some(ch) = node.get("children").and_then(|x| x.as_array()) {
+                    for c in ch {
+                        render_node(ui, plugin, c, out);
+                    }
+                }
+            });
+        }
+        "button" => {
+            let label = node.get("label").and_then(|x| x.as_str()).unwrap_or("按钮");
+            if ui.button(label).clicked() {
+                if let Some(action) = node.get("action").and_then(|x| x.as_str()) {
+                    out.push(Dispatch::Action {
+                        plugin: plugin.to_string(),
+                        action: action.to_string(),
+                    });
                 }
             }
-            Event::UserEvent(UserEvent::Resume) => {
-                eprintln!("[gui] 系统已恢复：任务保持暂停，请手动继续（避免链接失效）");
-                if let Some(wv) = &webview {
-                    let _ = wv.evaluate_script("window.__ipcEmit('system_resume', '{}')");
+        }
+        "progress" => {
+            let v = node.get("value").and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
+            ui.add(egui::ProgressBar::new(v.clamp(0.0, 1.0)).show_percentage());
+        }
+        "list" => {
+            if let Some(items) = node.get("items").and_then(|x| x.as_array()) {
+                for it in items {
+                    ui.horizontal(|ui| {
+                        ui.label("•");
+                        render_node(ui, plugin, it, out);
+                    });
+                }
+            } else if let Some(ch) = node.get("children").and_then(|x| x.as_array()) {
+                for c in ch {
+                    render_node(ui, plugin, c, out);
                 }
             }
-            Event::WindowEvent {
-                event: WindowEvent::CloseRequested,
-                ..
-            } => {
-                // 关闭到托盘：销毁窗口（避免 WebView2 隐藏后白屏），唤醒时重建。
-                webview.take();
-                window.take();
-                eprintln!("[gui] 已最小化到托盘（程序仍在后台运行）");
-            }
-            _ => {}
         }
-        let _ = &tray; // 保持托盘存活
-        let _ = &_power; // 保持电源通知注册存活
-    });
-}
-
-/// 创建窗口 + WebView（首次启动与从托盘唤醒时复用）。
-fn make_window(
-    target: &EventLoopWindowTarget<UserEvent>,
-    url: &str,
-    ipc_tx: &std::sync::mpsc::Sender<String>,
-) -> (Window, WebView) {
-    let window = WindowBuilder::new()
-        .with_title("ADL")
-        .with_inner_size(LogicalSize::new(1000.0, 700.0))
-        .with_min_inner_size(LogicalSize::new(720.0, 520.0))
-        .build(target)
-        .expect("无法创建窗口");
-    let tx = ipc_tx.clone();
-    let webview = WebViewBuilder::new()
-        .with_url(url)
-        .with_ipc_handler(move |req| {
-            let _ = tx.send(req.body().clone());
-        })
-        .build(&window)
-        .expect("无法创建 WebView");
-    (window, webview)
-}
-
-/// 显示主界面：原生模式重建/唤回窗口；浏览器模式重新打开浏览器。
-fn show_window(
-    window: &mut Option<Window>,
-    webview: &mut Option<WebView>,
-    target: &EventLoopWindowTarget<UserEvent>,
-    url: &str,
-    ipc_tx: &std::sync::mpsc::Sender<String>,
-    has_webview2: bool,
-) {
-    if !has_webview2 {
-        platform::open_in_browser(url);
-        return;
-    }
-    if webview.is_none() {
-        let (w, v) = make_window(target, url, ipc_tx);
-        *window = Some(w);
-        *webview = Some(v);
-        return;
-    }
-    if let Some(w) = window {
-        let _ = w.set_minimized(false);
-        w.set_visible(true);
-        w.set_focus();
-    }
-}
-
-fn build_tray() -> Option<tray_icon::TrayIcon> {
-    let menu = Menu::new();
-    let show = MenuItem::with_id("show", "显示主界面", true, None);
-    let quit = MenuItem::with_id("quit", "退出", true, None);
-    let _ = menu.append_items(&[&show, &quit]);
-    let icon = make_icon();
-    let mut builder = TrayIconBuilder::new()
-        .with_menu(Box::new(menu))
-        .with_tooltip("ADL 下载器");
-    if let Some(ic) = icon {
-        builder = builder.with_icon(ic);
-    }
-    builder.build().ok()
-}
-
-fn make_icon() -> Option<Icon> {
-    // 32x32 的青色方块图标（无需外部资源文件）
-    let (w, h) = (32u32, 32u32);
-    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-    for y in 0..h {
-        for x in 0..w {
-            let border = x < 3 || y < 3 || x >= w - 3 || y >= h - 3;
-            let (r, g, b, a) = if border {
-                (0x2e, 0x6e, 0x6a, 255)
-            } else if (x as i32 - 16).abs() + (y as i32 - 16).abs() < 10 {
-                (0x4a, 0x9e, 0x9e, 255)
-            } else {
-                (0x12, 0x18, 0x1a, 255)
-            };
-            rgba.extend_from_slice(&[r, g, b, a]);
-        }
-    }
-    Icon::from_rgba(rgba, w, h).ok()
-}
-
-fn find_web_root() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("ADL_WEB_ROOT") {
-        let p = PathBuf::from(p);
-        if p.is_dir() {
-            return Some(p);
-        }
-    }
-    let mut cands = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            cands.push(dir.join("web-dist"));
-            cands.push(dir.join("web"));
-        }
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        cands.push(cwd.join("web").join("dist"));
-        cands.push(cwd.join("web"));
-        cands.push(cwd.join("web-dist"));
-    }
-    cands.into_iter().find(|p| p.join("index.html").is_file())
-}
-
-// ─────────────────────────── IPC ───────────────────────────
-
-fn dispatch_ipc(gui: &Arc<Gui>, body: &str) -> Option<(Value, Value)> {
-    let v: Value = serde_json::from_str(body).ok()?;
-    let id = v.get("id").cloned().unwrap_or(Value::Null);
-    let cmd = v.get("cmd").and_then(|c| c.as_str()).unwrap_or("");
-    let args = v.get("args").cloned().unwrap_or(Value::Object(Default::default()));
-
-    let result: Result<Value, String> = match cmd {
-        "ping" => Ok(json!({"ok": true, "pong": true})),
-        "get_tasks" => Ok(gui_snapshot(gui)),
-        "get_settings" => {
-            let cfg = gui.cfg.lock().unwrap();
-            Ok(settings_json(&cfg))
-        }
-        "set_settings" => set_settings(gui, &args),
-        "add" => add_task(gui, &args),
-        "pause" => pause_task(gui, &args),
-        "remove" => remove_task(gui, &args),
-        "open_dir" => Ok(json!({"ok": true})),
-        "ui_snapshot" => {
-            let values = load_plugin_settings();
-            let hooks = gui.hooks.lock().unwrap().clone();
-            Ok(hooks.ui_snapshot(&values))
-        }
-        "ui_render" => {
-            let plugin = args.get("plugin").and_then(|x| x.as_str()).unwrap_or("");
-            let page = args.get("page").and_then(|x| x.as_str()).unwrap_or("");
-            let ctx = args.get("ctx").cloned().unwrap_or_else(|| json!({}));
-            let hooks = gui.hooks.lock().unwrap().clone();
-            Ok(hooks
-                .render(plugin, page, &ctx)
-                .unwrap_or_else(|| json!({"type":"text","value":"（插件没有返回内容）"})))
-        }
-        "run_action" => {
-            let plugin = args.get("plugin").and_then(|x| x.as_str()).unwrap_or("");
-            let action = args.get("action").and_then(|x| x.as_str()).unwrap_or("");
-            let payload = args.get("payload").cloned().unwrap_or_else(|| json!({}));
-            let hooks = gui.hooks.lock().unwrap().clone();
-            match hooks.run_action(plugin, action, &payload) {
-                Some(v) => Ok(v),
-                None => Err("插件动作不可用（需要 trusted 模式）".into()),
+        "toggle" => {
+            let label = node.get("label").and_then(|x| x.as_str()).unwrap_or("");
+            let cur = node.get("value").and_then(|x| x.as_bool()).unwrap_or(false);
+            let mut b = cur;
+            if ui.checkbox(&mut b, label).changed() {
+                if let Some(key) = node.get("setting").and_then(|x| x.as_str()) {
+                    out.push(Dispatch::Setting {
+                        plugin: plugin.to_string(),
+                        key: key.to_string(),
+                        value: b.to_string(),
+                    });
+                }
             }
         }
-        "run_command" => {
-            let plugin = args.get("plugin").and_then(|x| x.as_str()).unwrap_or("");
-            let command = args.get("command").and_then(|x| x.as_str()).unwrap_or("");
-            let hooks = gui.hooks.lock().unwrap().clone();
-            match hooks.run_command(plugin, command) {
-                Some(v) => Ok(v),
-                None => Err("插件命令不可用（需要 trusted 模式）".into()),
+        "select" => {
+            let label = node.get("label").and_then(|x| x.as_str()).unwrap_or("");
+            let cur = node.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let opts: Vec<String> = node
+                .get("options")
+                .and_then(|x| x.as_array())
+                .map(|a| a.iter().filter_map(|o| o.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default();
+            let mut sel = cur.clone();
+            ui.horizontal(|ui| {
+                ui.label(label);
+                egui::ComboBox::from_id_salt(format!("{plugin}.{label}"))
+                    .selected_text(sel.clone())
+                    .show_ui(ui, |ui| {
+                        for o in &opts {
+                            ui.selectable_value(&mut sel, o.clone(), o.clone());
+                        }
+                    });
+            });
+            if sel != cur {
+                if let Some(key) = node.get("setting").and_then(|x| x.as_str()) {
+                    out.push(Dispatch::Setting {
+                        plugin: plugin.to_string(),
+                        key: key.to_string(),
+                        value: sel,
+                    });
+                }
             }
         }
-        "plugin_setting_set" => {
-            let plugin = args.get("plugin").and_then(|x| x.as_str()).unwrap_or("");
-            let key = args.get("key").and_then(|x| x.as_str()).unwrap_or("");
-            let value = args.get("value").and_then(|x| x.as_str()).unwrap_or("");
-            if plugin.is_empty() || key.is_empty() {
-                Err("缺少 plugin 或 key".to_string())
-            } else {
-                save_plugin_setting(plugin, key, value).map(|_| {
-                    let values = load_plugin_settings();
-                    let hooks = gui.hooks.lock().unwrap().clone();
-                    hooks.ui_snapshot(&values)
-                })
-            }
+        "input" => {
+            let label = node.get("label").and_then(|x| x.as_str()).unwrap_or("");
+            let val = node.get("value").and_then(|x| x.as_str()).unwrap_or("");
+            ui.horizontal(|ui| {
+                ui.label(label);
+                ui.label(egui::RichText::new(val).weak());
+            });
         }
-        other => Err(format!("未知命令: {other}")),
-    };
-
-    let payload = match result {
-        Ok(v) => v,
-        Err(msg) => json!({"__err": {"message": msg}}),
-    };
-    Some((id, payload))
-}
-
-/// wry / WebView2 模式的 IPC：把结果包成调用页面回调的脚本。
-fn handle_ipc(gui: &Arc<Gui>, body: &str) -> Option<String> {
-    let (id, payload) = dispatch_ipc(gui, body)?;
-    Some(format!(
-        "window.__ipcResolve({}, {})",
-        serde_json::to_string(&id).ok()?,
-        serde_json::to_string(&payload).ok()?
-    ))
-}
-
-/// 浏览器降级模式的 IPC：`POST /ipc` 的响应体，形如 `{"id":..,"payload":..}`。
-fn dispatch_ipc_json(gui: &Arc<Gui>, body: &str) -> String {
-    match dispatch_ipc(gui, body) {
-        Some((id, payload)) => json!({"id": id, "payload": payload}).to_string(),
-        None => json!({
-            "id": Value::Null,
-            "payload": {"__err": {"message": "bad request"}}
-        })
-        .to_string(),
+        other => {
+            ui.label(format!("[{other}]"));
+        }
     }
 }
+
+// ───────────────────────── 辅助 ─────────────────────────
+
+fn install_cjk_font(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    let candidates = [
+        "C:/Windows/Fonts/simhei.ttf",
+        "C:/Windows/Fonts/Deng.ttf",
+        "C:/Windows/Fonts/msyh.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    ];
+    for path in candidates {
+        if let Ok(bytes) = std::fs::read(path) {
+            fonts.font_data.insert(
+                "cjk".to_owned(),
+                std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+            );
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .insert(0, "cjk".to_owned());
+            fonts
+                .families
+                .entry(egui::FontFamily::Monospace)
+                .or_default()
+                .push("cjk".to_owned());
+            break;
+        }
+    }
+    ctx.set_fonts(fonts);
+}
+
+fn status_style(status: &str) -> (&'static str, egui::Color32) {
+    match status {
+        "completed" => ("完成", egui::Color32::from_rgb(0x2E, 0x7D, 0x6B)),
+        "failed" => ("失败", egui::Color32::from_rgb(0xB0, 0x30, 0x30)),
+        "paused" => ("已暂停", egui::Color32::from_rgb(0x8A, 0x6D, 0x1F)),
+        _ => ("下载中", egui::Color32::from_rgb(0x1F, 0x5F, 0x8A)),
+    }
+}
+
+fn format_bytes(n: u64) -> String {
+    const U: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < U.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", U[i])
+    }
+}
+
+fn format_speed(bps: u64) -> String {
+    if bps == 0 {
+        "-".to_string()
+    } else {
+        format!("{}/s", format_bytes(bps))
+    }
+}
+
+// ───────────────────────── 与后端交互（复用原有逻辑） ─────────────────────────
 
 fn plugins_root(cfg: &Config) -> Option<PathBuf> {
     cfg.plugin_dir_opt().or_else(|| {
@@ -472,7 +969,6 @@ fn plugins_root(cfg: &Config) -> Option<PathBuf> {
     })
 }
 
-/// 按当前配置加载插件（含按主配置的 enabled 开关过滤）。
 fn build_hooks(cfg: &Config) -> Arc<PluginHooks> {
     let mode = if cfg.mode_trusted() { Mode::Trusted } else { Mode::Safe };
     match plugins_root(cfg) {
@@ -492,7 +988,6 @@ fn plugin_settings_dir() -> PathBuf {
     adl_app::config::app_data_dir().join("plugin-settings")
 }
 
-/// 读所有插件自己的设置文件（`plugin-settings/<id>.json`）。
 fn load_plugin_settings() -> adl_plugin::ui::SettingsValues {
     let mut out = BTreeMap::new();
     if let Ok(rd) = std::fs::read_dir(plugin_settings_dir()) {
@@ -541,7 +1036,8 @@ fn save_plugin_setting(plugin: &str, key: &str, value: &str) -> Result<(), Strin
     Ok(())
 }
 
-pub(crate) fn gui_snapshot(gui: &Arc<Gui>) -> Value {    let tasks = gui.tasks.lock().unwrap();
+pub(crate) fn gui_snapshot(gui: &Arc<Gui>) -> Value {
+    let tasks = gui.tasks.lock().unwrap();
     let arr: Vec<Value> = tasks
         .iter()
         .map(|t| {
@@ -599,7 +1095,6 @@ fn set_settings(gui: &Arc<Gui>, args: &Value) -> Result<Value, String> {
     let snapshot = settings_json(&cfg);
     let new_cfg = cfg.clone();
     drop(cfg);
-    // 设置可能改了插件目录/模式/开关，重建插件实例
     *gui.hooks.lock().unwrap() = build_hooks(&new_cfg);
     Ok(snapshot)
 }
@@ -631,7 +1126,6 @@ pub(crate) fn add_task(gui: &Arc<Gui>, args: &Value) -> Result<Value, String> {
     if let Some(ua) = cfg.user_agent_opt() {
         opts.user_agent = ua;
     }
-    // 浏览器接管时可带过来的额外信息
     if let Some(r) = args.get("referer").and_then(|x| x.as_str()) {
         if !r.is_empty() {
             opts.referer = Some(r.to_string());
@@ -674,9 +1168,8 @@ pub(crate) fn add_task(gui: &Arc<Gui>, args: &Value) -> Result<Value, String> {
     }
 
     let gui2 = gui.clone();
-    let proxy = gui.proxy.clone();
     let handle = gui.rt.spawn(async move {
-        let proxy_p = proxy.clone();
+        let gui3 = gui2.clone();
         let start = Instant::now();
         let last_emit = Arc::new(AtomicU64::new(0));
         let last_emit2 = last_emit.clone();
@@ -684,13 +1177,13 @@ pub(crate) fn add_task(gui: &Arc<Gui>, args: &Value) -> Result<Value, String> {
             let ms = start.elapsed().as_millis() as u64;
             if ms.saturating_sub(last_emit2.load(Ordering::Relaxed)) >= 150 {
                 last_emit2.store(ms, Ordering::Relaxed);
-                let payload = json!({
-                    "id": id,
-                    "completed": p.completed,
-                    "total": p.total,
-                    "speed": p.speed_bps,
-                });
-                let _ = proxy_p.send_event(UserEvent::Emit("progress", payload.to_string()));
+                if let Ok(mut tasks) = gui3.tasks.lock() {
+                    if let Some(t) = tasks.iter_mut().find(|t| t.id == id) {
+                        t.completed = p.completed;
+                        t.total = p.total;
+                        t.speed = p.speed_bps;
+                    }
+                }
             }
         });
 
@@ -705,25 +1198,10 @@ pub(crate) fn add_task(gui: &Arc<Gui>, args: &Value) -> Result<Value, String> {
                     t.total = r.total;
                     t.path = Some(r.path.to_string_lossy().to_string());
                     t.speed = r.speed_bps();
-                    let payload = json!({
-                        "id": id,
-                        "status": "completed",
-                        "path": t.path,
-                        "total": r.total,
-                        "sha256": r.sha256,
-                    });
-                    let _ = proxy.send_event(UserEvent::Emit("task_done", payload.to_string()));
                 }
                 Err(e) => {
                     t.status = "failed".into();
                     t.error = Some(e.to_string());
-                    let payload = json!({
-                        "id": id,
-                        "status": "failed",
-                        "error": e.to_string(),
-                        "code": e.aria2_code(),
-                    });
-                    let _ = proxy.send_event(UserEvent::Emit("task_done", payload.to_string()));
                 }
             }
         }
@@ -744,7 +1222,7 @@ fn pause_task(gui: &Arc<Gui>, args: &Value) -> Result<Value, String> {
     let mut tasks = gui.tasks.lock().unwrap();
     if let Some(t) = tasks.iter_mut().find(|t| t.id == id) {
         if let Some(h) = t.handle.take() {
-            h.abort(); // 中止下载；已下进度保存在 .adl，重新添加可续传
+            h.abort();
         }
         if t.status == "downloading" {
             t.status = "paused".into();
@@ -752,6 +1230,18 @@ fn pause_task(gui: &Arc<Gui>, args: &Value) -> Result<Value, String> {
         Ok(json!({"ok": true}))
     } else {
         Err("任务不存在".into())
+    }
+}
+
+fn pause_all(gui: &Arc<Gui>) {
+    let mut tasks = gui.tasks.lock().unwrap();
+    for t in tasks.iter_mut() {
+        if t.status == "downloading" {
+            if let Some(h) = t.handle.take() {
+                h.abort();
+            }
+            t.status = "paused".into();
+        }
     }
 }
 
@@ -777,4 +1267,105 @@ fn remove_task(gui: &Arc<Gui>, args: &Value) -> Result<Value, String> {
     } else {
         Err("任务不存在".into())
     }
+}
+
+// ───────────────────────── 入口 ─────────────────────────
+
+fn make_icon() -> Option<Icon> {
+    let (w, h) = (32u32, 32u32);
+    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let edge = x < 2 || y < 2 || x >= w - 2 || y >= h - 2;
+            let px = if edge {
+                [0x2Eu8, 0x7D, 0x6B, 0xFF]
+            } else {
+                [0x4Au8, 0x9E, 0x9E, 0xFF]
+            };
+            rgba.extend_from_slice(&px);
+        }
+    }
+    Icon::from_rgba(rgba, w, h).ok()
+}
+
+fn build_tray() -> Option<TrayIcon> {
+    let menu = Menu::new();
+    let show = MenuItem::with_id("show", "显示主界面", true, None);
+    let quit = MenuItem::with_id("quit", "退出", true, None);
+    let _ = menu.append(&show);
+    let _ = menu.append(&quit);
+    let mut b = TrayIconBuilder::new()
+        .with_menu(Box::new(menu))
+        .with_tooltip("ADL 下载器");
+    if let Some(ic) = make_icon() {
+        b = b.with_icon(ic);
+    }
+    b.build().ok()
+}
+
+fn main() -> eframe::Result {
+    // 单实例：已有实例则唤醒它并退出
+    let _single = platform::acquire_single_instance();
+    if _single.is_none() {
+        platform::signal_existing_instance();
+        return Ok(());
+    }
+
+    let cfg = Config::load();
+    let gui = Arc::new(Gui {
+        tasks: Mutex::new(Vec::new()),
+        next_id: AtomicU64::new(1),
+        rt: tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("构建 tokio 运行时失败"),
+        cfg: Mutex::new(cfg.clone()),
+        hooks: Mutex::new(build_hooks(&cfg)),
+    });
+
+    // 浏览器接管用的本地 API（与 UI 同进程共享状态）
+    let api_port = std::env::var("ADL_API_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(api_server::DEFAULT_PORT);
+    match api_server::start(gui.clone(), api_port) {
+        Ok(p) => eprintln!("[api] 浏览器接管 API 监听 127.0.0.1:{p}"),
+        Err(e) => eprintln!("[api] 启动失败: {e}"),
+    }
+
+    // 休眠 / 唤醒
+    let suspend = Arc::new(AtomicBool::new(false));
+    let resume = Arc::new(AtomicBool::new(false));
+    {
+        let s = suspend.clone();
+        let r = resume.clone();
+        let _ = platform::register_power(move |ev| match ev {
+            platform::PowerEvent::Suspend => s.store(true, Ordering::SeqCst),
+            platform::PowerEvent::Resume => r.store(true, Ordering::SeqCst),
+            platform::PowerEvent::Other => {}
+        });
+    }
+
+    // 第二实例唤醒
+    let wake = Arc::new(AtomicBool::new(false));
+    {
+        let w = wake.clone();
+        platform::spawn_wakeup_listener(move || w.store(true, Ordering::SeqCst));
+    }
+
+    let opts = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1040.0, 700.0])
+            .with_min_inner_size([760.0, 520.0])
+            .with_title("ADL 下载器"),
+        ..Default::default()
+    };
+
+    let gui2 = gui.clone();
+    let tray = build_tray();
+    eframe::run_native(
+        "ADL",
+        opts,
+        Box::new(move |cc| Ok(Box::new(App::new(cc, gui2, wake, suspend, resume, tray)))),
+    )
 }

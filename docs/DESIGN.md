@@ -1186,3 +1186,41 @@ if GetLastError() == ERROR_ALREADY_EXISTS(183) {
 - WebView2 运行时：`157.0.4341.60`（已装）
 - 网络（2026-11-20 实测）：crates.io / `registry.npmjs.org` / `registry.npmmirror.com` / 清华 tuna **全部可达**
 - 磁盘：Rust `target/` 单目录 673–694 MB（release），`cargo clean` 后全量重建 213 秒 → **定期清 target 即可，不必为磁盘改架构**
+
+---
+
+## 13. 原生 UI（egui / eframe）—— 彻底摆脱 WebView2
+
+### 13.1 为什么换
+M5 的界面是 tao + wry + WebView2 + Vue。WebView2 缺失或"残缺版 Windows"时只能降级到"用浏览器打开本地页面"，用户明确觉得"在网页里显示很怪"。于是改为**纯 Rust 原生 UI**：`eframe`（`egui` 立即模式 GUI）+ `glow`(OpenGL) 后端。**不再依赖 WebView2、不再有 node/vite 构建链**，产物是单个 exe，跨 Windows / Linux / macOS（含 Apple Silicon）。
+
+### 13.2 选型
+- **egui / eframe**（MIT）：纯 Rust、单 exe、跨平台。
+- 否掉 Slint：GPLv3 会传染，与项目 MIT 冲突。
+- 否掉自绘 Win32：只支持 Windows，工作量大，且不支持 Linux/macOS。
+
+### 13.3 关键 API（eframe 0.37，与旧版差异大，实测踩过）
+- `trait App` 的入口是 **`fn ui(&mut self, ui:&mut egui::Ui, frame:&mut eframe::Frame)`**，不是 `update(&mut self, ctx, frame)`；可选 `fn logic(&mut self, ctx:&egui::Context, frame)`。
+- 面板 `CentralPanel::default().show(ui, |ui| …)`、`SidePanel::left(id).show(ui, …)` **接收 `&mut Ui`，不是 `&Context`**。
+- 样式：`ctx.style_of(egui::Theme::Light)` / `ctx.set_style_of(egui::Theme::Light, style)`（没有 `style()`/`set_style()`）。
+- 窗口控制：`ctx.send_viewport_cmd(ViewportCommand::{Visible(bool), Minimized(bool), Focus, CancelClose, Close, …})`。
+- `NativeOptions{ viewport: ViewportBuilder::default().with_inner_size([w,h]).with_min_inner_size([..]).with_title(..), .. }`；`run_native(name, opts, Box::new(|cc| Ok(Box::new(App::new(cc,…)))))`。
+- 中文字体：默认字体不含 CJK，必须 `fonts.font_data.insert("cjk", FontData::from_owned(读 ttf))` 并插到 `Proportional` 首位；按平台依次找 `simhei.ttf`/`Deng.ttf`/`msyh.ttc`（Win）、Noto CJK（Linux）、PingFang/Hiragino（macOS）。
+
+### 13.4 🔴 后端坑：wgpu 在虚拟机/远程桌面会让进程 5 秒内静默退出
+默认 `eframe` 用 **wgpu** 后端。实测本机（无独立 GPU 的远程会话）下：窗口能创建、API 能连，但**约 5 秒后进程直接退出、无任何 stderr**（wgpu surface 丢失导致事件循环结束）。改为 **glow(OpenGL)** 后端后稳定运行。→ `eframe = { version="0.37", default-features=false, features=["glow","default_fonts"] }`。附带好处：exe 从 ~13.5 MB 降到 ~9.9 MB（未 strip）。
+
+### 13.5 构建与体积
+- `eframe` 首次需联网拉取（~200 crates，含 glutin/glow/egui_glow 等）；**离线下 `--offline` 会因 `accesskit_unix` 依赖的 `async-executor 1.14.0` 被 yank 而解析失败**，必须联网构建。
+- 依赖 `muda = { default-features=false }`，否则默认 feature 拉入 Linux 的 `libxdo`，离线/跨平台解析失败。
+- release（`opt-level="z" + lto="fat" + strip`）体积见 §13.7 实测。
+
+### 13.6 与后端的衔接
+`adl-gui` 只负责"壳"，仍复用 `adl-core`（引擎）、`adl-plugin`（插件 + 声明式 UI）、`adl-app`（config/history）。浏览器接管 API（`api_server`）与 UI 同进程共享 `Arc<Gui>` 状态，功能不变。桌面集成：单实例（命名互斥量 + 命名事件唤醒）、关闭到托盘（`CancelClose` + `Visible(false)`）、托盘菜单（tray-icon + muda，显示主界面/退出）、休眠暂停。
+
+### 13.7 待续
+- 托盘菜单已接；"关闭到托盘"依赖托盘"显示主界面"恢复。
+- UI 打磨（Motrix 浅色主题已起步：浅色 Visuals、圆角、间距）。
+- Linux/macOS 需在 `eframe` features 补 `x11`/`wayland`；`platform.rs` 的 Win32 部分用 `#[cfg(windows)]` 隔离。
+- 旧的 `web/`（Vue）与 `static_server.rs` 已不再编入（保留仅作历史），后续可清理。
+
