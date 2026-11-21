@@ -69,12 +69,19 @@ history_enabled = true
 
 `adl-gui.exe` 现在是 **纯 Rust 原生桌面界面**：`eframe`(`egui`)，**同时编入 glow(OpenGL) 与 wgpu 两套渲染后端**，**不需要 WebView2、不需要 Node/vite**，单个 exe，跨 Windows / Linux / macOS。
 
+![任务列表](docs/images/ui-tasks.png)
+
+| 添加下载 | 设置 |
+|---|---|
+| ![添加下载](docs/images/ui-add.png) | ![设置](docs/images/ui-settings.png) |
+
 ```bash
 cargo build --release -p adl-gui
 # 产物：target/release/adl-gui.exe（Windows 为 target/x86_64-pc-windows-msvc/release/adl-gui.exe）
 ```
 
 - 三个页面：任务列表（进度/暂停/删除）、添加下载、设置（目录/并发/限速/代理/插件模式）。
+- **左右式布局**：左侧整高边栏（品牌 + 导航 + 插件页面 + 模式胶囊）、顶部横栏（页标题 + 退出 / + 添加下载）、右侧内容区（白卡片）。
 - 支持插件声明式 UI 页面、动作按钮、插件设置、命令面板（Ctrl+K）。
 - 单实例（再次启动会唤醒已有窗口）、关闭到托盘（点托盘「显示主界面」恢复）、系统休眠自动暂停。
 - 与 CLI 共用 `adl-core` 引擎、`adl-plugin` 插件、`adl-app` 配置/历史；浏览器接管 API 同进程运行。
@@ -216,6 +223,7 @@ adl.onCommand(() => ({ message: "命令响应" }));
 - ✅ 插件 UI 扩展点（页面/动作/设置/命令，trusted 可替换内置页面）
 - ✅ 桌面集成（单实例 + 关闭到托盘 + 休眠/唤醒自动暂停）
 - ✅ 原生 UI（egui + glow/wgpu 双后端可选，跨 Windows/Linux/macOS，无 WebView2）
+- ✅ UI 左右式布局（侧边栏 + 顶栏 + 内容区，Motrix 浅色主题）
 
 设计文档见 [docs/DESIGN.md](docs/DESIGN.md)。
 

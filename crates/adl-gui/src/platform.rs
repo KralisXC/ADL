@@ -187,9 +187,17 @@ where
 }
 
 // ───────────────────────── WebView2 检测 / 浏览器降级 ─────────────────────────
+//
+// 自 v0.2 起 GUI 已换成纯 Rust 的 egui/eframe，不再依赖 WebView2，
+// 因此下面两个函数在主程序里已无调用点。保留它们是因为：
+//   1. 诊断用途 —— 想知道"这台机器到底有没有 WebView2"时可以直接调；
+//   2. 将来若再提供"用浏览器打开 ADL 的 Web UI"这种可选模式（`web/` 目录仍在），
+//      可以直接复用，不必重写一遍注册表/目录探测。
+// 用 allow(dead_code) 显式标记，避免每次构建都刷两条警告。
 
 /// 检测本机是否安装了 WebView2 运行时（Evergreen 或 Fixed Version 均可）。
 /// 先看文件目录，再查注册表（HKLM 32 位视图 / HKLM 64 位视图 / HKCU）。
+#[allow(dead_code)]
 pub fn webview2_available() -> bool {
     let bases = [
         r"C:\Program Files (x86)\Microsoft\EdgeWebView\Application",
@@ -223,6 +231,7 @@ pub fn webview2_available() -> bool {
 }
 
 /// 用系统默认浏览器打开一个 URL（WebView2 缺失时的降级路径）。
+#[allow(dead_code)]
 pub fn open_in_browser(url: &str) {
     // 允许用环境变量禁用自动拉起浏览器（无桌面环境/测试时有用）。
     if std::env::var_os("ADL_NO_OPEN_BROWSER").is_some() {

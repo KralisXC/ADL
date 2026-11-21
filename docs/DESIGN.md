@@ -1231,9 +1231,51 @@ M5 的界面是 tao + wry + WebView2 + Vue。WebView2 缺失或"残缺版 Window
 ### 13.6 与后端的衔接
 `adl-gui` 只负责"壳"，仍复用 `adl-core`（引擎）、`adl-plugin`（插件 + 声明式 UI）、`adl-app`（config/history）。浏览器接管 API（`api_server`）与 UI 同进程共享 `Arc<Gui>` 状态，功能不变。桌面集成：单实例（命名互斥量 + 命名事件唤醒）、关闭到托盘（`CancelClose` + `Visible(false)`）、托盘菜单（tray-icon + muda，显示主界面/退出）、休眠暂停。
 
-### 13.7 待续
-- 托盘菜单已接；"关闭到托盘"依赖托盘"显示主界面"恢复。
-- UI 打磨（Motrix 浅色主题已起步：浅色 Visuals、圆角、间距）。
-- Linux/macOS 需在 `eframe` features 补 `x11`/`wayland`；`platform.rs` 的 Win32 部分用 `#[cfg(windows)]` 隔离。
+### 13.7 界面骨架：左右式布局（侧边栏 + 顶栏 + 内容区）
+
+按用户要求改成"左右式，顶上也加"（对齐当前 DeepSeek Harness 的形态，但不要左下角角色图）。落地如下：
+
+```text
+┌───────────────────────────────────────────────┐
+│ 侧边栏(212px) │  顶栏(54px)：页标题 … 退出 / +添加下载 │
+│  ADL 下载器   ├───────────────────────────────┤
+│  导航         │                               │
+│   任务列表 ●  │        内容区（C_BG 浅底）      │
+│   添加下载    │        白色卡片 12px 圆角        │
+│   设置        │                               │
+│  插件页面/…   │                               │
+│               │                               │
+│  安全模式     │                               │
+│  Ctrl+K       │                               │
+└───────────────────────────────────────────────┘
+```
+
+- **egui 0.37 没有 `SidePanel` / `TopBottomPanel`**，统一成了 `egui::Panel::{left,right,top,bottom}`，且 `show()` 收 `&mut Ui`（不是 `&Context`）。
+- **面板调用顺序决定占位**：先 `Panel::left` 再 `Panel::top`，顶栏才只横跨右侧区域；最外层不要先开 `CentralPanel`。
+- 顶栏右侧按钮用**自绘**（`ui.interact` + `painter.rect_filled` + `painter.text`），坐标从 `available_rect_before_wrap()` 的右缘往左推。不用 `with_layout(right_to_left)` 或 `Sides`：前者在 `Panel::top` 的内边距里容易被裁，后者行为不稳定（实测右侧按钮会跑到面板外）。
+- **emoji 一律不用**：加载的中文字体（simhei）没有 emoji 字形，`📥 ➕ ⚙ 🧩 ⏻` 全渲染成空方块。导航项改为纯文字 + 选中态左侧 3px 青绿竖条。
+- **表格必须固定列宽**：`egui::Grid` 会按内容自适应，文件名一长就把整行宽度抢走，其余列被挤成竖排（实测 `test8m (2).bin` 会一个字一行）。改成 `ui.horizontal()` + 每列一个 `allocate_ui_with_layout(vec2(w,26), left_to_right)` 的定宽 `table_cell`；其中"文件"列吃剩余宽度（`w_name = available - 固定列总和 - 16`），并 `Label::truncate()` + 悬停显示完整 URL。
+- **左对齐标签**：`ui.add_sized([w,h], Label::new(..).halign(Align::LEFT))` 观感是居中（各标签看起来像右对齐），必须显式用 `allocate_ui_with_layout(.., Layout::left_to_right(Align::Center), ..)` 包一层（`label_cell`）。
+- 主题：`C_TEAL #3D8B7A`（强调）、`C_BG #F4F8F8`（内容底）、`C_CARD #FFFFFF`（卡片）、`C_LINE #E4EDEC`（描边）、`C_MUTED #8A9A98`（次要文字）、`C_INK #2A3333`（正文）。
+
+### 13.8 截图验证与 DPI 陷阱（踩过的坑）
+
+验证方式：`EnumWindows` 找出标题以 `ADL` 开头的窗口 → `PrintWindow(hwnd, dc, PW_RENDERFULLCONTENT=2)` 存 PNG。
+
+**🔴 关键陷阱**：PowerShell 进程默认 **DPI-unaware**。在 144 DPI 的屏幕上，`GetWindowRect` 返回**逻辑像素**（1055×737），而 `PrintWindow` 按**物理像素**渲染进传入的 DC —— 结果只截到窗口左上角一块。
+
+这个假象一度让我误判"顶栏右侧的按钮不见了"、"布局坏了"，反复改了三版 topbar 代码。实际是截图脚本的问题：**UI 一直是对的**。
+
+正确做法：`GetDpiForWindow(hwnd)` 拿到 dpi（本机 144），位图尺寸 = `logical * dpi / 96`（→1582×1106），再按这个尺寸建 `Bitmap`。
+
+其它坑：
+- `.ps1` **必须是纯 ASCII**：Windows PowerShell 5.1 按 GBK 读脚本，UTF-8 中文注释会被读坏并报一串 `Missing using directive`。
+- 不要用 `Get-Content`/`Set-Content` 批量改 Rust 源文件里的中文 —— 会把 UTF-8 字符串写坏成 `\u{3220}` 之类，rustc 报 `unknown start of token`。用编辑工具改。
+- 调试辅助：`ADL_TAB=tasks|add|settings` 可让程序直接落到指定页，省去模拟点击。
+
+### 13.9 待续
+- 托盘菜单已接；"关闭到托盘"= `CancelClose` + `Visible(false)`，靠托盘"显示主界面"恢复。
+- Linux/macOS 需在 `eframe` features 补 `x11`/`wayland`；`platform.rs` 的 Win32 部分已用 `#[cfg(windows)]` 隔离。
 - 旧的 `web/`（Vue）与 `static_server.rs` 已不再编入（保留仅作历史），后续可清理。
+
 

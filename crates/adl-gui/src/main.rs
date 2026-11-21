@@ -185,9 +185,15 @@ impl App {
         cc.egui_ctx.set_style_of(egui::Theme::Dark, style);
 
         let cfg = gui.cfg.lock().unwrap().clone();
+        // ADL_TAB 仅用于开发/截图脚本直达某个页面（tasks|add|settings），不写进文档。
+        let initial_tab = match std::env::var("ADL_TAB").unwrap_or_default().as_str() {
+            "add" => Tab::Add,
+            "settings" => Tab::Settings,
+            _ => Tab::Tasks,
+        };
         Self {
             gui,
-            tab: Tab::Tasks,
+            tab: initial_tab,
             f_url: String::new(),
             f_out: String::new(),
             s_dir: cfg.dir.clone(),
@@ -314,13 +320,79 @@ impl App {
     }
 }
 
-/// Motrix 风白色卡片容器
+/// 主题色（与 `App::new` 里的 Visuals 保持一致）
+const C_TEAL: egui::Color32 = egui::Color32::from_rgb(0x3D, 0x8B, 0x7A);
+const C_BG: egui::Color32 = egui::Color32::from_rgb(0xF4, 0xF8, 0xF8);
+const C_CARD: egui::Color32 = egui::Color32::WHITE;
+const C_LINE: egui::Color32 = egui::Color32::from_rgb(0xE4, 0xED, 0xEC);
+const C_MUTED: egui::Color32 = egui::Color32::from_rgb(0x8A, 0x9A, 0x98);
+const C_INK: egui::Color32 = egui::Color32::from_rgb(0x2A, 0x33, 0x33);
+
+/// 侧边栏宽度 / 顶栏高度
+const SIDEBAR_W: f32 = 212.0;
+const TOPBAR_H: f32 = 54.0;
+
+/// 整高侧边栏：白底
+fn sidebar_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(C_CARD)
+        .inner_margin(egui::Margin::symmetric(12, 14))
+}
+
+/// 顶栏：白底
+fn topbar_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(C_CARD)
+        .inner_margin(egui::Margin::symmetric(20, 8))
+}
+
+/// 内容区：浅底 + 内边距
+fn content_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(C_BG)
+        .inner_margin(egui::Margin::symmetric(20, 16))
+}
+
+/// 内容区里的白色卡片
 fn card_frame() -> egui::Frame {
     egui::Frame::new()
-        .fill(egui::Color32::WHITE)
+        .fill(C_CARD)
         .corner_radius(egui::CornerRadius::same(12))
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(0xE4, 0xED, 0xEC)))
-        .inner_margin(egui::Margin::same(14))
+        .stroke(egui::Stroke::new(1.0, C_LINE))
+        .inner_margin(egui::Margin::same(16))
+}
+
+/// 设置页左侧标签格：固定宽度、左对齐、垂直居中。
+///
+/// 不能直接用 `ui.add_sized([w, h], Label::new(..).halign(LEFT))` —— 那样
+/// 拿到的是"居中"的观感（各标签看起来像右对齐），必须显式建一个左对齐布局。
+fn label_cell(ui: &mut egui::Ui, w: f32, text: &str) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(w, 26.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.label(text);
+        },
+    );
+}
+
+/// 表格单元格：固定宽度、左对齐、垂直居中。
+///
+/// 任务列表必须用固定列宽，否则文件名一长就把整行宽度分配抢走，
+/// 其余列被挤成竖排（实测过：`test8m (2).bin` 会一个字一行）。
+fn table_cell(ui: &mut egui::Ui, w: f32, add: impl FnOnce(&mut egui::Ui)) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(w, 26.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            // set_min_width 是关键：allocate_ui_with_layout 只提供 max_rect，
+            // 水平布局前进时用的是子 Ui 的"已用宽度"。表头文字很窄，不强制撑满
+            // 就会各列挤在一起、与数据行对不齐。
+            ui.set_min_width(w);
+            ui.set_max_width(w);
+            add(ui);
+        },
+    );
 }
 
 impl eframe::App for App {
@@ -366,67 +438,67 @@ impl eframe::App for App {
 
         self.refresh_plugin_snapshot();
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            // 顶栏卡片
-            card_frame().show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.heading(
-                        egui::RichText::new("ADL")
-                            .color(egui::Color32::from_rgb(0x3D, 0x8B, 0x7A))
-                            .strong(),
-                    );
-                    ui.label(egui::RichText::new("下载器 · 纯 Rust 原生界面").weak());
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("⏻ 退出").clicked() {
-                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        // ===== 整体布局：左侧整高侧边栏 + 右侧顶栏/内容（类 DeepSeek Harness）=====
+        // Panel 之间的调用顺序决定占位顺序，所以最外层不要先开 CentralPanel。
+        egui::Panel::left("adl_sidebar")
+            .exact_size(SIDEBAR_W)
+            .resizable(false)
+            .show_separator_line(true)
+            .frame(sidebar_frame())
+            .show(ui, |ui| self.sidebar(ui));
+
+        egui::Panel::top("adl_topbar")
+            .exact_size(TOPBAR_H)
+            .resizable(false)
+            .show_separator_line(true)
+            .frame(topbar_frame())
+            .show(ui, |ui| self.topbar(ui));
+
+        // 状态提示条（6 秒后消失）
+        if let Some((msg, err, at)) = &self.status {
+            if at.elapsed() < Duration::from_secs(6) {
+                let color = if *err {
+                    egui::Color32::from_rgb(0xB0, 0x30, 0x30)
+                } else {
+                    egui::Color32::from_rgb(0x2E, 0x7D, 0x6B)
+                };
+                let fill = if *err {
+                    egui::Color32::from_rgb(0xFD, 0xEF, 0xEF)
+                } else {
+                    egui::Color32::from_rgb(0xEC, 0xF7, 0xF4)
+                };
+                egui::Panel::top("adl_statusbar")
+                    .resizable(false)
+                    .show_separator_line(false)
+                    .frame(
+                        egui::Frame::new()
+                            .fill(fill)
+                            .inner_margin(egui::Margin::symmetric(20, 6)),
+                    )
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.colored_label(color, if *err { "⚠" } else { "✓" });
+                            ui.colored_label(color, msg.as_str());
+                        });
+                    });
+            }
+        }
+
+        egui::CentralPanel::default()
+            .frame(content_frame())
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        match self.tab.clone() {
+                            Tab::Tasks => self.page_tasks(ui),
+                            Tab::Add => self.page_add(ui),
+                            Tab::Settings => self.page_settings(ui),
+                            Tab::Plugin(_, _) => self.page_plugin(ui),
                         }
                     });
-                });
             });
-            ui.add_space(6.0);
-
-            // 状态提示（6 秒后消失）
-            if let Some((msg, err, at)) = &self.status {
-                if at.elapsed() < Duration::from_secs(6) {
-                    let color = if *err {
-                        egui::Color32::from_rgb(0xB0, 0x30, 0x30)
-                    } else {
-                        egui::Color32::from_rgb(0x2E, 0x7D, 0x6B)
-                    };
-                    ui.horizontal(|ui| {
-                        ui.colored_label(color, if *err { "⚠" } else { "✓" });
-                        ui.colored_label(color, msg.as_str());
-                    });
-                }
-            }
-
-            let avail = ui.available_height();
-            ui.horizontal_top(|ui| {
-                // 左侧导航卡片
-                card_frame().show(ui, |ui| {
-                    ui.set_min_size(egui::vec2(180.0, (avail - 24.0).max(200.0)));
-                    ui.set_max_width(180.0);
-                    self.nav(ui);
-                });
-                // 右侧内容卡片
-                card_frame().show(ui, |ui| {
-                    ui.set_min_size(egui::vec2(0.0, (avail - 24.0).max(200.0)));
-                    ui.set_width(ui.available_width());
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            match self.tab.clone() {
-                                Tab::Tasks => self.page_tasks(ui),
-                                Tab::Add => self.page_add(ui),
-                                Tab::Settings => self.page_settings(ui),
-                                Tab::Plugin(_, _) => self.page_plugin(ui),
-                            }
-                        });
-                });
-            });
-        });
 
         // 命令面板
         if self.cmd_open {
@@ -438,36 +510,70 @@ impl eframe::App for App {
 }
 
 impl App {
-    fn nav(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(2.0);
-        ui.label(
-            egui::RichText::new("导航")
-                .small()
-                .color(egui::Color32::from_rgb(0x8A, 0x9A, 0x98)),
+    /// 单个导航项：整宽、圆角、选中/悬停高亮（不用 emoji —— 中文字体里没有表情字形，会显示成方块）
+    fn nav_item(&mut self, ui: &mut egui::Ui, selected: bool, label: &str) -> bool {
+        let (rect, resp) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), 36.0),
+            egui::Sense::click(),
         );
-        ui.add_space(2.0);
-        if ui
-            .selectable_label(self.tab == Tab::Tasks, "📥  任务列表")
-            .clicked()
-        {
+        if selected || resp.hovered() {
+            let bg = if selected {
+                egui::Color32::from_rgb(0xDD, 0xEE, 0xE9)
+            } else {
+                egui::Color32::from_rgb(0xEC, 0xF3, 0xF2)
+            };
+            ui.painter()
+                .rect_filled(rect, egui::CornerRadius::same(8), bg);
+        }
+        // 选中时左侧一道青绿竖条
+        if selected {
+            ui.painter().rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(rect.left(), rect.top() + 8.0),
+                    egui::vec2(3.0, rect.height() - 16.0),
+                ),
+                egui::CornerRadius::same(2),
+                C_TEAL,
+            );
+        }
+        let color = if selected {
+            C_TEAL
+        } else {
+            egui::Color32::from_rgb(0x3A, 0x45, 0x44)
+        };
+        ui.painter().text(
+            egui::pos2(rect.left() + 14.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::FontId::proportional(14.5),
+            color,
+        );
+        resp.clicked()
+    }
+
+    /// 左侧整高边栏：品牌 + 导航 + 底部状态
+    fn sidebar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("ADL").size(20.0).strong().color(C_TEAL));
+            ui.label(egui::RichText::new("下载器").size(13.0).color(C_MUTED));
+        });
+        ui.add_space(18.0);
+        ui.label(egui::RichText::new("导航").size(11.5).color(C_MUTED));
+        ui.add_space(6.0);
+
+        if self.nav_item(ui, self.tab == Tab::Tasks, "任务列表") {
             self.tab = Tab::Tasks;
         }
         ui.add_space(2.0);
-        if ui
-            .selectable_label(self.tab == Tab::Add, "➕  添加下载")
-            .clicked()
-        {
+        if self.nav_item(ui, self.tab == Tab::Add, "添加下载") {
             self.tab = Tab::Add;
         }
         ui.add_space(2.0);
-        if ui
-            .selectable_label(self.tab == Tab::Settings, "⚙  设置")
-            .clicked()
-        {
+        if self.nav_item(ui, self.tab == Tab::Settings, "设置") {
             self.tab = Tab::Settings;
         }
 
-        // 插件页面
         let pages = self
             .plugin_snapshot
             .get("pages")
@@ -475,36 +581,161 @@ impl App {
             .cloned()
             .unwrap_or_default();
         if !pages.is_empty() {
-            ui.add_space(10.0);
-            ui.label(egui::RichText::new("插件页面").weak().small());
+            ui.add_space(18.0);
+            ui.label(egui::RichText::new("插件页面").size(11.5).color(C_MUTED));
+            ui.add_space(6.0);
             for p in pages {
                 let plugin = p.get("plugin").and_then(|x| x.as_str()).unwrap_or("").to_string();
                 let id = p.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
                 let title = p.get("title").and_then(|x| x.as_str()).unwrap_or(&id).to_string();
-                let selected = matches!(&self.tab, Tab::Plugin(pl, pg) if pl == &plugin && pg == &id);
-                if ui.selectable_label(selected, format!("🧩  {title}")).clicked() {
+                let selected =
+                    matches!(&self.tab, Tab::Plugin(pl, pg) if pl == &plugin && pg == &id);
+                if self.nav_item(ui, selected, &title) {
                     self.tab = Tab::Plugin(plugin.clone(), id.clone());
                     self.plugin_view = None;
                     self.reload_plugin_view();
                 }
+                ui.add_space(2.0);
             }
         }
 
-        // 插件动作（工具栏型）与命令提示
         let trusted = self
             .plugin_snapshot
             .get("trusted")
             .and_then(|x| x.as_bool())
             .unwrap_or(false);
         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-            ui.add_space(6.0);
-            ui.label(egui::RichText::new(format!("模式：{}", if trusted { "信任" } else { "安全" })).weak().small());
-            ui.label(egui::RichText::new("Ctrl+K 命令面板").weak().small());
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new("Ctrl+K 命令面板")
+                    .size(11.0)
+                    .color(C_MUTED),
+            );
+            ui.add_space(8.0);
+            let (txt, fg, bg) = if trusted {
+                (
+                    "信任模式",
+                    egui::Color32::from_rgb(0x8B, 0x5A, 0x10),
+                    egui::Color32::from_rgb(0xFD, 0xF2, 0xDC),
+                )
+            } else {
+                ("安全模式", C_TEAL, egui::Color32::from_rgb(0xDD, 0xEE, 0xE9))
+            };
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(76.0, 22.0), egui::Sense::hover());
+            ui.painter()
+                .rect_filled(rect, egui::CornerRadius::same(11), bg);
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                txt,
+                egui::FontId::proportional(12.0),
+                fg,
+            );
+            ui.add_space(4.0);
         });
     }
 
+    fn page_title(&self) -> String {
+        match &self.tab {
+            Tab::Tasks => "任务列表".to_string(),
+            Tab::Add => "添加下载".to_string(),
+            Tab::Settings => "设置".to_string(),
+            Tab::Plugin(plugin, page) => {
+                let p = page.clone();
+                let pl = plugin.clone();
+                self.plugin_snapshot
+                    .get("pages")
+                    .and_then(|x| x.as_array())
+                    .and_then(|arr| {
+                        arr.iter().find_map(|n| {
+                            let same_plugin =
+                                n.get("plugin").and_then(|x| x.as_str()) == Some(pl.as_str());
+                            let same_page = n.get("id").and_then(|x| x.as_str()) == Some(p.as_str());
+                            if same_plugin && same_page {
+                                n.get("title").and_then(|x| x.as_str()).map(|s| s.to_string())
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .unwrap_or_else(|| "插件页面".to_string())
+            }
+        }
+    }
+
+    /// 顶栏按钮：自绘（不依赖布局容器，位置绝对可控）
+    fn topbar_button(ui: &mut egui::Ui, rect: egui::Rect, label: &str, primary: bool) -> bool {
+        let resp = ui.interact(rect, ui.scope_id().with(label), egui::Sense::click());
+        let (bg, fg) = if primary {
+            (
+                if resp.hovered() {
+                    egui::Color32::from_rgb(0x33, 0x7A, 0x6B)
+                } else {
+                    C_TEAL
+                },
+                egui::Color32::WHITE,
+            )
+        } else {
+            (
+                if resp.hovered() {
+                    egui::Color32::from_rgb(0xE4, 0xED, 0xEC)
+                } else {
+                    egui::Color32::from_rgb(0xF2, 0xF6, 0xF6)
+                },
+                egui::Color32::from_rgb(0x3A, 0x45, 0x44),
+            )
+        };
+        ui.painter().rect_filled(rect, egui::CornerRadius::same(7), bg);
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(13.5),
+            fg,
+        );
+        resp.clicked()
+    }
+
+    /// 顶栏：页标题 + 右侧操作（自绘按钮，绝对定位到面板右缘）
+    fn topbar(&mut self, ui: &mut egui::Ui) {
+        let title = self.page_title();
+        let band = ui.available_rect_before_wrap();
+        let cy = band.center().y;
+        let bh = 28.0;
+
+        // 左侧标题
+        ui.painter().text(
+            egui::pos2(band.left() + 2.0, cy),
+            egui::Align2::LEFT_CENTER,
+            &title,
+            egui::FontId::proportional(16.0),
+            C_INK,
+        );
+
+        // 右侧两个按钮，从右边缘往左排
+        let w_add = 96.0;
+        let w_quit = 60.0;
+        let gap = 8.0;
+        let right = band.right();
+        let add_rect = egui::Rect::from_center_size(
+            egui::pos2(right - w_add / 2.0, cy),
+            egui::vec2(w_add, bh),
+        );
+        let quit_rect = egui::Rect::from_center_size(
+            egui::pos2(right - w_add - gap - w_quit / 2.0, cy),
+            egui::vec2(w_quit, bh),
+        );
+
+        if Self::topbar_button(ui, add_rect, "+ 添加下载", true) {
+            self.tab = Tab::Add;
+        }
+        if Self::topbar_button(ui, quit_rect, "退出", false) {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
     fn page_tasks(&mut self, ui: &mut egui::Ui) {
-        ui.heading("任务列表");
+        ui.add_space(2.0);
         // 工具栏动作（插件）
         let actions: Vec<(String, String, String)> = self
             .plugin_snapshot
@@ -539,57 +770,126 @@ impl App {
             ui.label(egui::RichText::new("还没有下载任务，去「添加下载」吧。").weak());
             return;
         }
-        ui.add_space(6.0);
+        ui.add_space(8.0);
+
+        // 列宽：除"文件"外都是固定值，"文件"吃掉剩余宽度。
+        // 注意总宽必须 <= 可用宽度，否则最右侧的"操作"列会被裁掉（实测过）。
+        const W_STATUS: f32 = 72.0;
+        const W_PROGRESS: f32 = 150.0;
+        const W_SPEED: f32 = 92.0;
+        const W_SIZE: f32 = 82.0;
+        const W_ACTION: f32 = 104.0;
+        const GAP: f32 = 10.0;
+        const ROW_H: f32 = 34.0;
+
+        let fixed =
+            W_STATUS + W_PROGRESS + W_SPEED + W_SIZE + W_ACTION + GAP * 5.0;
+        // 减去滚动条与一点安全边距，避免出现横向滚动
+        let w_name = (ui.available_width() - fixed - 16.0).max(120.0);
 
         let mut pause_id: Option<u64> = None;
         let mut remove_id: Option<u64> = None;
-        egui::Grid::new("tasks_grid")
-            .num_columns(6)
-            .striped(true)
-            .spacing([14.0, 8.0])
-            .show(ui, |ui| {
-                ui.label(egui::RichText::new("状态").strong());
-                ui.label(egui::RichText::new("文件").strong());
-                ui.label(egui::RichText::new("进度").strong());
-                ui.label(egui::RichText::new("速度").strong());
-                ui.label(egui::RichText::new("大小").strong());
-                ui.label(egui::RichText::new("操作").strong());
-                ui.end_row();
 
-                for t in &tasks {
-                    let (txt, color) = status_style(&t.status);
-                    ui.colored_label(color, txt);
-                    let name = t
-                        .path
-                        .as_deref()
-                        .and_then(|p| std::path::Path::new(p).file_name())
-                        .and_then(|s| s.to_str())
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| t.url.clone());
-                    ui.vertical(|ui| {
-                        ui.label(name).on_hover_text(&t.url);
-                        if let Some(err) = &t.error {
-                            ui.label(
-                                egui::RichText::new(err)
-                                    .small()
-                                    .color(egui::Color32::from_rgb(0xB0, 0x30, 0x30)),
-                            );
-                        }
-                    });
-                    let frac = if t.total > 0 {
-                        (t.completed as f32 / t.total as f32).clamp(0.0, 1.0)
-                    } else {
-                        0.0
-                    };
+        // 表头
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            table_cell(ui, W_STATUS, |ui| {
+                ui.label(egui::RichText::new("状态").small().color(C_MUTED));
+            });
+            table_cell(ui, w_name, |ui| {
+                ui.label(egui::RichText::new("文件").small().color(C_MUTED));
+            });
+            table_cell(ui, W_PROGRESS, |ui| {
+                ui.label(egui::RichText::new("进度").small().color(C_MUTED));
+            });
+            table_cell(ui, W_SPEED, |ui| {
+                ui.label(egui::RichText::new("速度").small().color(C_MUTED));
+            });
+            table_cell(ui, W_SIZE, |ui| {
+                ui.label(egui::RichText::new("大小").small().color(C_MUTED));
+            });
+            table_cell(ui, W_ACTION, |ui| {
+                ui.label(egui::RichText::new("操作").small().color(C_MUTED));
+            });
+        });
+        ui.add_space(4.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        // 数据行
+        for t in &tasks {
+            let (txt, color) = status_style(&t.status);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                ui.set_height(ROW_H);
+
+                table_cell(ui, W_STATUS, |ui| {
+                    ui.label(egui::RichText::new(txt).color(color));
+                });
+
+                // 文件名：单行截断 + 悬停看完整 URL
+                let name = t
+                    .path
+                    .as_deref()
+                    .and_then(|p| std::path::Path::new(p).file_name())
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| t.url.clone());
+                table_cell(ui, w_name, |ui| {
                     ui.add(
-                        egui::ProgressBar::new(frac)
-                            .desired_width(150.0)
-                            .fill(egui::Color32::from_rgb(0x3D, 0x8B, 0x7A))
-                            .show_percentage(),
-                    );
-                    ui.label(format_speed(t.speed));
+                        egui::Label::new(name)
+                            .truncate()
+                            .sense(egui::Sense::hover()),
+                    )
+                    .on_hover_text(&t.url);
+                });
+
+                let frac = if t.total > 0 {
+                    (t.completed as f32 / t.total as f32).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                if t.status == "completed" {
+                    table_cell(ui, W_PROGRESS, |ui| {
+                        ui.label(egui::RichText::new("已完成").color(C_TEAL));
+                    });
+                } else if t.status == "failed" {
+                    table_cell(ui, W_PROGRESS, |ui| {
+                        let msg = t.error.as_deref().unwrap_or("失败");
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(msg)
+                                    .color(egui::Color32::from_rgb(0xB0, 0x30, 0x30)),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(msg);
+                    });
+                } else {
+                    table_cell(ui, W_PROGRESS, |ui| {
+                        ui.add(
+                            egui::ProgressBar::new(frac)
+                                .desired_width(W_PROGRESS - 8.0)
+                                .fill(C_TEAL)
+                                .show_percentage(),
+                        );
+                    });
+                }
+
+                table_cell(ui, W_SPEED, |ui| {
+                    let s = if t.speed > 0 {
+                        format_speed(t.speed)
+                    } else {
+                        "—".to_string()
+                    };
+                    ui.label(egui::RichText::new(s).color(C_MUTED));
+                });
+                table_cell(ui, W_SIZE, |ui| {
                     ui.label(format_bytes(t.total));
+                });
+                table_cell(ui, W_ACTION, |ui| {
                     ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
                         if t.status == "downloading" && ui.small_button("暂停").clicked() {
                             pause_id = Some(t.id);
                         }
@@ -597,9 +897,12 @@ impl App {
                             remove_id = Some(t.id);
                         }
                     });
-                    ui.end_row();
-                }
+                });
             });
+            ui.add_space(2.0);
+            ui.separator();
+            ui.add_space(2.0);
+        }
 
         if let Some(id) = pause_id {
             let _ = pause_task(&self.gui, &json!({"id": id}));
@@ -610,8 +913,8 @@ impl App {
     }
 
     fn page_add(&mut self, ui: &mut egui::Ui) {
-        ui.heading("添加下载");
-        ui.add_space(6.0);
+        // 标题已在顶栏显示
+        ui.add_space(2.0);
         ui.label("下载地址");
         ui.add(
             egui::TextEdit::singleline(&mut self.f_url)
@@ -638,53 +941,125 @@ impl App {
     }
 
     fn page_settings(&mut self, ui: &mut egui::Ui) {
-        ui.heading("设置");
-        ui.add_space(6.0);
-        egui::Grid::new("settings_grid")
-            .num_columns(2)
-            .spacing([12.0, 8.0])
-            .show(ui, |ui| {
-                ui.label("默认下载目录");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.s_dir).desired_width(360.0),
-                );
-                ui.end_row();
+        // 标题已在顶栏显示
+        ui.add_space(2.0);
+        card_frame().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new("下载")
+                    .size(13.0)
+                    .strong()
+                    .color(C_MUTED),
+            );
+            ui.add_space(8.0);
+            egui::Grid::new("settings_grid")
+                .num_columns(2)
+                .spacing([18.0, 12.0])
+                .min_col_width(0.0)
+                .show(ui, |ui| {
+                    let label_w = 210.0;
+                    let ctrl_w = 380.0;
 
-                ui.label("并发数（1–64，自适应）");
-                ui.add(egui::DragValue::new(&mut self.s_conn).range(1..=64));
-                ui.end_row();
+                    label_cell(ui, label_w, "默认下载目录");
+                    ui.add_sized(
+                        [ctrl_w, 26.0],
+                        egui::TextEdit::singleline(&mut self.s_dir)
+                            .hint_text("留空 = 当前目录"),
+                    );
+                    ui.end_row();
 
-                ui.label("限速（字节/秒，0=不限）");
-                ui.add(egui::DragValue::new(&mut self.s_limit).range(0..=1_000_000_000u64));
-                ui.end_row();
-
-                ui.label("HTTP 代理（如 http://127.0.0.1:7890）");
-                ui.add(egui::TextEdit::singleline(&mut self.s_proxy).desired_width(360.0));
-                ui.end_row();
-
-                ui.label("插件模式");
-                egui::ComboBox::from_id_salt("mode")
-                    .selected_text(if self.s_mode == "trusted" { "信任（可改写/替换 UI）" } else { "安全（只读/拦截）" })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.s_mode, "safe".to_string(), "安全（只读/拦截）");
-                        ui.selectable_value(&mut self.s_mode, "trusted".to_string(), "信任（可改写/替换 UI）");
+                    label_cell(ui, label_w, "并发数（1–64，自适应）");
+                    ui.horizontal(|ui| {
+                        ui.add(egui::DragValue::new(&mut self.s_conn).range(1..=64).speed(1.0));
+                        ui.label(
+                            egui::RichText::new("服务器不给满会自动降，稳定后偶尔试探 +1")
+                                .small()
+                                .color(C_MUTED),
+                        );
                     });
-                ui.end_row();
+                    ui.end_row();
 
-                ui.label("强制 HTTP/1.1");
-                ui.checkbox(&mut self.s_http1, "某些站点的 h2 有问题时勾选");
-                ui.end_row();
+                    label_cell(ui, label_w, "限速（字节/秒，0 = 不限）");
+                    ui.add_sized(
+                        [ctrl_w, 26.0],
+                        egui::DragValue::new(&mut self.s_limit).range(0..=1_000_000_000u64),
+                    );
+                    ui.end_row();
 
-                ui.label("插件目录（留空=exe 同级 plugins）");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.s_plugin_dir).desired_width(360.0),
-                );
-                ui.end_row();
-            });
-        ui.add_space(10.0);
-        if ui.button("保存设置").clicked() {
-            self.do_save_settings();
-        }
+                    label_cell(ui, label_w, "HTTP 代理");
+                    ui.add_sized(
+                        [ctrl_w, 26.0],
+                        egui::TextEdit::singleline(&mut self.s_proxy)
+                            .hint_text("http://127.0.0.1:7890（留空 = 直连）"),
+                    );
+                    ui.end_row();
+
+                    label_cell(ui, label_w, "HTTP/1.1");
+                    ui.checkbox(&mut self.s_http1, "强制使用 HTTP/1.1（某些站点 h2 有问题时）");
+                    ui.end_row();
+                });
+
+            ui.add_space(14.0);
+            ui.label(
+                egui::RichText::new("插件")
+                    .size(13.0)
+                    .strong()
+                    .color(C_MUTED),
+            );
+            ui.add_space(8.0);
+            egui::Grid::new("settings_plugin_grid")
+                .num_columns(2)
+                .spacing([18.0, 12.0])
+                .min_col_width(0.0)
+                .show(ui, |ui| {
+                    let label_w = 210.0;
+                    let ctrl_w = 380.0;
+
+                    label_cell(ui, label_w, "插件模式");
+                    ui.vertical(|ui| {
+                        egui::ComboBox::from_id_salt("mode")
+                            .width(ctrl_w)
+                            .selected_text(if self.s_mode == "trusted" {
+                                "信任（可改写请求 / 替换界面）"
+                            } else {
+                                "安全（只读观察 / 拦截）"
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.s_mode,
+                                    "safe".to_string(),
+                                    "安全（只读观察 / 拦截）",
+                                );
+                                ui.selectable_value(
+                                    &mut self.s_mode,
+                                    "trusted".to_string(),
+                                    "信任（可改写请求 / 替换界面）",
+                                );
+                            });
+                        ui.label(
+                            egui::RichText::new("信任模式下插件才能改写请求、注册按钮与替换内置页面")
+                                .small()
+                                .color(C_MUTED),
+                        );
+                    });
+                    ui.end_row();
+
+                    label_cell(ui, label_w, "插件目录");
+                    ui.vertical(|ui| {
+                        ui.add_sized(
+                            [ctrl_w, 26.0],
+                            egui::TextEdit::singleline(&mut self.s_plugin_dir)
+                                .hint_text("留空 = exe 同级 plugins"),
+                        );
+                    });
+                    ui.end_row();
+                });
+            ui.add_space(14.0);
+            if ui.button("保存设置").clicked() {
+                self.do_save_settings();
+            }
+        });
 
         // 插件设置区
         let settings = self
@@ -695,8 +1070,15 @@ impl App {
             .unwrap_or_default();
         if !settings.is_empty() {
             ui.add_space(16.0);
-            ui.separator();
-            ui.heading("插件设置");
+            card_frame().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    egui::RichText::new("插件设置")
+                        .size(15.0)
+                        .strong()
+                        .color(C_TEAL),
+                );
+                ui.add_space(6.0);
             let mut pending: Vec<(String, String, String)> = Vec::new();
             egui::Grid::new("plugin_settings_grid")
                 .num_columns(3)
@@ -757,16 +1139,16 @@ impl App {
             for (p, k, v) in pending {
                 self.save_plugin_setting(&p, &k, &v);
             }
+            });
         }
     }
 
     fn page_plugin(&mut self, ui: &mut egui::Ui) {
-        let (plugin, page) = match self.tab.clone() {
-            Tab::Plugin(p, g) => (p, g),
+        let plugin = match self.tab.clone() {
+            Tab::Plugin(p, _) => p,
             _ => return,
         };
-        ui.heading(format!("插件页面 · {plugin}/{page}"));
-        ui.add_space(6.0);
+        ui.add_space(2.0);
         let mut dispatch: Vec<Dispatch> = Vec::new();
         if self.plugin_view.is_none() {
             self.reload_plugin_view();
