@@ -1439,7 +1439,15 @@ fn main() -> eframe::Result {
         .to_ascii_lowercase()
         .as_str()
     {
-        "wgpu" => eframe::Renderer::Wgpu,
+        "wgpu" => {
+            // 实测：本机 wgpu 自动选后端会优先拿到 Vulkan，而 Intel Vulkan 驱动在
+            // 远程/无独显会话下 swapchain 会在数秒内静默崩溃；DX12 稳定。所以
+            // 未显式指定 WGPU_BACKEND 时，Windows 上默认走 dx12。
+            if cfg!(windows) && std::env::var_os("WGPU_BACKEND").is_none() {
+                std::env::set_var("WGPU_BACKEND", "dx12");
+            }
+            eframe::Renderer::Wgpu
+        }
         "vulkan" => {
             std::env::set_var("WGPU_BACKEND", "vulkan");
             eframe::Renderer::Wgpu
