@@ -134,7 +134,39 @@ adl.onAction((req) => ({ message: "收到动作：" + req.action }));
 adl.onCommand((req) => ({ message: "命令响应" }));
 ```
 
-- 组件白名单：`text / heading / badge / divider / spacer / row / col / button / input / select / toggle / progress / list`；每个节点可有 `children: []`。
+- 组件白名单：`text / label / heading / badge / status / divider / spacer / row / col / card / grid / stat / kv / table / list / link / code / timestamp / button / input / select / toggle / progress`；容器类节点用 `children: []`，列表/键值/表格类用自己的字段（见下）。
 - 按钮的 `action` 会回调到 `adl.onAction`（仅 trusted 生效）；`input/select/toggle` 上的 `setting` 会双向绑定到插件设置。
 - **分级**：`safe` 只给页面（只读）+ 设置项（只读）；`trusted` 才给动作、命令、可编辑设置、替换内置页。
 - 设置存储：主 `config.toml` 只存每插件 `enabled` 开关；详细值在 `%LOCALAPPDATA%\ADL\plugin-settings\<id>.json`。
+
+### 组件速查
+
+| type | 关键字段 | 说明 |
+|---|---|---|
+| `text` | `value`, `dim?` | 正文；`dim:true` 变弱色 |
+| `label` | `value` | 小号灰标题，用于分段 |
+| `heading` | `value` | 17px 加粗 |
+| `badge` | `value`, `tone?` | 胶囊徽标 |
+| `status` | `value`, `tone?` | 圆点 + 文字（运行中/已完成…） |
+| `divider` | — | 极细线 |
+| `spacer` | `height?`（默认 8） | 竖向留白 |
+| `row` | `children`, `gap?` | 横向排列 |
+| `col` | `children`, `gap?` | 纵向排列 |
+| `card` | `children` | 白卡片容器 |
+| `grid` | `columns?`（默认 3）, `gap?`, `children` | 等宽网格，适合统计卡片墙 |
+| `stat` | `value`, `label?` | 大数字卡片 |
+| `kv` | `items:[{key,value,tone?}]`, `labelWidth?` | 键值对表 |
+| `table` | `columns:["标题",…]`, `rows:[[…]]` | 插件表格（列宽均分） |
+| `list` | `items:[string或节点]` | 圆点列表 |
+| `link` | `label`, `url` | 超链接 |
+| `code` | `value` | 等宽小字（哈希/日志） |
+| `timestamp` | `value` | 弱色小字 |
+| `button` | `label`, `action`, `kind?` | `kind` = `primary`/`ghost`/省略 |
+| `progress` | `value` + `total?` 或 `value`(0..1), `label?` | 有 `total` 时显示 `已下/总量` |
+| `toggle` | `label`, `value`, `setting` | 开关，双向绑定设置 |
+| `select` | `label`, `value`, `options`, `setting` | 下拉，双向绑定设置 |
+| `input` | `label`, `value` | **只读**展示（插件不能抢焦点） |
+
+`tone` 只用语义名：`accent` / `warn` / `danger` / `muted`（另有别名 `primary`/`ok`/`completed`/`paused`/`error`/`failed`）。**不要写 RGB** —— 硬编码色在换主题时会变成一块突兀的补丁。
+
+未知 `type` 会被画成 `[xxx]` 占位而不是报错，所以新插件用新组件在旧版 ADL 上只是少显示一点东西，不会整页崩掉。

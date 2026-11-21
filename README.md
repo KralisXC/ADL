@@ -81,9 +81,11 @@ cargo build --release -p adl-gui
 ```
 
 - 三个页面：任务列表（进度/暂停/删除）、添加下载、设置（目录/并发/限速/代理/插件模式）。
-- **左右式布局**：左侧整高边栏（品牌 + 导航 + 插件页面 + 模式胶囊）、顶部横栏（页标题 + 退出 / + 添加下载）、右侧内容区（白卡片）。
-- **自研 UI 组件库 `crates/adl-ui`**（854 行）：主题令牌化（换肤只改 `theme.rs`）、`Field`/`form()` 声明式表单（一行一个字段）、`Column`/`table()` 定宽表格（一列吃剩余、自带虚拟化）。新增一页设置只需几行 `Field`，不再手写 `Grid` + `add_sized` + `end_row`。
-- 支持插件声明式 UI 页面、动作按钮、插件设置、命令面板（Ctrl+K）；插件组件树与本体的界面共用同一套视觉语言。
+- **左右式布局**：左侧整高边栏（导航 + 插件页面 + 模式胶囊）、顶部横栏（页标题 + 添加下载）、右侧内容区（白卡片浮在浅灰底上）。
+- **无边框窗口、自绘标题栏**：顶部是应用自己的标题栏（左侧 logo、右侧最小化/最大化/关闭），拖动、双击最大化、八向边缘缩放全部由自己实现（`with_decorations(false)` 之后系统不再提供这些）。三个按钮的图标用线段手画，不依赖字体符号。
+- **没有装饰性的分隔线**：侧边栏、顶栏、标题栏同色（白）构成一整块外壳，内容区浅灰底 —— 边界靠底色差出现，不画线；只有表头下沿保留一条 0.6px 的极淡线（`palette.hair`）。
+- **自研 UI 组件库 `crates/adl-ui`**：主题令牌化（换肤只改 `theme.rs`）、`Field`/`form()` 声明式表单（一行一个字段）、`Column`/`table()` 定宽表格（一列吃剩余、自带虚拟化）、`window_button`/`hairline`/`nav_item`/`card` 等基础控件。新增一页设置只需几行 `Field`，不再手写 `Grid` + `add_sized` + `end_row`。
+- 支持插件声明式 UI 页面（**23 个组件**：text/heading/badge/status/grid/stat/kv/table/progress/toggle/select/button…）、动作按钮、插件设置、命令面板（Ctrl+K）；插件组件树与本体的界面共用同一套视觉语言与主题令牌。
 - 单实例（再次启动会唤醒已有窗口）、关闭到托盘（点托盘「显示主界面」恢复）、系统休眠自动暂停。
 - 与 CLI 共用 `adl-core` 引擎、`adl-plugin` 插件、`adl-app` 配置/历史；浏览器接管 API 同进程运行。
 
@@ -226,6 +228,8 @@ adl.onCommand(() => ({ message: "命令响应" }));
 - ✅ 原生 UI（egui + glow/wgpu 双后端可选，跨 Windows/Linux/macOS，无 WebView2）
 - ✅ UI 左右式布局（侧边栏 + 顶栏 + 内容区，Motrix 浅色主题）
 - ✅ 自研 UI 组件库 `crates/adl-ui`（主题令牌 + 声明式表单 + 定宽表格，三页已迁移）
+- ✅ 无边框窗口 + 自绘标题栏（拖动 / 双击最大化 / 八向缩放全部自实现，不依赖字体图标）
+- ✅ 插件渲染器 23 个组件（grid/stat/kv/table/status…，语义 tone，未知类型降级不崩）
 
 设计文档见 [docs/DESIGN.md](docs/DESIGN.md)。
 

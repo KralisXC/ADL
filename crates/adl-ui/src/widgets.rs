@@ -41,12 +41,7 @@ pub fn nav_item(ui: &mut Ui, selected: bool, label: &str) -> bool {
     let (rect, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
 
     if selected || resp.hovered() {
-        let bg = if selected { p.accent_soft } else { p.card.gamma_multiply(0.0) };
-        let bg = if selected {
-            bg
-        } else {
-            Color32::from_rgb(0xEC, 0xF3, 0xF2)
-        };
+        let bg = if selected { p.accent_soft } else { p.hover_bg };
         ui.painter()
             .rect_filled(rect, CornerRadius::same(th.radius.nav), bg);
     }
@@ -89,7 +84,7 @@ pub fn small_button(ui: &mut Ui, rect: Rect, label: &str, primary: bool) -> bool
         let bg = if resp.hovered() {
             p.line
         } else {
-            Color32::from_rgb(0xF2, 0xF6, 0xF6)
+            p.hover_bg
         };
         (bg, p.ink)
     };
@@ -194,4 +189,117 @@ pub fn empty_state(ui: &mut Ui, text: &str) {
             .color(th.palette.muted)
             .size(th.text.body),
     );
+}
+
+/// 极细分割线（1 物理像素观感）。
+///
+/// **只在"内容被截断/滚动"的地方用**：表头下沿、可滚动区域的上/下边缘。
+/// 分区本身靠底色差（白卡 vs 浅底）表达，不要用线去划每个面板 —— 那样
+/// 界面会被一堆框裹住（用户明确说过"分隔线太明显了"）。
+///
+/// 用 `hair` 令牌而不是 `line`：`line` 是卡片描边强度，做面板分隔太重。
+pub fn hairline(ui: &mut Ui) {
+    let th = Theme::from_ui(ui);
+    let w = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(vec2(w, 1.0), Sense::hover());
+    // 只画中间 0.5 高的一根线，让它在 2x DPI 下也不至于变成一条 2px 粗线。
+    let y = rect.center().y;
+    ui.painter().line_segment(
+        [
+            egui::pos2(rect.left(), y),
+            egui::pos2(rect.right(), y),
+        ],
+        egui::Stroke::new(0.6, th.palette.hair),
+    );
+}
+
+/// 自绘标题栏上的窗口按钮。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WindowButton {
+    Minimize,
+    Maximize,
+    Restore,
+    Close,
+}
+
+/// 窗口控制按钮（最小化 / 最大化·还原 / 关闭）。
+///
+/// 关闭按钮悬停时变红底白叉（Windows 习惯），其余悬停浅灰底。
+/// 图标全部用 `line_segment` 画，不依赖字体里的几何符号 ——
+/// 中文字体（simhei）没有 `✕ ▢ ─` 这些字形，会渲染成方块。
+pub fn window_button(ui: &mut Ui, rect: Rect, kind: WindowButton) -> bool {
+    let th = Theme::from_ui(ui);
+    let p = &th.palette;
+
+    let resp = ui.interact(
+        rect,
+        ui.scope_id().with(("winbtn", kind as u8)),
+        Sense::click(),
+    );
+
+    let is_close = kind == WindowButton::Close;
+    if resp.hovered() {
+        let bg = if is_close {
+            Color32::from_rgb(0xC4, 0x2B, 0x1C)
+        } else {
+            p.hover_bg
+        };
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(6), bg);
+    }
+    let fg = if resp.hovered() && is_close {
+        Color32::WHITE
+    } else if resp.hovered() {
+        p.ink
+    } else {
+        p.muted
+    };
+
+    let c = rect.center();
+    let s = 4.5; // 半边长
+    let stroke = egui::Stroke::new(1.2, fg);
+    let painter = ui.painter();
+    match kind {
+        WindowButton::Minimize => {
+            painter.line_segment(
+                [egui::pos2(c.x - s, c.y + 0.5), egui::pos2(c.x + s, c.y + 0.5)],
+                stroke,
+            );
+        }
+        WindowButton::Maximize => {
+            let r = Rect::from_center_size(c, vec2(s * 2.0, s * 2.0));
+            painter.rect_stroke(
+                r,
+                CornerRadius::same(1),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+        WindowButton::Restore => {
+            // 两个叠起来的小方框（错开 2px）
+            let r1 = Rect::from_center_size(
+                egui::pos2(c.x - 1.0, c.y + 1.0),
+                vec2(s * 1.8, s * 1.8),
+            );
+            let r2 = Rect::from_center_size(
+                egui::pos2(c.x + 1.0, c.y - 1.0),
+                vec2(s * 1.8, s * 1.8),
+            );
+            painter.rect_stroke(r2, CornerRadius::same(1), stroke, egui::StrokeKind::Inside);
+            painter.rect_filled(r1, CornerRadius::same(1), p.card);
+            painter.rect_stroke(r1, CornerRadius::same(1), stroke, egui::StrokeKind::Inside);
+        }
+        WindowButton::Close => {
+            painter.line_segment(
+                [egui::pos2(c.x - s, c.y - s), egui::pos2(c.x + s, c.y + s)],
+                stroke,
+            );
+            painter.line_segment(
+                [egui::pos2(c.x - s, c.y + s), egui::pos2(c.x + s, c.y - s)],
+                stroke,
+            );
+        }
+    }
+
+    resp.clicked()
 }

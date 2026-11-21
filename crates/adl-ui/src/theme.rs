@@ -27,6 +27,9 @@ pub struct Palette {
     pub card: Color32,
     /// 分割线、卡片描边
     pub line: Color32,
+    /// 极细线：只在"内容被截断/滚动"处出现（表头下沿、滚动区边缘）。
+    /// 比 `line` 更淡，肉眼几乎看不出是一条线，只当作边界暗示。
+    pub hair: Color32,
     /// 次要文字（表头、说明、速度）
     pub muted: Color32,
     /// 正文
@@ -60,6 +63,7 @@ impl Palette {
             bg: Color32::from_rgb(0xF4, 0xF8, 0xF8),
             card: Color32::WHITE,
             line: Color32::from_rgb(0xE4, 0xED, 0xEC),
+            hair: Color32::from_rgb(0xEE, 0xF3, 0xF2),
             muted: Color32::from_rgb(0x8A, 0x9A, 0x98),
             ink: Color32::from_rgb(0x2A, 0x33, 0x33),
             hover_bg: Color32::from_rgb(0xEC, 0xF3, 0xF2),
@@ -77,6 +81,8 @@ impl Palette {
 pub struct Spacing {
     /// 侧边栏宽度
     pub sidebar_w: f32,
+    /// 自绘标题栏高度（窗口无系统边框时用）
+    pub titlebar_h: f32,
     /// 顶栏高度
     pub topbar_h: f32,
     /// 导航项高度
@@ -101,6 +107,7 @@ impl Default for Spacing {
     fn default() -> Self {
         Self {
             sidebar_w: 212.0,
+            titlebar_h: 40.0,
             topbar_h: 54.0,
             nav_h: 36.0,
             row_h: 30.0,
@@ -282,13 +289,23 @@ impl Theme {
 
     // ── 便捷取值 ──
 
-    /// 卡片：白底 + 圆角 + 细描边 + 内边距
+    /// 卡片：白底 + 圆角 + 极细描边 + 内边距
+    ///
+    /// 描边用 `hair` 而不是 `line`：卡片靠"白底浮在浅底上"产生层次，
+    /// 描边只是防止完全融在一起，不该有"框"的感觉。
     pub fn card_frame(&self) -> egui::Frame {
         egui::Frame::new()
             .fill(self.palette.card)
             .corner_radius(CornerRadius::same(self.radius.card))
-            .stroke(egui::Stroke::new(1.0, self.palette.line))
+            .stroke(egui::Stroke::new(1.0, self.palette.hair))
             .inner_margin(Margin::same(self.spacing.card_pad))
+    }
+
+    /// 自绘标题栏：白底，无描边（分隔靠下面的顶栏同色、内容区浅底）。
+    pub fn titlebar_frame(&self) -> egui::Frame {
+        egui::Frame::new()
+            .fill(self.palette.card)
+            .inner_margin(Margin::symmetric(10, 0))
     }
 
     /// 左侧整高边栏：白底
@@ -298,7 +315,7 @@ impl Theme {
             .inner_margin(Margin::symmetric(12, 14))
     }
 
-    /// 顶栏：白底
+    /// 顶栏：白底（与侧边栏同色 —— 二者本就是一整块"外壳"）
     pub fn topbar_frame(&self) -> egui::Frame {
         egui::Frame::new()
             .fill(self.palette.card)

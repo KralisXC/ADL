@@ -119,6 +119,8 @@ struct App {
     cmd_query: String,
     // 托盘图标：持有即可保活（Windows 上 tray-icon 自己带消息线程）
     _tray: Option<TrayIcon>,
+    // 自绘标题栏用的最大化状态（从 ViewportInfo 同步，点击时本地翻转以即时响应）
+    maximized: bool,
 }
 
 impl App {
@@ -136,10 +138,17 @@ impl App {
         adl_ui::Theme::light().install_and_apply(&cc.egui_ctx);
 
         let cfg = gui.cfg.lock().unwrap().clone();
-        // ADL_TAB 仅用于开发/截图脚本直达某个页面（tasks|add|settings），不写进文档。
+        // ADL_TAB 仅用于开发/截图脚本直达某个页面，不写进文档：
+        //   tasks | add | settings | plugin:<pluginId>:<pageId>
         let initial_tab = match std::env::var("ADL_TAB").unwrap_or_default().as_str() {
             "add" => Tab::Add,
             "settings" => Tab::Settings,
+            s if s.starts_with("plugin:") => {
+                let mut it = s.trim_start_matches("plugin:").splitn(2, ':');
+                let p = it.next().unwrap_or("").to_string();
+                let g = it.next().unwrap_or("").to_string();
+                Tab::Plugin(p, g)
+            }
             _ => Tab::Tasks,
         };
         Self {
@@ -165,6 +174,7 @@ impl App {
             cmd_open: false,
             cmd_query: String::new(),
             _tray: tray,
+            maximized: false,
         }
     }
 
@@ -298,6 +308,14 @@ fn sidebar_w() -> f32 {
 fn topbar_h() -> f32 {
     theme().spacing.topbar_h
 }
+fn titlebar_h() -> f32 {
+    theme().spacing.titlebar_h
+}
+
+/// 自绘标题栏（白底、无描边）
+fn titlebar_frame() -> egui::Frame {
+    theme().titlebar_frame()
+}
 
 /// 整高侧边栏：白底
 fn sidebar_frame() -> egui::Frame {
@@ -360,19 +378,29 @@ impl eframe::App for App {
 
         self.refresh_plugin_snapshot();
 
-        // ===== 整体布局：左侧整高侧边栏 + 右侧顶栏/内容（类 DeepSeek Harness）=====
+        // 无边框窗口：系统不再提供边缘拖拽，八向热区要自己铺。
+        resize_borders(ui);
+
+        // ===== 整体布局：最外层自绘标题栏 + 左侧整高侧边栏 + 右侧顶栏/内容 =====
         // Panel 之间的调用顺序决定占位顺序，所以最外层不要先开 CentralPanel。
+        egui::Panel::top("adl_titlebar")
+            .exact_size(titlebar_h())
+            .resizable(false)
+            .show_separator_line(false)
+            .frame(titlebar_frame())
+            .show(ui, |ui| self.titlebar(ui));
+
         egui::Panel::left("adl_sidebar")
             .exact_size(sidebar_w())
             .resizable(false)
-            .show_separator_line(true)
+            .show_separator_line(false)
             .frame(sidebar_frame())
             .show(ui, |ui| self.sidebar(ui));
 
         egui::Panel::top("adl_topbar")
             .exact_size(topbar_h())
             .resizable(false)
-            .show_separator_line(true)
+            .show_separator_line(false)
             .frame(topbar_frame())
             .show(ui, |ui| self.topbar(ui));
 
@@ -437,14 +465,12 @@ impl App {
         adl_ui::widgets::nav_item(ui, selected, label)
     }
 
-    /// 左侧整高边栏：品牌 + 导航 + 底部状态
+    /// 左侧整高边栏：导航 + 底部状态
+    ///
+    /// 品牌字（ADL / 下载器）已在自绘标题栏里，这里不再重复 ——
+    /// 否则窗口顶部会出现两次"ADL 下载器"。
     fn sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.add_space(4.0);
-            ui.label(egui::RichText::new("ADL").size(20.0).strong().color(teal()));
-            ui.label(egui::RichText::new("下载器").size(13.0).color(muted()));
-        });
-        ui.add_space(18.0);
+        ui.add_space(6.0);
         ui.label(egui::RichText::new("导航").size(11.5).color(muted()));
         ui.add_space(6.0);
 
@@ -554,7 +580,83 @@ impl App {
         adl_ui::widgets::small_button(ui, rect, label, primary)
     }
 
+    /// 自绘标题栏：品牌 + 可拖动空白区 + 最小化/最大化/关闭。
+    ///
+    /// 窗口用 `.with_decorations(false)` 关掉了系统标题栏，所以这里的拖动与
+    /// 双击最大化必须自己实现（`ViewportCommand::StartDrag` / `Maximized`）。
+    /// 拖动区只覆盖标题栏里除按钮外的部分，否则点按钮会变成拖窗口。
+    fn titlebar(&mut self, ui: &mut egui::Ui) {
+        // 跟随系统状态（用户用快捷键 Win+↑ 时也要同步）
+        if let Some(m) = ui.ctx().input(|i| i.viewport().maximized) {
+            self.maximized = m;
+        }
+
+        let band = ui.available_rect_before_wrap();
+        let cy = band.center().y;
+
+        // 右侧三个窗口按钮，从右缘往左排
+        let bw = 46.0;
+        let bh = band.height().min(34.0);
+        let close_rect = egui::Rect::from_center_size(
+            egui::pos2(band.right() - bw / 2.0, cy),
+            egui::vec2(bw, bh),
+        );
+        let max_rect = close_rect.translate(egui::vec2(-bw, 0.0));
+        let min_rect = max_rect.translate(egui::vec2(-bw, 0.0));
+
+        // 品牌与拖动区（覆盖到最小化按钮左侧，留 6px 空隙）
+        let drag_rect = egui::Rect::from_min_max(
+            band.left_top(),
+            egui::pos2(min_rect.left() - 6.0, band.bottom()),
+        );
+        let drag = ui.interact(drag_rect, ui.scope_id().with("adl_titlebar_drag"), egui::Sense::click_and_drag());
+        if drag.drag_started() {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+        if drag.double_clicked() {
+            self.toggle_maximize(ui.ctx());
+        }
+
+        ui.painter().text(
+            egui::pos2(drag_rect.left() + 4.0, cy),
+            egui::Align2::LEFT_CENTER,
+            "ADL",
+            egui::FontId::proportional(14.0),
+            pal().accent,
+        );
+        ui.painter().text(
+            egui::pos2(drag_rect.left() + 42.0, cy),
+            egui::Align2::LEFT_CENTER,
+            "下载器",
+            egui::FontId::proportional(12.0),
+            pal().muted,
+        );
+
+        if adl_ui::widgets::window_button(ui, min_rect, adl_ui::WindowButton::Minimize) {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+        let kind = if self.maximized {
+            adl_ui::WindowButton::Restore
+        } else {
+            adl_ui::WindowButton::Maximize
+        };
+        if adl_ui::widgets::window_button(ui, max_rect, kind) {
+            self.toggle_maximize(ui.ctx());
+        }
+        if adl_ui::widgets::window_button(ui, close_rect, adl_ui::WindowButton::Close) {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    fn toggle_maximize(&mut self, ctx: &egui::Context) {
+        self.maximized = !self.maximized;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(self.maximized));
+    }
+
     /// 顶栏：页标题 + 右侧操作（自绘按钮，绝对定位到面板右缘）
+    ///
+    /// 不放"退出"按钮了：标题栏右上角已经有系统级关闭键，重复摆两个关闭
+    /// 入口会让人犹豫"这两个有什么区别"。
     fn topbar(&mut self, ui: &mut egui::Ui) {
         let title = self.page_title();
         let band = ui.available_rect_before_wrap();
@@ -570,25 +672,16 @@ impl App {
             ink(),
         );
 
-        // 右侧两个按钮，从右边缘往左排
+        // 右侧按钮，从右边缘往左排
         let w_add = 96.0;
-        let w_quit = 60.0;
-        let gap = 8.0;
         let right = band.right();
         let add_rect = egui::Rect::from_center_size(
             egui::pos2(right - w_add / 2.0, cy),
             egui::vec2(w_add, bh),
         );
-        let quit_rect = egui::Rect::from_center_size(
-            egui::pos2(right - w_add - gap - w_quit / 2.0, cy),
-            egui::vec2(w_quit, bh),
-        );
 
         if Self::topbar_button(ui, add_rect, "+ 添加下载", true) {
             self.tab = Tab::Add;
-        }
-        if Self::topbar_button(ui, quit_rect, "退出", false) {
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
@@ -990,30 +1083,196 @@ impl App {
     }
 }
 
+// ───────────────────────── 无边框窗口的边缘缩放 ─────────────────────────
+
+/// 无边框窗口的边缘缩放热区。
+///
+/// `with_decorations(false)` 之后，Windows 不再提供 `WS_SIZEBOX` 那种边缘命中
+/// 测试（winit 的 `WM_NCCALCSIZE` 把客户区铺满整个非客户区），所以八个方向的
+/// 缩放必须自己铺：沿四边画不可见的热区，按住时发 `BeginResize`。
+///
+/// 热区宽度取 5px：再宽会挡住内容区的边缘控件，再窄鼠标不好瞄。
+fn resize_borders(ui: &mut egui::Ui) {
+    const G: f32 = 5.0;
+    use egui::viewport::ResizeDirection as Dir;
+
+    let full = ui.ctx().input(|i| i.viewport_rect());
+
+    // (矩形, 方向, 光标)
+    let items: [(egui::Rect, Dir, egui::CursorIcon); 8] = [
+        (
+            egui::Rect::from_min_max(full.left_top(), egui::pos2(full.left() + G, full.bottom())),
+            Dir::West,
+            egui::CursorIcon::ResizeHorizontal,
+        ),
+        (
+            egui::Rect::from_min_max(
+                egui::pos2(full.right() - G, full.top()),
+                full.right_bottom(),
+            ),
+            Dir::East,
+            egui::CursorIcon::ResizeHorizontal,
+        ),
+        (
+            egui::Rect::from_min_max(full.left_top(), egui::pos2(full.right(), full.top() + G)),
+            Dir::North,
+            egui::CursorIcon::ResizeVertical,
+        ),
+        (
+            egui::Rect::from_min_max(
+                egui::pos2(full.left(), full.bottom() - G),
+                full.right_bottom(),
+            ),
+            Dir::South,
+            egui::CursorIcon::ResizeVertical,
+        ),
+        (
+            egui::Rect::from_min_max(full.left_top(), egui::pos2(full.left() + G, full.top() + G)),
+            Dir::NorthWest,
+            egui::CursorIcon::ResizeNorthWest,
+        ),
+        (
+            egui::Rect::from_min_max(
+                egui::pos2(full.right() - G, full.top()),
+                egui::pos2(full.right(), full.top() + G),
+            ),
+            Dir::NorthEast,
+            egui::CursorIcon::ResizeNorthEast,
+        ),
+        (
+            egui::Rect::from_min_max(
+                egui::pos2(full.left(), full.bottom() - G),
+                egui::pos2(full.left() + G, full.bottom()),
+            ),
+            Dir::SouthWest,
+            egui::CursorIcon::ResizeSouthWest,
+        ),
+        (
+            egui::Rect::from_min_max(
+                egui::pos2(full.right() - G, full.bottom() - G),
+                full.right_bottom(),
+            ),
+            Dir::SouthEast,
+            egui::CursorIcon::ResizeSouthEast,
+        ),
+    ];
+
+    for (i, (rect, dir, cursor)) in items.into_iter().enumerate() {
+        let resp = ui.interact(
+            rect,
+            ui.make_persistent_id(("adl_resize_hot", i)),
+            egui::Sense::drag(),
+        );
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(cursor);
+        }
+        if resp.drag_started() {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
+        }
+    }
+}
+
 // ───────────────────────── 插件组件树渲染 ─────────────────────────
 
+/// 取字符串字段（缺失/类型不符都当空串）。
+fn s_of<'a>(node: &'a Value, k: &str) -> &'a str {
+    node.get(k).and_then(|x| x.as_str()).unwrap_or("")
+}
+/// 取数字字段。
+fn f_of(node: &Value, k: &str) -> Option<f64> {
+    node.get(k).and_then(|x| x.as_f64())
+}
+/// 取布尔字段。
+fn b_of(node: &Value, k: &str, default: bool) -> bool {
+    node.get(k).and_then(|x| x.as_bool()).unwrap_or(default)
+}
+/// 取字符串数组。
+fn sa_of(node: &Value, k: &str) -> Vec<String> {
+    node.get(k)
+        .and_then(|x| x.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|o| o.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 语义色：把插件写的 `tone` 名字翻成主题色。
+///
+/// 插件**不能**直接传 RGB —— 那样换主题/深色模式时插件会变成一块突兀的
+/// 硬编码色。只允许语义名，颜色归主题管。
+fn tone_color(tone: &str) -> egui::Color32 {
+    let p = pal();
+    match tone {
+        "accent" | "primary" | "ok" | "completed" => p.accent,
+        "warn" | "paused" => p.warn,
+        "danger" | "error" | "failed" => p.danger,
+        _ => p.muted,
+    }
+}
+
+/// 插件声明的组件树 → egui。
+///
+/// 设计约束（与 DESIGN.md §5.2 一致）：插件只能返回**声明式 JSON**，
+/// 绝不返回 HTML/JS。这里每个 `type` 都是白名单里的一项，未识别的一律
+/// 画成 `[xxx]` 而不是报错 —— 这样新版插件在旧版 ADL 上只是少画点东西，
+/// 不会整页崩掉。
 fn render_node(ui: &mut egui::Ui, plugin: &str, node: &Value, out: &mut Vec<Dispatch>) {
     let ty = node.get("type").and_then(|x| x.as_str()).unwrap_or("text");
     match ty {
         "text" => {
-            ui.label(node.get("value").and_then(|x| x.as_str()).unwrap_or(""));
+            let v = s_of(node, "value");
+            let dim = b_of(node, "dim", false);
+            let r = egui::RichText::new(v);
+            ui.label(if dim { r.color(pal().muted) } else { r });
         }
         "heading" => {
-            ui.heading(node.get("value").and_then(|x| x.as_str()).unwrap_or(""));
+            ui.label(
+                egui::RichText::new(s_of(node, "value"))
+                    .size(17.0)
+                    .strong()
+                    .color(pal().ink),
+            );
+        }
+        "label" => {
+            // 表单左侧的小标题
+            ui.label(
+                egui::RichText::new(s_of(node, "value"))
+                    .small()
+                    .color(pal().muted),
+            );
         }
         "badge" => {
-            let v = node.get("value").and_then(|x| x.as_str()).unwrap_or("");
-            ui.label(egui::RichText::new(format!("[{v}]")).weak().small());
+            let v = s_of(node, "value");
+            if v.is_empty() {
+                return;
+            }
+            adl_ui::badge(ui, v, tone_color(s_of(node, "tone")));
+        }
+        "status" => {
+            // = badge + 圆点，用于"运行中/已完成"这类状态
+            let v = s_of(node, "value");
+            let c = tone_color(s_of(node, "tone"));
+            ui.horizontal(|ui| {
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                ui.painter().circle_filled(rect.center(), 3.5, c);
+                ui.label(egui::RichText::new(v).color(c));
+            });
         }
         "divider" => {
-            ui.separator();
+            // 极细线：插件也可能想分段，但不要粗沟
+            adl_ui::hairline(ui);
         }
         "spacer" => {
-            let h = node.get("height").and_then(|x| x.as_f64()).unwrap_or(8.0) as f32;
+            let h = f_of(node, "height").unwrap_or(8.0) as f32;
             ui.add_space(h);
         }
         "row" => {
+            let gap = f_of(node, "gap").unwrap_or(8.0) as f32;
             ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
                 if let Some(ch) = node.get("children").and_then(|x| x.as_array()) {
                     for c in ch {
                         render_node(ui, plugin, c, out);
@@ -1022,7 +1281,19 @@ fn render_node(ui: &mut egui::Ui, plugin: &str, node: &Value, out: &mut Vec<Disp
             });
         }
         "col" => {
+            let gap = f_of(node, "gap").unwrap_or(6.0) as f32;
             ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = gap;
+                if let Some(ch) = node.get("children").and_then(|x| x.as_array()) {
+                    for c in ch {
+                        render_node(ui, plugin, c, out);
+                    }
+                }
+            });
+        }
+        "card" => {
+            // 插件页里也能有卡片，视觉与本体一致
+            adl_ui::card(ui, |ui| {
                 if let Some(ch) = node.get("children").and_then(|x| x.as_array()) {
                     for c in ch {
                         render_node(ui, plugin, c, out);
@@ -1032,7 +1303,19 @@ fn render_node(ui: &mut egui::Ui, plugin: &str, node: &Value, out: &mut Vec<Disp
         }
         "button" => {
             let label = node.get("label").and_then(|x| x.as_str()).unwrap_or("按钮");
-            if ui.button(label).clicked() {
+            let kind = s_of(node, "kind");
+            let clicked = if kind == "primary" {
+                ui.add(egui::Button::new(
+                    egui::RichText::new(label).color(egui::Color32::WHITE),
+                )
+                .fill(pal().accent))
+                .clicked()
+            } else if kind == "ghost" {
+                ui.add(egui::Button::new(label).frame(false)).clicked()
+            } else {
+                ui.button(label).clicked()
+            };
+            if clicked {
                 if let Some(action) = node.get("action").and_then(|x| x.as_str()) {
                     out.push(Dispatch::Action {
                         plugin: plugin.to_string(),
@@ -1042,19 +1325,42 @@ fn render_node(ui: &mut egui::Ui, plugin: &str, node: &Value, out: &mut Vec<Disp
             }
         }
         "progress" => {
-            let v = node.get("value").and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
-            ui.add(
-                egui::ProgressBar::new(v.clamp(0.0, 1.0))
-                    .fill(egui::Color32::from_rgb(0x3D, 0x8B, 0x7A))
-                    .show_percentage(),
-            );
+            // 两种写法：value 是 0..1 比例，或 value/total 是绝对量
+            let total = f_of(node, "total");
+            let ratio = match total {
+                Some(t) if t > 0.0 => (f_of(node, "value").unwrap_or(0.0) / t) as f32,
+                _ => f_of(node, "value").unwrap_or(0.0) as f32,
+            };
+            let mut pb = egui::ProgressBar::new(ratio.clamp(0.0, 1.0)).fill(pal().accent);
+            let label = s_of(node, "label");
+            pb = if let Some(t) = total {
+                pb.text(format!(
+                    "{} / {}",
+                    format_bytes(f_of(node, "value").unwrap_or(0.0) as u64),
+                    format_bytes(t as u64)
+                ))
+            } else if !label.is_empty() {
+                pb.text(label)
+            } else {
+                pb.show_percentage()
+            };
+            let width = ui.available_width();
+            ui.add(pb.desired_width(width));
         }
         "list" => {
-            if let Some(items) = node.get("items").and_then(|x| x.as_array()) {
-                for it in items {
+            let items = node.get("items").and_then(|x| x.as_array()).cloned();
+            if let Some(items) = items {
+                for it in items.iter() {
                     ui.horizontal(|ui| {
-                        ui.label("•");
-                        render_node(ui, plugin, it, out);
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
+                        ui.painter().circle_filled(rect.center(), 2.0, pal().muted);
+                        ui.add_space(2.0);
+                        if it.is_string() {
+                            ui.label(it.as_str().unwrap_or(""));
+                        } else {
+                            render_node(ui, plugin, it, out);
+                        }
                     });
                 }
             } else if let Some(ch) = node.get("children").and_then(|x| x.as_array()) {
@@ -1063,9 +1369,165 @@ fn render_node(ui: &mut egui::Ui, plugin: &str, node: &Value, out: &mut Vec<Disp
                 }
             }
         }
+        "kv" => {
+            // 键值对：左侧灰标签定宽，右侧值
+            let rows = node.get("items").and_then(|x| x.as_array()).cloned();
+            let lw = f_of(node, "labelWidth").unwrap_or(110.0) as f32;
+            if let Some(rows) = rows {
+                for r in rows.iter() {
+                    let k = s_of(r, "key");
+                    let v = s_of(r, "value");
+                    let tone = s_of(r, "tone");
+                    ui.horizontal(|ui| {
+                        // 键用弱色、值用正文色：一眼能分出"标签/内容"
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(lw, 22.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.label(egui::RichText::new(k).color(pal().muted));
+                            },
+                        );
+                        let text = egui::RichText::new(v);
+                        if tone.is_empty() {
+                            ui.label(text);
+                        } else {
+                            ui.label(text.color(tone_color(tone)));
+                        }
+                    });
+                }
+            }
+        }
+        "stat" => {
+            // 大数字卡片：value 为主，label 为辅
+            adl_ui::card(ui, |ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new(s_of(node, "value"))
+                            .size(22.0)
+                            .strong()
+                            .color(pal().ink),
+                    );
+                    let sub = s_of(node, "label");
+                    if !sub.is_empty() {
+                        ui.label(egui::RichText::new(sub).small().color(pal().muted));
+                    }
+                });
+            });
+        }
+        "grid" => {
+            // 等宽网格：按 columns 把 children 分行排（用于统计卡片墙）
+            let cols = f_of(node, "columns").unwrap_or(3.0).max(1.0) as usize;
+            let children: Vec<Value> = node
+                .get("children")
+                .and_then(|x| x.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let gap = f_of(node, "gap").unwrap_or(10.0) as f32;
+            let avail = ui.available_width();
+            let cell_w = ((avail - gap * (cols as f32 - 1.0)) / cols as f32).max(80.0);
+            for chunk in children.chunks(cols) {
+                // horizontal_top：否则各行高度不同时卡片会像阶梯一样上下错开
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = gap;
+                    for c in chunk {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(cell_w, 10.0),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ui.set_min_width(cell_w);
+                                ui.set_max_width(cell_w);
+                                render_node(ui, plugin, c, out);
+                            },
+                        );
+                    }
+                });
+                ui.add_space(gap);
+            }
+        }
+        "table" => {
+            // 插件表格：columns=[{title,width?}]，rows=[[cell,...]]
+            let titles: Vec<String> = node
+                .get("columns")
+                .and_then(|x| x.as_array())
+                .map(|a| {
+                    a.iter()
+                        .map(|c| {
+                            if c.is_string() {
+                                c.as_str().unwrap_or("").to_string()
+                            } else {
+                                s_of(c, "title").to_string()
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if titles.is_empty() {
+                return;
+            }
+            let rows: Vec<Vec<String>> = node
+                .get("rows")
+                .and_then(|x| x.as_array())
+                .map(|a| {
+                    a.iter()
+                        .map(|r| {
+                            r.as_array()
+                                .map(|cells| {
+                                    cells
+                                        .iter()
+                                        .map(|c| match c {
+                                            // 单元格可以是纯字符串，也可以是 {value,tone}
+                                            Value::String(s) => s.clone(),
+                                            other => s_of(other, "value").to_string(),
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            // 手写表头（列宽均分，插件不参与列宽计算，避免布局失控）
+            let n = titles.len();
+            let gap = 10.0;
+            let avail = ui.available_width();
+            let w = ((avail - gap * (n as f32 - 1.0) - 16.0) / n as f32).max(60.0);
+            let widths: Vec<f32> = vec![w; n];
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                for t in &titles {
+                    adl_ui::widgets::cell(ui, w, |ui| {
+                        ui.label(egui::RichText::new(t).small().color(pal().muted));
+                    });
+                }
+            });
+            ui.add_space(4.0);
+            adl_ui::hairline(ui);
+            ui.add_space(4.0);
+            for row in rows {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = gap;
+                    for (i, cw) in widths.iter().enumerate() {
+                        let v = row.get(i).cloned().unwrap_or_default();
+                        adl_ui::widgets::cell(ui, *cw, |ui| {
+                            adl_ui::truncated(ui, &v, &v);
+                        });
+                    }
+                });
+                ui.add_space(4.0);
+            }
+        }
+        "link" => {
+            let label = s_of(node, "label");
+            let url = s_of(node, "url");
+            if url.is_empty() {
+                ui.label(label);
+            } else {
+                ui.hyperlink_to(label, url);
+            }
+        }
         "toggle" => {
-            let label = node.get("label").and_then(|x| x.as_str()).unwrap_or("");
-            let cur = node.get("value").and_then(|x| x.as_bool()).unwrap_or(false);
+            let label = s_of(node, "label");
+            let cur = b_of(node, "value", false);
             let mut b = cur;
             if ui.checkbox(&mut b, label).changed() {
                 if let Some(key) = node.get("setting").and_then(|x| x.as_str()) {
@@ -1078,17 +1540,16 @@ fn render_node(ui: &mut egui::Ui, plugin: &str, node: &Value, out: &mut Vec<Disp
             }
         }
         "select" => {
-            let label = node.get("label").and_then(|x| x.as_str()).unwrap_or("");
-            let cur = node.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            let opts: Vec<String> = node
-                .get("options")
-                .and_then(|x| x.as_array())
-                .map(|a| a.iter().filter_map(|o| o.as_str().map(|s| s.to_string())).collect())
-                .unwrap_or_default();
+            let label = s_of(node, "label");
+            let cur = s_of(node, "value").to_string();
+            let opts = sa_of(node, "options");
             let mut sel = cur.clone();
             ui.horizontal(|ui| {
-                ui.label(label);
+                if !label.is_empty() {
+                    ui.label(label);
+                }
                 egui::ComboBox::from_id_salt(format!("{plugin}.{label}"))
+                    .width(200.0)
                     .selected_text(sel.clone())
                     .show_ui(ui, |ui| {
                         for o in &opts {
@@ -1107,15 +1568,36 @@ fn render_node(ui: &mut egui::Ui, plugin: &str, node: &Value, out: &mut Vec<Disp
             }
         }
         "input" => {
-            let label = node.get("label").and_then(|x| x.as_str()).unwrap_or("");
-            let val = node.get("value").and_then(|x| x.as_str()).unwrap_or("");
+            // 只读：插件不能往宿主抢焦点，输入类交回本体页面处理
+            let label = s_of(node, "label");
+            let val = s_of(node, "value");
             ui.horizontal(|ui| {
-                ui.label(label);
-                ui.label(egui::RichText::new(val).weak());
+                if !label.is_empty() {
+                    ui.label(label);
+                }
+                ui.label(egui::RichText::new(val).color(pal().ink));
             });
         }
+        "code" => {
+            // 等宽只读文本（日志/哈希）
+            ui.label(
+                egui::RichText::new(s_of(node, "value"))
+                    .monospace()
+                    .small()
+                    .color(pal().muted),
+            );
+        }
+        "timestamp" => {
+            let v = s_of(node, "value");
+            ui.label(egui::RichText::new(v).small().color(pal().muted));
+        }
         other => {
-            ui.label(format!("[{other}]"));
+            // 未知类型：画占位而不是 panic —— 新版插件在旧版宿主上要能降级
+            ui.label(
+                egui::RichText::new(format!("[{other}]"))
+                    .small()
+                    .color(pal().muted),
+            );
         }
     }
 }
@@ -1611,7 +2093,10 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1040.0, 700.0])
             .with_min_inner_size([760.0, 520.0])
-            .with_title("ADL 下载器"),
+            .with_title("ADL 下载器")
+            // 关掉系统标题栏，自己画（见 App::titlebar）。
+            // 代价：系统不再提供边缘缩放，八向热区由 resize_borders() 铺。
+            .with_decorations(false),
         ..Default::default()
     };
 

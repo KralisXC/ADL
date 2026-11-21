@@ -95,7 +95,9 @@ fn header(ui: &mut Ui, columns: &[Column], lay: &Layout2, gap: f32, muted: egui:
         }
     });
     ui.add_space(4.0);
-    ui.separator();
+    // 表头下沿用极细线：这里是"内容与表头被分开"的截断边界，
+    // 但仍要比 ui.separator() 淡得多（后者在浅底上像一道沟）。
+    super::widgets::hairline(ui);
     ui.add_space(4.0);
 }
 
@@ -122,7 +124,8 @@ pub fn table<R>(
             row(ui, i, &lay.widths);
         });
         ui.add_space(2.0);
-        ui.separator();
+        // 行间不画线、不画分隔：靠行高与留白区分。
+        // 只有表头下沿那一条极细线（内容边界）是允许出现的。
         ui.add_space(2.0);
     }
 }

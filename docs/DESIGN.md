@@ -1340,11 +1340,78 @@ adl_ui::table(ui, &cols, tasks.len(), |ui, i, w| {
 - 失败原因**不要**塞进"进度"列：150px 装不下，实测被截成"资源不存在（HTTP 4…"。
   改成进度列给短标记"已中断"，完整原因挂到状态列的悬停提示。
 
-### 13.10 待续
+### 13.10 无边框窗口 + 极细线 + 渲染器词汇表
+
+三件事一起做：**拆掉原生标题栏、把分隔线换成底色差、把插件渲染器补全**。它们
+看起来无关，其实都是同一个原则：**界面里不要有"装饰性的线"，位置靠底色和留白
+表达，线只在真的被截断时才出现**。
+
+#### 13.10.1 自绘标题栏
+
+`ViewportBuilder::with_decorations(false)` 之后，**系统连边框拖拽缩放都不提供了**。
+winit 的 `WM_NCCALCSIZE` 会把客户区扩到整个非客户区（`event_loop.rs:1162`），
+`to_window_styles()` 虽然仍设 `WS_CAPTION | WS_BORDER`，但 `adjust_rect()` 在
+非 decorations 时把 `WS_CAPTION | WS_SIZEBOX` 清掉（`window_state.rs:435`）。
+所以两件事必须自己补：
+
+| 交互 | 实现 |
+|---|---|
+| 拖动窗口 | `Sense::click_and_drag()` 的不可见热区 + `drag_started()` → `ViewportCommand::StartDrag` |
+| 双击最大化 | `drag.double_clicked()` → 翻转 `maximized` → `ViewportCommand::Maximized(b)` |
+| 八向缩放 | `resize_borders()` 铺 8 个 5px 热区（`Sense::drag()`），hover 时换光标，`drag_started()` → `ViewportCommand::BeginResize(Dir)` |
+| 最小化/最大化/关闭 | `adl_ui::window_button()` 三个自绘按钮 |
+
+**图标必须手画，不能用字体符号**：中文字体（simhei）没有 `✕ ▢ ─` 这些字形，
+渲染出来是空方块（`—` 能显示纯属意外，换个字体就没了）。`window_button` 里
+全部用 `painter.line_segment` / `rect_stroke` 画，半边长 4.5px、`Stroke::new(1.2, fg)`。
+
+**最大化状态要从系统同步回来**：`ui.ctx().input(|i| i.viewport().maximized)` 每帧
+读一次写进 `self.maximized`，否则用户拖窗口到屏幕顶部触发系统贴边最大化后，
+我们的按钮还显示"最大化"图标。
+
+#### 13.10.2 分隔线 → 底色差
+
+原来有三层都是白底 + `show_separator_line(true)`，于是出现两条明显的 1px 竖/横线
+（用户截图里最刺眼的就是这个）。改法：
+
+- `Panel::left` / `Panel::top` 全部 `show_separator_line(false)`
+- 侧边栏、顶栏、标题栏**同色**（都是 `palette.card` 白）—— 它们本来就是一整块
+  "外壳"，没有任何理由分开
+- 内容区 `palette.bg`(#F4F8F8) —— 白外壳浮在浅灰底上，边界自然出现，不需要画线
+- 新增 `palette.hair`(#EEF3F2)，比 `line`(#E4EDEC) 更淡；`hairline()` 画
+  `Stroke::new(0.6, hair)`，**只在表头下沿**这一处保留
+- `table()` 每行之间的 `ui.separator()` **全删**：行高 30px + 留白已经足够区分，
+  每行一条线在浅底上像一道道沟
+- `card_frame()` 描边从 `line` 降到 `hair`：卡片靠白底 + 圆角 + 极淡描边浮起来
+
+#### 13.10.3 渲染器词汇表（23 个 type）
+
+`render_node` 从 9 个 type 扩到 23 个，且**宿主只用 `adl_ui` 的令牌与控件**，观感
+与本体界面完全一致：
+
+`text` / `label` / `heading` / `badge` / `status` / `divider` / `spacer` / `row` /
+`col` / `card` / `grid` / `stat` / `kv` / `table` / `list` / `link` / `code` /
+`timestamp` / `button` / `input` / `select` / `toggle` / `progress`
+
+三条设计约束：
+
+1. **`tone` 只用语义名**（`accent`/`warn`/`danger`/`muted`，别名 `primary`/`ok`/
+   `completed`/`paused`/`error`/`failed`），**不允许插件传 RGB** —— 否则换主题时
+   插件里那些硬编码颜色会变成一块块突兀的补丁。
+2. **未知 type 画成 `[xxx]` 占位，绝不 panic** —— 新插件用新组件跑在旧宿主上时，
+   只是少显示一点东西，不会整页崩。
+3. **`input` 只读** —— 插件不能抢焦点，否则用户在插件页打字时按键会被吃掉。
+
+**`grid` 必须用 `ui.horizontal_top`**：用 `ui.horizontal` 时各行是独立布局，
+某一行卡片高一点就会把后面的行往下推，三张 stat 卡片会呈现"阶梯错开"。实测
+第一版就是这个样子，改 `horizontal_top` 后立刻对齐。
+
+### 13.11 待续
 - 托盘菜单已接；"关闭到托盘"= `CancelClose` + `Visible(false)`，靠托盘"显示主界面"恢复。
 - Linux/macOS 需在 `eframe` features 补 `x11`/`wayland`；`platform.rs` 的 Win32 部分已用 `#[cfg(windows)]` 隔离。
 - 旧的 `web/`（Vue）与 `static_server.rs` 已不再编入（保留仅作历史），后续可清理。
-- `adl-ui` 尚未接管插件渲染器 `render_node`（目前直接调 egui，观感已一致但没共用
-  代码）；下一步可让 `render_node` 也走 `adl_ui::widgets`。
+- `render_node` 已改用 `adl_ui` 的 `badge`/`card`/`hairline`，但 `table`/`kv`/`grid`
+  仍是自己算列宽（插件表格要支持任意列数与单元格节点，与 `adl_ui::table` 的
+  `FnMut(ui, i, widths)` 签名不同构）；后续可抽公共的"均分列宽"函数。
 
 
