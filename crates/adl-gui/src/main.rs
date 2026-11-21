@@ -132,9 +132,55 @@ impl App {
     ) -> Self {
         install_cjk_font(&cc.egui_ctx);
         let mut style = (*cc.egui_ctx.style_of(egui::Theme::Light)).clone();
-        style.visuals = egui::Visuals::light();
-        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-        style.spacing.button_padding = egui::vec2(10.0, 6.0);
+
+        // ---- Motrix 清爽风：浅青背景 + 白色卡片 + 青绿强调色 ----
+        let teal = egui::Color32::from_rgb(0x3D, 0x8B, 0x7A);
+        let teal_soft = egui::Color32::from_rgb(0xE2, 0xF1, 0xED);
+        let bg = egui::Color32::from_rgb(0xF0, 0xF7, 0xF7);
+        let card = egui::Color32::WHITE;
+        let ink = egui::Color32::from_rgb(0x2A, 0x33, 0x33);
+        let line = egui::Color32::from_rgb(0xE4, 0xED, 0xEC);
+
+        let mut v = egui::Visuals::light();
+        v.panel_fill = bg;
+        v.window_fill = card;
+        v.extreme_bg_color = egui::Color32::from_rgb(0xF7, 0xFA, 0xFA);
+        v.faint_bg_color = egui::Color32::from_rgb(0xF5, 0xF9, 0xF9);
+        v.override_text_color = Some(ink);
+        v.hyperlink_color = teal;
+        v.selection.bg_fill = teal_soft;
+        v.selection.stroke = egui::Stroke::new(1.0, teal);
+        v.window_corner_radius = egui::CornerRadius::same(14);
+        v.menu_corner_radius = egui::CornerRadius::same(10);
+
+        let r = egui::CornerRadius::same(8);
+        v.widgets.noninteractive.corner_radius = r;
+        v.widgets.inactive.corner_radius = r;
+        v.widgets.hovered.corner_radius = r;
+        v.widgets.active.corner_radius = r;
+        v.widgets.open.corner_radius = r;
+        v.widgets.noninteractive.bg_fill = card;
+        v.widgets.noninteractive.weak_bg_fill = card;
+        v.widgets.inactive.bg_fill = egui::Color32::from_rgb(0xEC, 0xF3, 0xF2);
+        v.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(0xEC, 0xF3, 0xF2);
+        v.widgets.hovered.bg_fill = teal_soft;
+        v.widgets.hovered.weak_bg_fill = teal_soft;
+        v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, teal);
+        v.widgets.active.bg_fill = teal;
+        v.widgets.active.weak_bg_fill = teal;
+        v.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+        style.visuals = v;
+
+        style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+        style.spacing.button_padding = egui::vec2(12.0, 7.0);
+        style.spacing.interact_size.y = 30.0;
+        style.spacing.scroll.bar_width = 10.0;
+        style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(14.5));
+        style.text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(14.5));
+        style.text_styles.insert(egui::TextStyle::Heading, egui::FontId::proportional(22.0));
+        style.text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(12.0));
+        let _ = line;
+
         cc.egui_ctx.set_style_of(egui::Theme::Light, style.clone());
         cc.egui_ctx.set_style_of(egui::Theme::Dark, style);
 
@@ -268,6 +314,15 @@ impl App {
     }
 }
 
+/// Motrix 风白色卡片容器
+fn card_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(egui::Color32::WHITE)
+        .corner_radius(egui::CornerRadius::same(12))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(0xE4, 0xED, 0xEC)))
+        .inner_margin(egui::Margin::same(14))
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
@@ -312,17 +367,24 @@ impl eframe::App for App {
         self.refresh_plugin_snapshot();
 
         egui::CentralPanel::default().show(ui, |ui| {
-            // 顶栏
-            ui.horizontal(|ui| {
-                ui.heading("ADL");
-                ui.label(egui::RichText::new("下载器 · 纯 Rust 原生界面").weak());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("⏻ 退出").clicked() {
-                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
+            // 顶栏卡片
+            card_frame().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.heading(
+                        egui::RichText::new("ADL")
+                            .color(egui::Color32::from_rgb(0x3D, 0x8B, 0x7A))
+                            .strong(),
+                    );
+                    ui.label(egui::RichText::new("下载器 · 纯 Rust 原生界面").weak());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("⏻ 退出").clicked() {
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    });
                 });
             });
-            ui.separator();
+            ui.add_space(6.0);
 
             // 状态提示（6 秒后消失）
             if let Some((msg, err, at)) = &self.status {
@@ -341,24 +403,28 @@ impl eframe::App for App {
 
             let avail = ui.available_height();
             ui.horizontal_top(|ui| {
-                // 左侧导航
-                ui.allocate_ui_with_layout(
-                    egui::vec2(180.0, avail),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| self.nav(ui),
-                );
-                ui.separator();
-                // 右侧内容
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        match self.tab.clone() {
-                            Tab::Tasks => self.page_tasks(ui),
-                            Tab::Add => self.page_add(ui),
-                            Tab::Settings => self.page_settings(ui),
-                            Tab::Plugin(_, _) => self.page_plugin(ui),
-                        }
-                    });
+                // 左侧导航卡片
+                card_frame().show(ui, |ui| {
+                    ui.set_min_size(egui::vec2(180.0, (avail - 24.0).max(200.0)));
+                    ui.set_max_width(180.0);
+                    self.nav(ui);
+                });
+                // 右侧内容卡片
+                card_frame().show(ui, |ui| {
+                    ui.set_min_size(egui::vec2(0.0, (avail - 24.0).max(200.0)));
+                    ui.set_width(ui.available_width());
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            match self.tab.clone() {
+                                Tab::Tasks => self.page_tasks(ui),
+                                Tab::Add => self.page_add(ui),
+                                Tab::Settings => self.page_settings(ui),
+                                Tab::Plugin(_, _) => self.page_plugin(ui),
+                            }
+                        });
+                });
             });
         });
 
@@ -373,19 +439,27 @@ impl eframe::App for App {
 
 impl App {
     fn nav(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new("导航")
+                .small()
+                .color(egui::Color32::from_rgb(0x8A, 0x9A, 0x98)),
+        );
+        ui.add_space(2.0);
         if ui
             .selectable_label(self.tab == Tab::Tasks, "📥  任务列表")
             .clicked()
         {
             self.tab = Tab::Tasks;
         }
+        ui.add_space(2.0);
         if ui
             .selectable_label(self.tab == Tab::Add, "➕  添加下载")
             .clicked()
         {
             self.tab = Tab::Add;
         }
+        ui.add_space(2.0);
         if ui
             .selectable_label(self.tab == Tab::Settings, "⚙  设置")
             .clicked()
@@ -510,6 +584,7 @@ impl App {
                     ui.add(
                         egui::ProgressBar::new(frac)
                             .desired_width(150.0)
+                            .fill(egui::Color32::from_rgb(0x3D, 0x8B, 0x7A))
                             .show_percentage(),
                     );
                     ui.label(format_speed(t.speed));
@@ -818,7 +893,11 @@ fn render_node(ui: &mut egui::Ui, plugin: &str, node: &Value, out: &mut Vec<Disp
         }
         "progress" => {
             let v = node.get("value").and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
-            ui.add(egui::ProgressBar::new(v.clamp(0.0, 1.0)).show_percentage());
+            ui.add(
+                egui::ProgressBar::new(v.clamp(0.0, 1.0))
+                    .fill(egui::Color32::from_rgb(0x3D, 0x8B, 0x7A))
+                    .show_percentage(),
+            );
         }
         "list" => {
             if let Some(items) = node.get("items").and_then(|x| x.as_array()) {
