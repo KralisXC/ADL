@@ -13,9 +13,11 @@ adl-core = { path = "../adl-core" }
 adl-plugin = { path = "../adl-plugin" }
 adl-app = { path = "../adl-app" }
 # 纯 Rust 原生 GUI：不依赖 WebView2，跨 Windows/Linux/macOS。
-# 用 glow(OpenGL) 后端而非默认的 wgpu：体积小很多，且在虚拟机/远程桌面
-# 等 wgpu 后端不稳定（surface 丢失会让事件循环直接退出）的环境更可靠。
-eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts"] }
+# 同时编入两个渲染后端，运行时用 ADL_RENDERER 选择：
+#   - glow (OpenGL)  —— 默认，兼容性最好（虚拟机/远程桌面/老核显都能开）
+#   - wgpu           —— 走 Vulkan / DX12 / Metal，设 ADL_RENDERER=wgpu
+#                       （想强制 Vulkan 再加 WGPU_BACKEND=vulkan）
+eframe = { version = "0.37", default-features = false, features = ["glow", "wgpu", "default_fonts"] }
 # 托盘菜单（跨平台，Windows 上只需默认后端）。
 tray-icon = { version = "0.25.1", default-features = false }
 muda = { version = "0.20", default-features = false }

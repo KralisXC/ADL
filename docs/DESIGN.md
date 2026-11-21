@@ -1192,7 +1192,7 @@ if GetLastError() == ERROR_ALREADY_EXISTS(183) {
 ## 13. 原生 UI（egui / eframe）—— 彻底摆脱 WebView2
 
 ### 13.1 为什么换
-M5 的界面是 tao + wry + WebView2 + Vue。WebView2 缺失或"残缺版 Windows"时只能降级到"用浏览器打开本地页面"，用户明确觉得"在网页里显示很怪"。于是改为**纯 Rust 原生 UI**：`eframe`（`egui` 立即模式 GUI）+ `glow`(OpenGL) 后端。**不再依赖 WebView2、不再有 node/vite 构建链**，产物是单个 exe，跨 Windows / Linux / macOS（含 Apple Silicon）。
+M5 的界面是 tao + wry + WebView2 + Vue。WebView2 缺失或"残缺版 Windows"时只能降级到"用浏览器打开本地页面"，用户明确觉得"在网页里显示很怪"。于是改为**纯 Rust 原生 UI**：`eframe`（`egui` 立即模式 GUI），**同时编入 glow(OpenGL) 与 wgpu 两套渲染后端**，运行时可选。**不再依赖 WebView2、不再有 node/vite 构建链**，产物是单个 exe，跨 Windows / Linux / macOS（含 Apple Silicon）。
 
 ### 13.2 选型
 - **egui / eframe**（MIT）：纯 Rust、单 exe、跨平台。
@@ -1207,12 +1207,25 @@ M5 的界面是 tao + wry + WebView2 + Vue。WebView2 缺失或"残缺版 Window
 - `NativeOptions{ viewport: ViewportBuilder::default().with_inner_size([w,h]).with_min_inner_size([..]).with_title(..), .. }`；`run_native(name, opts, Box::new(|cc| Ok(Box::new(App::new(cc,…)))))`。
 - 中文字体：默认字体不含 CJK，必须 `fonts.font_data.insert("cjk", FontData::from_owned(读 ttf))` 并插到 `Proportional` 首位；按平台依次找 `simhei.ttf`/`Deng.ttf`/`msyh.ttc`（Win）、Noto CJK（Linux）、PingFang/Hiragino（macOS）。
 
-### 13.4 🔴 后端坑：wgpu 在虚拟机/远程桌面会让进程 5 秒内静默退出
-默认 `eframe` 用 **wgpu** 后端。实测本机（无独立 GPU 的远程会话）下：窗口能创建、API 能连，但**约 5 秒后进程直接退出、无任何 stderr**（wgpu surface 丢失导致事件循环结束）。改为 **glow(OpenGL)** 后端后稳定运行。→ `eframe = { version="0.37", default-features=false, features=["glow","default_fonts"] }`。附带好处：exe 从 ~13.5 MB 降到 ~9.9 MB（未 strip）。
+### 13.4 双渲染后端：默认 glow，可选 wgpu(Vulkan/DX12/Metal)
+
+`eframe` 同时编入两套后端：`eframe = { version="0.37", default-features=false, features=["glow","wgpu","default_fonts"] }`，运行时用环境变量 `ADL_RENDERER` 选择：
+
+| `ADL_RENDERER` | 后端 | 说明 |
+|---|---|---|
+| （未设）/ `glow` | glow(OpenGL) | **默认**，兼容性最好：虚拟机 / 远程桌面 / 老核显 / 无独显都能开 |
+| `wgpu` | wgpu | 自动挑 Vulkan/DX12/Metal 中可用的一个 |
+| `vulkan` | wgpu + 强制 `WGPU_BACKEND=vulkan` | 想强制走 Vulkan 时用 |
+
+- **为什么默认 glow**：实测本机（无独显的远程会话）下 wgpu 曾出现"窗口能创建、API 能连，但约 5 秒后进程静默退出、无任何 stderr"（surface 丢失）。glow 在任何环境都能开，所以默认它兜底；想要 Vulkan/DX12 的用户可显式 `ADL_RENDERER=wgpu`。
+- 实测：`glow` 稳定、窗口标题 `ADL 下载器`、`/ping` 正常；`wgpu` 在能拿到 DX12 适配器的会话里也能正常工作；`vulkan` 在本机**没有可用 Vulkan 驱动**，会拿不到适配器（此时退回 `ADL_RENDERER=wgpu` 或默认 glow 即可）。
+- 体积：双后端比单 glow 大约 +3 MB（未 strip）。用户明确"体积不在意，解压后 <1 GB 即可"，双后端（~13 MB 未 strip）完全满足。
+- 下载器 UI 用 GL 还是 Vulkan 性能无区别；Vulkan 的价值主要在特定系统/驱动上，代价是兼容面更窄，所以留成可选而非默认。
 
 ### 13.5 构建与体积
-- `eframe` 首次需联网拉取（~200 crates，含 glutin/glow/egui_glow 等）；**离线下 `--offline` 会因 `accesskit_unix` 依赖的 `async-executor 1.14.0` 被 yank 而解析失败**，必须联网构建。
+- `eframe` 首次需联网拉取（~200 crates，含 glutin/glow/egui_glow/wgpu/naga 等）；**离线下 `--offline` 会因 `accesskit_unix` 依赖的 `async-executor 1.14.0` 被 yank 而解析失败**，必须联网构建。
 - 依赖 `muda = { default-features=false }`，否则默认 feature 拉入 Linux 的 `libxdo`，离线/跨平台解析失败。
+- 编译开销：wgpu/naga/vello 是重灾区，单次全量 release 构建可达 20~40 分钟；迭代期可用 `CARGO_PROFILE_RELEASE_LTO=false` + `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16` 加速（注意 profile 变化会触发全量重建）。fat LTO + 单 CGU 在本机会病理级慢，正式出包再开。
 - release（`opt-level="z" + lto="fat" + strip`）体积见 §13.7 实测。
 
 ### 13.6 与后端的衔接

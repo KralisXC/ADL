@@ -1353,7 +1353,24 @@ fn main() -> eframe::Result {
         platform::spawn_wakeup_listener(move || w.store(true, Ordering::SeqCst));
     }
 
+    // 渲染后端选择：默认 glow(OpenGL)；ADL_RENDERER=wgpu 走 wgpu(Vulkan/DX12/Metal)；
+    // ADL_RENDERER=vulkan 等价于 wgpu 且强制 WGPU_BACKEND=vulkan。
+    let renderer = match std::env::var("ADL_RENDERER")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "wgpu" => eframe::Renderer::Wgpu,
+        "vulkan" => {
+            std::env::set_var("WGPU_BACKEND", "vulkan");
+            eframe::Renderer::Wgpu
+        }
+        _ => eframe::Renderer::Glow,
+    };
+    eprintln!("[gui] 渲染后端: {:?}", renderer);
+
     let opts = eframe::NativeOptions {
+        renderer,
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1040.0, 700.0])
             .with_min_inner_size([760.0, 520.0])
