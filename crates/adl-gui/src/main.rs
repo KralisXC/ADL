@@ -304,6 +304,15 @@ impl App {
         }
     }
 
+    /// 移除所有已完成的任务（只从列表里删，不碰磁盘文件）。
+    ///
+    /// 顶栏"后台任务"下拉里的「清空已完成」用它 —— 磁盘上的文件是用户
+    /// 自己下的东西，清理界面不该顺手删掉。
+    fn clear_finished(&mut self) {
+        let mut tasks = self.gui.tasks.lock().unwrap();
+        tasks.retain(|t| t.status != "completed");
+    }
+
     fn run_action(&mut self, plugin: &str, action: &str) {
         let hooks = self.gui.hooks.lock().unwrap().clone();
         match hooks.run_action(plugin, action, &json!({})) {
@@ -942,6 +951,7 @@ impl App {
 
         let mut go_tasks = false;
         let mut picked_limit: Option<u64> = None;
+        let mut clear_finished = false;
 
         ui.horizontal(|ui| {
             ui.add_space(2.0);
@@ -951,9 +961,46 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(2.0);
 
-                // 后台任务
-                let p = adl_ui::widgets::chip(ui, &progress_label, None, false);
-                p.on_hover_text(format!("进行中 {running}，已完成 {done}"));
+                // 后台任务（点开是任务卡片列表）
+                let pr = adl_ui::widgets::chip(ui, &progress_label, None, false);
+                pr.clone()
+                    .on_hover_text(format!("进行中 {running}，已完成 {done}"));
+                egui::Popup::menu(&pr).show(|ui| {
+                    ui.set_min_width(340.0);
+                    if tasks.is_empty() {
+                        adl_ui::widgets::hint(ui, "还没有任务");
+                        return;
+                    }
+                    // 未完成 / 失败的排前面，已完成的沉底
+                    let rank = |s: &str| match s {
+                        "downloading" => 0,
+                        "paused" | "failed" => 1,
+                        _ => 2,
+                    };
+                    let mut list: Vec<&TaskView> = tasks.iter().collect();
+                    list.sort_by_key(|t| (rank(&t.status), t.id));
+                    ui.horizontal(|ui| {
+                        adl_ui::widgets::section_title(ui, "任务");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if done > 0 && ui.small_button("清空已完成").clicked() {
+                                clear_finished = true;
+                                ui.close();
+                            }
+                        });
+                    });
+                    for t in list.iter().take(12) {
+                        if task_row(ui, t) {
+                            go_tasks = true;
+                            ui.close();
+                        }
+                    }
+                    if list.len() > 12 {
+                        adl_ui::widgets::hint(
+                            ui,
+                            &format!("还有 {} 个，去任务列表看", list.len() - 12),
+                        );
+                    }
+                });
 
                 // 并行线路
                 let dot = if conns > 0 { Some(teal()) } else { Some(muted()) };
@@ -989,6 +1036,10 @@ impl App {
 
         if go_tasks {
             self.tab = Tab::Tasks;
+        }
+        if clear_finished {
+            self.clear_finished();
+            self.set_status("已清空已完成的任务", false);
         }
         if let Some(v) = picked_limit {
             {
@@ -1071,13 +1122,7 @@ impl App {
                 }
             });
 
-            let name = t
-                .path
-                .as_deref()
-                .and_then(|p| std::path::Path::new(p).file_name())
-                .and_then(|s| s.to_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| t.url.clone());
+            let name = display_name(t);
             adl_ui::widgets::cell(ui, w[1], |ui| {
                 adl_ui::table::truncated(ui, &name, &t.url);
             });
@@ -2421,6 +2466,78 @@ fn status_style(status: &str) -> (&'static str, egui::Color32) {
         "paused" => ("已暂停", egui::Color32::from_rgb(0x8A, 0x6D, 0x1F)),
         _ => ("下载中", egui::Color32::from_rgb(0x1F, 0x5F, 0x8A)),
     }
+}
+
+/// 顶栏"后台任务"下拉里的一行：状态点 + 文件名 + 进度/大小 + 速度。
+///
+/// 刻意做得比任务列表松（高约 30px、不带操作按钮）—— 它只是"瞥一眼"的
+/// 面板，真正的操作在任务列表页。
+/// 任务在界面上的显示名：优先落盘文件名；还没落盘（失败/刚入队）就退到
+/// URL 的最后一段（很多失败任务是 0 字节，`path` 为空，直接把整条 URL
+/// 当名字会把弹出面板撑得很宽）。
+fn display_name(t: &TaskView) -> String {
+    if let Some(name) = t
+        .path
+        .as_deref()
+        .and_then(|p| std::path::Path::new(p).file_name())
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+    {
+        return name.to_string();
+    }
+    let no_query = t.url.split(['?', '#']).next().unwrap_or(&t.url);
+    let tail = no_query.trim_end_matches('/');
+    let last = tail.rsplit('/').find(|s| !s.is_empty());
+    match last {
+        Some(s) => s.to_string(),
+        None => t.url.clone(),
+    }
+}
+
+/// 顶栏"后台任务"下拉里的一行：状态点 + 文件名 + 进度/大小。
+///
+/// 刻意做得比任务列表松（不带操作按钮）—— 它只是"瞥一眼"的面板，
+/// 真正的操作在任务列表页。返回 true 表示这一行被点了。
+fn task_row(ui: &mut egui::Ui, t: &TaskView) -> bool {
+    let (_, color) = status_style(&t.status);
+    let name = display_name(t);
+
+    let row = ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 18.0), egui::Sense::hover());
+        ui.painter().circle_filled(
+            rect.center(),
+            3.2,
+            if t.status == "downloading" {
+                teal()
+            } else {
+                color
+            },
+        );
+
+        // 文件名（宽度自适应，右侧留固定宽度给"进度/大小"）
+        let right_w = 118.0;
+        let name_w = (ui.available_width() - right_w).max(80.0);
+        adl_ui::widgets::cell(ui, name_w, |ui| {
+            adl_ui::table::truncated(ui, &name, &t.url);
+        });
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let tail = if t.status == "downloading" {
+                if t.speed > 0 {
+                    format!("{}  {}", format_bytes(t.completed), format_speed(t.speed))
+                } else {
+                    format_bytes(t.completed)
+                }
+            } else if t.status == "failed" {
+                "已中断".to_string()
+            } else {
+                format_bytes(t.total.max(t.completed))
+            };
+            ui.label(egui::RichText::new(tail).small().color(muted()));
+        });
+    });
+
+    row.response.interact(egui::Sense::click()).clicked()
 }
 
 fn format_bytes(n: u64) -> String {

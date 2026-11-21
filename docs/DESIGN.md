@@ -1478,7 +1478,7 @@ fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
 | `任务列表` | 回到任务页 | 点击切换，当前页高亮 |
 | `不限速` / `限速 2.0 MB/s` | 当前限速档位 | `Popup::menu` 选 不限速/1/2/5/10 MB/s，直接写 `cfg.limit` + 落盘 |
 | `N 条线路` | 所有进行中任务的活跃连接数之和 | 悬停说明"服务器会限流" |
-| `剩余 N / 完成 M` | 任务计数 | 悬停给出明细 |
+| `剩余 N / 完成 M` | 任务计数 | 点开是任务卡片列表：状态圆点 + 文件名 + 大小/速度，整行可点跳任务列表，右上角「清空已完成」（只清界面，不删磁盘文件） |
 
 `N 条线路` 的数据源是新加的 `Progress::connections`：引擎在 `emit_progress`
 里带 `conns: usize`（四个调用点都能直接拿到 `active.len()`），
@@ -1531,13 +1531,28 @@ close_requested → CancelClose → 弹窗 → 用户选"退出程序" → 再�
 宿主把该插件的 settings 项单独列成一页，而不是让插件自己渲染。
 `page_title()` 同步识别这个前缀，顶栏标题显示 `<pluginId> · 设置`。
 
+#### 13.11.10 任务卡片下拉与显示名兜底
+
+点「剩余 N / 完成 M」弹出任务卡片列表，两个实现细节值得记：
+
+1. **显示名不能直接用 `path`**。失败任务的 `path` 常常是 `None`（0 字节就中断了），
+   退到 `t.url` 会把整条 `http://127.0.0.1:61243/test256m.bin` 塞进 340px 宽的面板，
+   面板被撑到超出窗口。`display_name()` 的顺序是：落盘文件名 → URL 去掉
+   query/fragment 后的**最后一段** → 原始 URL。
+2. **`Popup` 里不能用 `self.xxx()` 改状态**。`Popup::menu(&resp).show(|ui| ...)` 的闭包
+   借的是 `ui`，而 `self` 已被 `ui.horizontal` 的闭包可变借用占用。做法是把要改的事
+   记到闭包外的局部变量（`go_tasks` / `clear_finished`），`show` 返回后再统一处理。
+
+排序用 `(rank, id)`：`downloading`(0) → `paused|failed`(1) → 其他(2)，
+所以失败任务浮在最上面，已完成沉底。
+
 ### 13.12 待续
 - Linux/macOS 需在 `eframe` features 补 `x11`/`wayland`；`platform.rs` 的 Win32 部分已用 `#[cfg(windows)]` 隔离。
 - 旧的 `web/`（Vue）与 `static_server.rs` 已不再编入（保留仅作历史），后续可清理。
 - `render_node` 已改用 `adl_ui` 的 `badge`/`card`/`hairline`，但 `table`/`kv`/`grid`
   仍是自己算列宽（插件表格要支持任意列数与单元格节点，与 `adl_ui::table` 的
   `FnMut(ui, i, widths)` 签名不同构）；后续可抽公共的"均分列宽"函数。
-- 顶栏"后台任务"chip 目前只显示计数，还没做用户参考图里那种"点开弹出任务卡片列表"。
+- 顶栏"后台任务"chip 已能点开任务卡片列表；下一步可给每行加"暂停/删除"小按钮（目前要跳任务列表操作）。
 - 关闭询问弹窗只在"还没有记忆选择"时出现；`Settings → 关闭窗口时` 可以随时改回"每次询问"。
 
 
