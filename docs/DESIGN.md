@@ -1406,12 +1406,138 @@ winit 的 `WM_NCCALCSIZE` 会把客户区扩到整个非客户区（`event_loop.
 某一行卡片高一点就会把后面的行往下推，三张 stat 卡片会呈现"阶梯错开"。实测
 第一版就是这个样子，改 `horizontal_top` 后立刻对齐。
 
-### 13.11 待续
-- 托盘菜单已接；"关闭到托盘"= `CancelClose` + `Visible(false)`，靠托盘"显示主界面"恢复。
+### 13.11 外壳重构：顶栏并入主区、添加下载弹窗化、主页与关闭询问
+
+这一版把窗口"外壳"整个重排了，起因是用户看截图提的九条意见。记在这里
+是因为其中几条踩坑与取舍并不显然。
+
+#### 13.11.1 顶栏不再是独立 Panel
+
+以前是三层横条叠着：`Panel::top(标题栏)` → `Panel::left(侧栏)` →
+`Panel::top(顶栏白底)` → `CentralPanel(内容浅底)`。问题是三个 Panel 各自
+有底色，接缝处出现横向白/灰分界带，看起来像三张纸拼起来。
+
+现在：
+
+```
+Panel::top(标题栏, 白底)
+Panel::left(侧栏, 白底)
+CentralPanel(shell_frame: 浅底 + 左上圆角)
+  ├── topbar(ui)     ← 透明，chips 那一行
+  └── ScrollArea(内容)
+```
+
+`topbar_frame()` 改成**完全透明**（`Frame::new().inner_margin(symmetric(0,6))`），
+让 `shell_frame` 的浅底透上来 —— 这样"顶栏 + 内容区"是同一块底，只有 chips
+与卡片的浮起感来分层，不再有线。
+
+#### 13.11.2 左上角圆角与 eframe 的清屏色（踩坑）
+
+`shell_frame()` 只切 `nw` 一个角（`CornerRadius{nw: card+4, ne:0, sw:0, se:0}`）；
+另外三个角贴窗口边缘，切了会露白边。
+
+**圆角外侧露出来的颜色是 eframe 的 `clear_color`，不是任何 Panel 的底色。**
+eframe 默认给 `rgba(12,12,12,180)`（半透明深色），在浅色主题下那块圆角缺口
+会变成一个**黑三角**。实测第一版就是这个样子。修法：
+
+```rust
+fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+    let c = pal().card;   // 与侧栏/标题栏同色
+    [c.r() as f32/255.0, c.g() as f32/255.0, c.b() as f32/255.0, 1.0]
+}
+```
+
+#### 13.11.3 侧栏：仿 DSH 的信息层级
+
+- 最左上角是**折叠键**，与窗口三键同一条横条（`Panel::top` 里先画折叠键，
+  再画右侧三个 `window_button`），不再让侧栏顶部单独占一行。
+- 侧栏内部顺序：图标块（`A` 方块 + "ADL / 下载器"）→ **`+ 新建下载`** →
+  主页 / 任务列表 → `插件` 分组（插件页面 + 每个有 settings 的插件一个入口，
+  **最多 5 个**，超出显示"更多设置…"）→ 底部 `Layout::bottom_up`（Ctrl+K 提示 /
+  模式胶囊 / **设置**）。
+- 收起态（`Spacing::sidebar_w_collapsed = 56.0`）：用**首字**当图标
+  （主 / 列 / 设 / 安 / 首字缩写的插件名）。中文字体没有图标字形，
+  用单字比拿 emoji 稳（emoji 会渲染成空方块）。
+- 侧栏不再有"添加下载"导航项 —— 添加改成了弹窗，入口是 `+ 新建下载`。
+
+#### 13.11.4 添加下载 → Modal
+
+`egui::Modal::new(Id::unique("adl_add_modal"))`，宽 520，两个 `TextEdit`
+（`desired_width(f32::INFINITY)`，URL 很长不适合 `form()` 的定宽控件格），
+地址框里按 Enter 直接开始。`ModalResponse::should_close()`（背板点击 / Esc）
+等于取消。
+
+#### 13.11.5 顶栏 chips（参考 DSH）
+
+`with_layout(Layout::right_to_left(Align::Center))` 从右往左摆，第一个 `add`
+就落在最右边 —— 比手算 `x -= width` 稳得多（手算版第一版就把最右一个 chip
+挤出面板外了）。四个 chip：
+
+| chip | 含义 | 交互 |
+|---|---|---|
+| `任务列表` | 回到任务页 | 点击切换，当前页高亮 |
+| `不限速` / `限速 2.0 MB/s` | 当前限速档位 | `Popup::menu` 选 不限速/1/2/5/10 MB/s，直接写 `cfg.limit` + 落盘 |
+| `N 条线路` | 所有进行中任务的活跃连接数之和 | 悬停说明"服务器会限流" |
+| `剩余 N / 完成 M` | 任务计数 | 悬停给出明细 |
+
+`N 条线路` 的数据源是新加的 `Progress::connections`：引擎在 `emit_progress`
+里带 `conns: usize`（四个调用点都能直接拿到 `active.len()`），
+`adl-plugin` 的 `on_progress` JSON 也同步加了 `connections` 字段。
+
+#### 13.11.6 主页：统计卡 + 热力图
+
+四张 `stat_card`（任务总数 / 已完成 / 失败 / 累计下载）+ `segmented` 切
+周/月/年 + `heatmap`。数据源是 `history.json` 的 `started_unix`。
+
+两个布局坑：
+
+1. **统计卡宽度**：写 `(avail - gap*3)/4` 之后又在每张卡后面 `add_space(gap)`，
+   等于吃了 4 份间距，最右那张被裁掉半个。正确写法是把间距交给
+   `ui.spacing_mut().item_spacing.x = gap` —— `horizontal` 只在元素**之间**
+   插间距，n 个元素天然 n-1 个间隙。
+2. **热力图坐标系**：年视图是"一列一周、一行一天"（GitHub 那种），
+   周/月视图是"一行一周、一格一天"。两者 `cells` 的 `(col,row)` 换算方向相反，
+   写成同一个分支就会出现数据落在错格子。
+
+#### 13.11.7 设置页：只给档位，不给自由输入
+
+- **并发**：7 档 `segmented`（1/2/4/8/16/32/64），选的是**上限**；
+  引擎按服务器实际放行量自动收敛，稳定后偶尔试探 +1。
+  改档位立刻写 `cfg.connections` + 落盘，不需要点"保存设置"。
+- **限速**：`DragValue`（按当前单位的数值）+ 单位 `ComboBox`（自动 / B/s /
+  KB/s / MB/s / GB/s）。用户明确要求用英文单位，"兆字节/秒"读起来别扭。
+  `format_speed_unit(bps, unit)` 负责显示，`auto` 时退化为自适应。
+- **HTTP/1.1 开关已从界面移除**（用户："自动就行了"）。`Config.http1` 字段保留，
+  保存设置时原样带上现值，不会被重置。
+- **关闭行为**：三段选择（每次询问 / 最小化到托盘 / 退出程序），
+  对应 `cfg.close_action`（`""` / `"tray"` / `"close"`）。
+
+#### 13.11.8 关闭询问与 `closing` 闸门（踩坑）
+
+用户要求"第一次点关闭时问一次，能记住选项"。实现时有个自锁陷阱：
+
+```
+close_requested → CancelClose → 弹窗 → 用户选"退出程序" → 再发 Close
+                                                ↑ 又回到 close_requested
+```
+
+于是永远关不掉。修法是加一个 `closing: bool` 放行闸：确认退出后先置 `closing = true`
+再发 `ViewportCommand::Close`，拦截处看到 `closing` 就放行不再拦。
+
+#### 13.11.9 插件设置入口
+
+侧栏的"`<插件名> 设置`"用的是伪页面 `Tab::Plugin("adl", "settings:<pluginId>")`。
+`page_plugin` 一进来先认这个前缀，走 `page_plugin_settings(ui, plugin_id)` ——
+宿主把该插件的 settings 项单独列成一页，而不是让插件自己渲染。
+`page_title()` 同步识别这个前缀，顶栏标题显示 `<pluginId> · 设置`。
+
+### 13.12 待续
 - Linux/macOS 需在 `eframe` features 补 `x11`/`wayland`；`platform.rs` 的 Win32 部分已用 `#[cfg(windows)]` 隔离。
 - 旧的 `web/`（Vue）与 `static_server.rs` 已不再编入（保留仅作历史），后续可清理。
 - `render_node` 已改用 `adl_ui` 的 `badge`/`card`/`hairline`，但 `table`/`kv`/`grid`
   仍是自己算列宽（插件表格要支持任意列数与单元格节点，与 `adl_ui::table` 的
   `FnMut(ui, i, widths)` 签名不同构）；后续可抽公共的"均分列宽"函数。
+- 顶栏"后台任务"chip 目前只显示计数，还没做用户参考图里那种"点开弹出任务卡片列表"。
+- 关闭询问弹窗只在"还没有记忆选择"时出现；`Settings → 关闭窗口时` 可以随时改回"每次询问"。
 
 

@@ -61,6 +61,8 @@ pub struct Progress {
     pub completed: u64,
     pub total: u64,
     pub speed_bps: u64,
+    /// 当前活跃的连接数（已派发且未结束的分片）。UI 用它显示"并行线路"。
+    pub connections: u32,
 }
 
 /// 完成事件（`onComplete` 的入参）。
@@ -155,6 +157,7 @@ mod tests {
             completed: 1,
             total: 2,
             speed_bps: 3,
+            connections: 4,
         });
         assert!(h
             .on_complete(&Completed {

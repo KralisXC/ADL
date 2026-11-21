@@ -79,6 +79,13 @@ pub struct Config {
     pub plugin_dir: String,
     /// 是否记录下载历史
     pub history_enabled: bool,
+    /// 点窗口关闭按钮时的行为："" = 还没问过用户（下次关闭时弹窗问），
+    /// "close" = 直接退出程序，"tray" = 最小化到托盘继续在后台下载。
+    pub close_action: String,
+    /// 限速显示单位："auto"（按速度自动挑）或 "B/s"/"KB/s"/"MB/s"/"GB/s" 固定。
+    pub limit_unit: String,
+    /// 侧边栏是否收起（只留图标轨道）。
+    pub sidebar_collapsed: bool,
     /// 每个插件的一小段主配置（只用 enabled 开关；详细设置在各插件自己的 json 里）
     pub plugins: BTreeMap<String, PluginCfg>,
 }
@@ -96,6 +103,9 @@ impl Default for Config {
             mode: "safe".to_string(),
             plugin_dir: String::new(),
             history_enabled: true,
+            close_action: String::new(),
+            limit_unit: "auto".to_string(),
+            sidebar_collapsed: false,
             plugins: BTreeMap::new(),
         }
     }
@@ -127,6 +137,16 @@ impl Config {
 
     pub fn mode_trusted(&self) -> bool {
         self.mode.eq_ignore_ascii_case("trusted")
+    }
+
+    /// 关闭按钮行为是否已经问过用户。
+    pub fn close_action_known(&self) -> bool {
+        matches!(self.close_action.as_str(), "close" | "tray")
+    }
+
+    /// 关闭时是否最小化到托盘（未选择时按"问一次"处理，由 UI 负责弹窗）。
+    pub fn close_to_tray(&self) -> bool {
+        self.close_action == "tray"
     }
 
     /// 插件是否启用（主配置里没有该条目时默认启用）。
@@ -225,6 +245,18 @@ plugin_dir = ""
 
 # 是否记录下载历史（history.json）。
 history_enabled = true
+
+# 点窗口右上角关闭按钮时的行为：
+#   ""      = 还没选，下次关闭时弹窗问一次
+#   "close" = 直接退出程序
+#   "tray"  = 最小化到托盘，下载继续在后台跑
+close_action = ""
+
+# 限速显示单位："auto" 自动挑，或固定成 "B/s" / "KB/s" / "MB/s" / "GB/s"
+limit_unit = "auto"
+
+# 侧边栏是否收起（只留一条窄轨道）
+sidebar_collapsed = false
 "#;
 
 #[cfg(test)]
@@ -240,6 +272,10 @@ mod tests {
         assert!(c.history_enabled);
         assert!(c.proxy_opt().is_none());
         assert!(c.user_agent_opt().is_none());
+        assert!(!c.close_action_known());
+        assert!(!c.close_to_tray());
+        assert_eq!(c.limit_unit, "auto");
+        assert!(!c.sidebar_collapsed);
     }
 
     #[test]

@@ -303,3 +303,205 @@ pub fn window_button(ui: &mut Ui, rect: Rect, kind: WindowButton) -> bool {
 
     resp.clicked()
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// 顶栏 chip / 分段选择 / 热力图 / 统计卡 / 侧栏折叠
+// ═══════════════════════════════════════════════════════════════════════
+
+/// 顶栏那种"胶囊信息块"（左边可带一个状态圆点）。
+///
+/// 返回值是 `Response`：调用方拿它去 `Popup::menu(&resp)` 弹卡片，
+/// 或者直接判 `clicked()`。宽度按文字自适应，所以几个 chip 排在一起
+/// 不会像固定宽度那样留下大片空白。
+pub fn chip(ui: &mut Ui, label: &str, dot: Option<Color32>, active: bool) -> Response {
+    let th = Theme::from_ui(ui);
+    let p = &th.palette;
+
+    let font = FontId::proportional(th.text.small);
+    let galley = ui.painter().layout_no_wrap(label.to_owned(), font, p.ink);
+
+    let pad_x = 10.0;
+    let dot_w = if dot.is_some() { 12.0 } else { 0.0 };
+    let w = pad_x * 2.0 + dot_w + galley.size().x;
+    let h = 26.0;
+
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
+
+    let bg = if active {
+        p.accent_soft
+    } else if resp.hovered() {
+        p.hover_bg
+    } else {
+        Color32::TRANSPARENT
+    };
+    if bg != Color32::TRANSPARENT {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(th.radius.pill), bg);
+    }
+
+    let mut tx = rect.left() + pad_x;
+    if let Some(c) = dot {
+        ui.painter()
+            .circle_filled(egui::pos2(tx + 3.0, rect.center().y), 3.2, c);
+        tx += dot_w;
+    }
+    let color = if active { p.accent } else { p.muted };
+    ui.painter().galley(
+        egui::pos2(tx, rect.center().y - galley.size().y / 2.0),
+        galley,
+        color,
+    );
+
+    resp
+}
+
+/// 分段选择器（并发档位、热力图范围切换）。
+///
+/// 返回 `Some(值)` 表示本帧用户点选了另一个选项。
+pub fn segmented<T: PartialEq + Copy>(ui: &mut Ui, current: T, items: &[(T, &str)]) -> Option<T> {
+    let th = Theme::from_ui(ui);
+    let p = &th.palette;
+    let font = FontId::proportional(th.text.small);
+
+    let pad_x = 12.0;
+    let h = 28.0;
+    let widths: Vec<f32> = items
+        .iter()
+        .map(|(_, label)| {
+            let g = ui
+                .painter()
+                .layout_no_wrap((*label).to_owned(), font.clone(), p.ink);
+            g.size().x + pad_x * 2.0
+        })
+        .collect();
+    let total: f32 = widths.iter().sum();
+    let (bg_rect, _) = ui.allocate_exact_size(vec2(total + 4.0, h + 4.0), Sense::hover());
+    ui.painter()
+        .rect_filled(bg_rect, CornerRadius::same(th.radius.pill), p.hover_bg);
+
+    let mut picked = None;
+    let mut x = bg_rect.left() + 2.0;
+    for (i, (value, label)) in items.iter().enumerate() {
+        let rect = Rect::from_min_size(egui::pos2(x, bg_rect.top() + 2.0), vec2(widths[i], h));
+        let resp = ui.interact(rect, ui.scope_id().with(("seg", i)), Sense::click());
+        let on = *value == current;
+        if on {
+            ui.painter()
+                .rect_filled(rect, CornerRadius::same(th.radius.pill), p.card);
+        }
+        let color = if on {
+            p.accent
+        } else if resp.hovered() {
+            p.ink
+        } else {
+            p.muted
+        };
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            *label,
+            font.clone(),
+            color,
+        );
+        if resp.clicked() && !on {
+            picked = Some(*value);
+        }
+        x += widths[i];
+    }
+    picked
+}
+
+/// 热力图（GitHub 贡献图那种）：`cells` 是 `(列, 行, 强度 0..=4)`。
+///
+/// 只负责画格子与 5 档配色；日期与统计由调用方算好传进来 ——
+/// 这样周/月/年三种视图都能复用同一个控件。
+pub fn heatmap(ui: &mut Ui, cells: &[(usize, usize, u8)], cols: usize, rows: usize) {
+    let th = Theme::from_ui(ui);
+    let p = &th.palette;
+
+    let gap = 3.0;
+    let cell = ((ui.available_width() - gap * (cols as f32 - 1.0)) / cols.max(1) as f32)
+        .clamp(6.0, 18.0);
+    let h = rows as f32 * cell + gap * (rows as f32 - 1.0);
+    let w = cols as f32 * cell + gap * (cols as f32 - 1.0);
+    let (rect, _) = ui.allocate_exact_size(vec2(w, h), Sense::hover());
+
+    let levels = [
+        p.hover_bg,
+        p.accent.gamma_multiply(0.22),
+        p.accent.gamma_multiply(0.42),
+        p.accent.gamma_multiply(0.66),
+        p.accent,
+    ];
+
+    for (c, r, level) in cells {
+        if *c >= cols || *r >= rows {
+            continue;
+        }
+        let x = rect.left() + *c as f32 * (cell + gap);
+        let y = rect.top() + *r as f32 * (cell + gap);
+        let cr = Rect::from_min_size(egui::pos2(x, y), vec2(cell, cell));
+        ui.painter().rect_filled(
+            cr,
+            CornerRadius::same(2),
+            levels[(*level as usize).min(4)],
+        );
+    }
+}
+
+/// 主页统计卡片：大数字 + 小标题。
+pub fn stat_card(ui: &mut Ui, value: &str, label: &str, tone: Color32) {
+    let th = Theme::from_ui(ui);
+    card(ui, |ui| {
+        ui.vertical(|ui| {
+            ui.label(egui::RichText::new(value).size(22.0).strong().color(tone));
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(label)
+                    .size(th.text.small)
+                    .color(th.palette.muted),
+            );
+        });
+    });
+}
+
+/// 侧边栏折叠按钮（画一个"面板"图标：方框 + 一条竖线表示侧栏）。
+pub fn sidebar_toggle(ui: &mut Ui, rect: Rect, collapsed: bool) -> bool {
+    let th = Theme::from_ui(ui);
+    let p = &th.palette;
+    let resp = ui.interact(
+        rect,
+        ui.scope_id().with("adl_sidebar_toggle"),
+        Sense::click(),
+    );
+    if resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(6), p.hover_bg);
+    }
+    let fg = if resp.hovered() { p.ink } else { p.muted };
+    let stroke = egui::Stroke::new(1.2, fg);
+    let c = rect.center();
+    let s = 7.0;
+    let outer = Rect::from_center_size(c, vec2(s * 2.0, s * 1.6));
+    ui.painter().rect_stroke(
+        outer,
+        CornerRadius::same(2),
+        stroke,
+        egui::StrokeKind::Inside,
+    );
+    // 左边那条竖线表示"侧栏"；收起时画得更靠左，暗示状态
+    let x = if collapsed {
+        outer.left() + 4.0
+    } else {
+        outer.left() + 7.0
+    };
+    ui.painter().line_segment(
+        [
+            egui::pos2(x, outer.top() + 2.0),
+            egui::pos2(x, outer.bottom() - 2.0),
+        ],
+        stroke,
+    );
+    resp.clicked()
+}
+

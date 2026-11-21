@@ -81,6 +81,8 @@ impl Palette {
 pub struct Spacing {
     /// 侧边栏宽度
     pub sidebar_w: f32,
+    /// 侧边栏收起后的宽度（只留一条窄轨道）
+    pub sidebar_w_collapsed: f32,
     /// 自绘标题栏高度（窗口无系统边框时用）
     pub titlebar_h: f32,
     /// 顶栏高度
@@ -107,6 +109,7 @@ impl Default for Spacing {
     fn default() -> Self {
         Self {
             sidebar_w: 212.0,
+            sidebar_w_collapsed: 56.0,
             titlebar_h: 40.0,
             topbar_h: 54.0,
             nav_h: 36.0,
@@ -315,18 +318,47 @@ impl Theme {
             .inner_margin(Margin::symmetric(12, 14))
     }
 
-    /// 顶栏：白底（与侧边栏同色 —— 二者本就是一整块"外壳"）
-    pub fn topbar_frame(&self) -> egui::Frame {
-        egui::Frame::new()
-            .fill(self.palette.card)
-            .inner_margin(Margin::symmetric(20, 8))
-    }
-
-    /// 内容区：浅底 + 内边距
+    /// 内容区：浅底 + 内边距（保留给"独立卡片式内容区"的旧用法，
+    /// 现在主界面走 `shell_frame()`）
     pub fn content_frame(&self) -> egui::Frame {
         let (x, y) = self.spacing.content_pad;
         egui::Frame::new()
             .fill(self.palette.bg)
             .inner_margin(Margin::symmetric(x, y))
+    }
+
+    /// 右侧主区外壳：浅底 + **左上圆角**，把顶栏 chips 与任务列表包成同一块。
+    ///
+    /// 为什么要圆角：侧栏与标题栏是白底，主区是浅底，两者交界处如果是个
+    /// 直角，看起来像两块贴在一起的纸；左上角切一个圆角，主区就像一张
+    /// 卡片压在白色外壳上，层次自然出来（用户明确要求"左上角做圆角设计"）。
+    ///
+    /// 只切左上（`nw`），其余三角保持直角：另外三个角贴着窗口边缘，
+    /// 切了反而会在边缘露出白边。
+    pub fn shell_frame(&self) -> egui::Frame {
+        let (x, _) = self.spacing.content_pad;
+        egui::Frame::new()
+            .fill(self.palette.bg)
+            .corner_radius(CornerRadius {
+                nw: self.radius.card + 4,
+                ne: 0,
+                sw: 0,
+                se: 0,
+            })
+            .inner_margin(Margin {
+                left: x,
+                right: x,
+                top: 8,
+                bottom: 0,
+            })
+    }
+
+    /// 顶栏（chips 那一行）：**透明**，让下面的浅底透出来。
+    ///
+    /// 以前这里是白底 `topbar_frame()`，结果侧栏白底 + 顶栏白底 + 内容浅底
+    /// 之间出现一条横向的白/灰分界带。现在顶栏并进主区的浅底里，
+    /// 只靠间距与 chips 本身区分层级。
+    pub fn topbar_frame(&self) -> egui::Frame {
+        egui::Frame::new().inner_margin(Margin::symmetric(0, 6))
     }
 }

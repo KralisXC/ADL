@@ -281,6 +281,7 @@ impl Hooks for PluginHooks {
             "completed": p.completed,
             "total": p.total,
             "speedBps": p.speed_bps,
+            "connections": p.connections,
         })
         .to_string();
         for pl in self.ordered(HookPoint::Progress) {

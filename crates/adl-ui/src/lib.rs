@@ -18,6 +18,7 @@ pub use form::{Field, form, form_with_save};
 pub use table::{Column, Width, table, truncated, virtual_table};
 pub use theme::{Palette, Radius, Spacing, TextSize, Theme};
 pub use widgets::{
-    WindowButton, badge, card, cell, empty_state, hairline, hint, label_cell, mode_pill, nav_item,
-    section_title, small_button, window_button,
+    WindowButton, badge, card, cell, chip, empty_state, hairline, heatmap, hint, label_cell,
+    mode_pill, nav_item, section_title, segmented, sidebar_toggle, small_button, stat_card,
+    window_button,
 };

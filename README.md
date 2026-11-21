@@ -61,6 +61,9 @@ proxy = ""            # 例如 "http://127.0.0.1:7890"
 mode = "safe"         # safe | trusted
 plugin_dir = ""       # 空 = exe 同级 plugins/
 history_enabled = true
+close_action = ""     # "" = 每次询问 | "tray" = 最小化到托盘 | "close" = 退出程序
+limit_unit = "auto"   # auto | B/s | KB/s | MB/s | GB/s（只影响显示）
+sidebar_collapsed = false
 ```
 
 命令行的显式参数会覆盖配置里的同名项。
@@ -69,9 +72,13 @@ history_enabled = true
 
 `adl-gui.exe` 现在是 **纯 Rust 原生桌面界面**：`eframe`(`egui`)，**同时编入 glow(OpenGL) 与 wgpu 两套渲染后端**，**不需要 WebView2、不需要 Node/vite**，单个 exe，跨 Windows / Linux / macOS。
 
-![任务列表](docs/images/ui-tasks.png)
+![主页](docs/images/ui-home.png)
 
-| 添加下载 | 设置 |
+| 任务列表 | 侧栏收起 |
+|---|---|
+| ![任务列表](docs/images/ui-tasks.png) | ![收起](docs/images/ui-collapsed.png) |
+
+| 添加下载（弹窗） | 设置 |
 |---|---|
 | ![添加下载](docs/images/ui-add.png) | ![设置](docs/images/ui-settings.png) |
 
@@ -80,14 +87,18 @@ cargo build --release -p adl-gui
 # 产物：target/release/adl-gui.exe（Windows 为 target/x86_64-pc-windows-msvc/release/adl-gui.exe）
 ```
 
-- 三个页面：任务列表（进度/暂停/删除）、添加下载、设置（目录/并发/限速/代理/插件模式）。
-- **左右式布局**：左侧整高边栏（导航 + 插件页面 + 模式胶囊）、顶部横栏（页标题 + 添加下载）、右侧内容区（白卡片浮在浅灰底上）。
-- **无边框窗口、自绘标题栏**：顶部是应用自己的标题栏（左侧 logo、右侧最小化/最大化/关闭），拖动、双击最大化、八向边缘缩放全部由自己实现（`with_decorations(false)` 之后系统不再提供这些）。三个按钮的图标用线段手画，不依赖字体符号。
-- **没有装饰性的分隔线**：侧边栏、顶栏、标题栏同色（白）构成一整块外壳，内容区浅灰底 —— 边界靠底色差出现，不画线；只有表头下沿保留一条 0.6px 的极淡线（`palette.hair`）。
-- **自研 UI 组件库 `crates/adl-ui`**：主题令牌化（换肤只改 `theme.rs`）、`Field`/`form()` 声明式表单（一行一个字段）、`Column`/`table()` 定宽表格（一列吃剩余、自带虚拟化）、`window_button`/`hairline`/`nav_item`/`card` 等基础控件。新增一页设置只需几行 `Field`，不再手写 `Grid` + `add_sized` + `end_row`。
+- **主页**：四张统计卡（任务总数 / 已完成 / 失败 / 累计下载量）+ 下载热力图（年 / 月 / 周三档，数据来自 `history.json`）。
+- **左右式外壳**：标题栏（左上折叠键 + 右侧窗口三键）与左侧栏同色连成一整块；内容区浅灰底、**左上角圆角**浮在上面。**不画装饰性分隔线**，边界全靠底色差；只有表头下沿保留一条 0.6px 的极淡线（`palette.hair`）。
+- **顶栏 chips**：`任务列表`（当前页高亮可点）· 限速档位（不限速 / 1·2·5·10 MB/s 下拉直切）· `N 条线路`（进行中任务的活跃连接数之和）· `剩余 N / 完成 M`。
+- **侧栏**：`+ 新建下载` → 主页 / 任务列表 → 插件分组（插件页面 + 最多 5 个插件设置入口，超出显示「更多设置…」）→ 底部「设置」与模式胶囊。**可收起**为 56px 图标条（用首字当图标）。
+- **添加下载是弹窗**，不再是单独一页；地址框按 Enter 直接开始。
+- **无边框窗口、自绘标题栏**：拖动、双击最大化、八向边缘缩放全部自己实现（`with_decorations(false)` 之后系统不再提供）。三个窗口按钮的图标用线段手画，不依赖字体符号。
+- **关闭行为可选**：首次点关闭会问「最小化到托盘 / 退出程序」，可勾选记住；之后随时在设置里改回「每次询问」。
+- **自研 UI 组件库 `crates/adl-ui`**：主题令牌化（换肤只改 `theme.rs`）、`Field`/`form()` 声明式表单、`Column`/`table()` 定宽表格（一列吃剩余、自带虚拟化）、`chip`/`segmented`/`heatmap`/`stat_card`/`window_button`/`hairline`/`nav_item`/`card` 等基础控件。新增一页设置只需几行 `Field`。
 - 支持插件声明式 UI 页面（**23 个组件**：text/heading/badge/status/grid/stat/kv/table/progress/toggle/select/button…）、动作按钮、插件设置、命令面板（Ctrl+K）；插件组件树与本体的界面共用同一套视觉语言与主题令牌。
-- 单实例（再次启动会唤醒已有窗口）、关闭到托盘（点托盘「显示主界面」恢复）、系统休眠自动暂停。
+- 单实例（再次启动会唤醒已有窗口）、托盘（点托盘「显示主界面」恢复）、系统休眠自动暂停。
 - 与 CLI 共用 `adl-core` 引擎、`adl-plugin` 插件、`adl-app` 配置/历史；浏览器接管 API 同进程运行。
+- **设置项只给档位**：并发 7 档（1/2/4/8/16/32/64，本质仍是自适应）；限速 = 数值 + 单位（自动 / B/s / KB/s / MB/s / GB/s，用英文单位）。HTTP/1.1 不再由用户选（引擎自动）。
 
 > **渲染后端可切换**（环境变量 `ADL_RENDERER`）：
 > - 不设 / `glow`：OpenGL，**默认**，兼容性最好（虚拟机、远程桌面、老核显都能开）。
@@ -208,9 +219,10 @@ adl.onAction((req) => ({ message: "动作：" + req.action }));
 adl.onCommand(() => ({ message: "命令响应" }));
 ```
 
-- 组件白名单：`text/heading/badge/divider/spacer/row/col/button/input/select/toggle/progress/list`。
+- 组件白名单：`text/label/heading/badge/status/divider/spacer/row/col/card/button/input/select/toggle/progress/list/kv/stat/grid/table/link/code/timestamp`（共 23 种，未知类型画成 `[xxx]` 不报错）。
 - **分级**：`safe` 只给页面（只读）与设置项；`trusted` 才给动作、Ctrl+K 命令、可编辑设置，以及"替换内置页面"（`replaces = "tasks|add|settings"`）。
 - 设置存储分两处：主 `config.toml` 只存每插件 `enabled` 开关；详细设置在各插件自己的 `plugin-settings/<id>.json`。
+- 颜色只能用语义名（`accent`/`warn`/`danger`/`muted` 及别名 `primary`/`ok`/`completed`/`paused`/`error`/`failed`），**不能写 RGB** —— 否则换主题时插件就成了硬编码补丁。
 - 示例见 `plugins/ui-demo/`。
 
 ![插件 UI 示例页面](docs/images/plugin-ui.png)
@@ -230,6 +242,7 @@ adl.onCommand(() => ({ message: "命令响应" }));
 - ✅ 自研 UI 组件库 `crates/adl-ui`（主题令牌 + 声明式表单 + 定宽表格，三页已迁移）
 - ✅ 无边框窗口 + 自绘标题栏（拖动 / 双击最大化 / 八向缩放全部自实现，不依赖字体图标）
 - ✅ 插件渲染器 23 个组件（grid/stat/kv/table/status…，语义 tone，未知类型降级不崩）
+- ✅ 外壳重构（顶栏 chips + 主页热力图 + 添加下载弹窗 + 侧栏可收起 + 关闭行为可记忆）
 
 设计文档见 [docs/DESIGN.md](docs/DESIGN.md)。
 

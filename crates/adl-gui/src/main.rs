@@ -32,6 +32,9 @@ pub(crate) struct Task {
     pub(crate) completed: u64,
     pub(crate) total: u64,
     pub(crate) speed: u64,
+    /// 当前活跃连接数（引擎每帧通过 `Progress::connections` 报上来）。
+    /// 顶栏的"并行线路"chip 就是把所有进行中任务的这个值加起来。
+    pub(crate) connections: u32,
     pub(crate) path: Option<String>,
     pub(crate) error: Option<String>,
     pub(crate) handle: Option<tokio::task::JoinHandle<()>>,
@@ -53,6 +56,7 @@ struct TaskView {
     completed: u64,
     total: u64,
     speed: u64,
+    connections: u32,
     path: Option<String>,
     error: Option<String>,
 }
@@ -69,6 +73,7 @@ fn snapshot(gui: &Gui) -> Vec<TaskView> {
             completed: t.completed,
             total: t.total,
             speed: t.speed,
+            connections: t.connections,
             path: t.path.clone(),
             error: t.error.clone(),
         })
@@ -79,10 +84,18 @@ fn snapshot(gui: &Gui) -> Vec<TaskView> {
 
 #[derive(Clone, PartialEq)]
 enum Tab {
+    Home,
     Tasks,
-    Add,
     Settings,
     Plugin(String, String),
+}
+
+/// 主页热力图的时间跨度。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Range {
+    Week,
+    Month,
+    Year,
 }
 
 enum Dispatch {
@@ -93,7 +106,8 @@ enum Dispatch {
 struct App {
     gui: Arc<Gui>,
     tab: Tab,
-    // 添加下载表单
+    // 添加下载表单（现在是弹窗，不再是页面）
+    add_open: bool,
     f_url: String,
     f_out: String,
     // 设置表单
@@ -102,8 +116,15 @@ struct App {
     s_limit: u64,
     s_proxy: String,
     s_mode: String,
-    s_http1: bool,
     s_plugin_dir: String,
+    // 限速显示单位（"auto" 或固定单位）
+    limit_unit: String,
+    // 侧栏收起
+    sidebar_collapsed: bool,
+    // 主页热力图范围
+    home_range: Range,
+    // 关闭行为询问弹窗（None = 不显示）
+    close_ask: Option<CloseAsk>,
     // 提示
     status: Option<(String, bool, Instant)>,
     // 插件 UI 缓存
@@ -121,6 +142,14 @@ struct App {
     _tray: Option<TrayIcon>,
     // 自绘标题栏用的最大化状态（从 ViewportInfo 同步，点击时本地翻转以即时响应）
     maximized: bool,
+    /// "正在退出"闸门：用户确认退出后放行 Close，避免被自己的关闭拦截挡回去。
+    closing: bool,
+}
+
+/// 首次点关闭时问用户"退出还是最小化"。
+struct CloseAsk {
+    /// 勾选"记住我的选择"
+    remember: bool,
 }
 
 impl App {
@@ -139,9 +168,15 @@ impl App {
 
         let cfg = gui.cfg.lock().unwrap().clone();
         // ADL_TAB 仅用于开发/截图脚本直达某个页面，不写进文档：
-        //   tasks | add | settings | plugin:<pluginId>:<pageId>
+        //   home | tasks | settings | add | plugin:<pluginId>:<pageId>
+        // `add` 现在打开弹窗而不是切页。
+        let mut add_open = false;
         let initial_tab = match std::env::var("ADL_TAB").unwrap_or_default().as_str() {
-            "add" => Tab::Add,
+            "add" => {
+                add_open = true;
+                Tab::Tasks
+            }
+            "home" => Tab::Home,
             "settings" => Tab::Settings,
             s if s.starts_with("plugin:") => {
                 let mut it = s.trim_start_matches("plugin:").splitn(2, ':');
@@ -154,6 +189,7 @@ impl App {
         Self {
             gui,
             tab: initial_tab,
+            add_open,
             f_url: String::new(),
             f_out: String::new(),
             s_dir: cfg.dir.clone(),
@@ -161,8 +197,15 @@ impl App {
             s_limit: cfg.limit,
             s_proxy: cfg.proxy.clone(),
             s_mode: if cfg.mode_trusted() { "trusted".into() } else { "safe".into() },
-            s_http1: cfg.http1,
             s_plugin_dir: cfg.plugin_dir.clone(),
+            limit_unit: if cfg.limit_unit.trim().is_empty() {
+                "auto".to_string()
+            } else {
+                cfg.limit_unit.clone()
+            },
+            sidebar_collapsed: cfg.sidebar_collapsed,
+            home_range: Range::Month,
+            close_ask: None,
             status: None,
             plugin_snapshot: json!({}),
             plugin_snapshot_at: Instant::now() - Duration::from_secs(3600),
@@ -175,6 +218,7 @@ impl App {
             cmd_query: String::new(),
             _tray: tray,
             maximized: false,
+        closing: false,
         }
     }
 
@@ -215,6 +259,7 @@ impl App {
                 self.set_status(format!("已添加任务 #{id}"), false);
                 self.f_url.clear();
                 self.f_out.clear();
+                self.add_open = false;
                 self.tab = Tab::Tasks;
             }
             Err(e) => self.set_status(e, true),
@@ -222,14 +267,18 @@ impl App {
     }
 
     fn do_save_settings(&mut self) {
+        // `http1` 不再暴露给用户（自动协商失败会自己退回 HTTP/1.1），
+        // 这里仍原样带上当前配置值，避免保存时把它重置。
+        let http1 = self.gui.cfg.lock().unwrap().http1;
         let args = json!({
             "dir": self.s_dir,
             "connections": self.s_conn,
             "limit": self.s_limit,
             "proxy": self.s_proxy,
             "mode": self.s_mode,
-            "http1": self.s_http1,
+            "http1": http1,
             "plugin_dir": self.s_plugin_dir,
+            "limit_unit": self.limit_unit,
         });
         match set_settings(&self.gui, &args) {
             Ok(_) => {
@@ -237,6 +286,21 @@ impl App {
                 self.plugin_snapshot_at = Instant::now() - Duration::from_secs(3600);
             }
             Err(e) => self.set_status(e, true),
+        }
+    }
+
+    /// 关闭行为：记住用户的选择并落盘。
+    fn remember_close_action(&mut self, action: &str) {
+        {
+            let mut cfg = self.gui.cfg.lock().unwrap();
+            cfg.close_action = action.to_string();
+            let _ = cfg.save();
+        }
+        self.close_ask = None;
+        if action == "tray" {
+            self.set_status("已记住：关闭时最小化到托盘（下载继续）", false);
+        } else {
+            self.set_status("已记住：关闭时退出程序", false);
         }
     }
 
@@ -305,6 +369,10 @@ fn ink() -> egui::Color32 {
 fn sidebar_w() -> f32 {
     theme().spacing.sidebar_w
 }
+// 顶栏已并进主区外壳（不再是独立的 Panel），这个高度只作为
+// chips 行的视觉参考值保留，避免主题里删字段引起大范围改动；
+// 目前没有调用点，留着说明"这里曾经有一条顶栏"。
+#[allow(dead_code)]
 fn topbar_h() -> f32 {
     theme().spacing.topbar_h
 }
@@ -322,20 +390,30 @@ fn sidebar_frame() -> egui::Frame {
     theme().sidebar_frame()
 }
 
-/// 顶栏：白底
-fn topbar_frame() -> egui::Frame {
-    theme().topbar_frame()
-}
-
-/// 内容区：浅底 + 内边距
-fn content_frame() -> egui::Frame {
-    theme().content_frame()
+/// 右侧主区外壳：浅底 + 左上圆角
+fn shell_frame() -> egui::Frame {
+    theme().shell_frame()
 }
 
 /// 设置页左侧标签格、表格单元格、导航项、顶栏按钮等已统一迁到
 /// `adl_ui::widgets` / `adl_ui::table`，本文件只保留页面组装逻辑。
 
 impl eframe::App for App {
+    /// 窗口清屏色。
+    ///
+    /// 主区左上角是圆角（`shell_frame` 只切 `nw`），圆角外侧露出来的就是
+    /// 这个清屏色。eframe 默认是半透明深色 `rgba(12,12,12,180)`，在浅色
+    /// 界面里会变成一块黑三角 —— 所以必须显式给白，和侧栏/标题栏同色。
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        let c = pal().card;
+        [
+            c.r() as f32 / 255.0,
+            c.g() as f32 / 255.0,
+            c.b() as f32 / 255.0,
+            1.0,
+        ]
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
@@ -352,10 +430,30 @@ impl eframe::App for App {
             self.set_status("系统已从休眠恢复，如需继续请点「继续」", false);
         }
 
-        // 关闭到托盘：拦截关闭，改为隐藏窗口（不销毁，egui 无白屏问题）
+        // 关闭拦截：行为由配置决定（首次点关闭时问一次，可以记住）
+        //
+        // `closing` 是个"放行闸"——用户选了"退出程序"之后我们要再发一次 Close，
+        // 如果不放行就会在这里被自己拦回去，永远关不掉。
         if ctx.input(|i| i.viewport().close_requested()) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            if self.closing {
+                // 已在退出流程里，不再拦截
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                let action = self.gui.cfg.lock().unwrap().close_action.clone();
+                match action.as_str() {
+                    "close" => {
+                        self.closing = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    "tray" => {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                    }
+                    _ => {
+                        // 还没问过：弹窗让用户选，并允许记住
+                        self.close_ask = Some(CloseAsk { remember: true });
+                    }
+                }
+            }
         }
 
         // 托盘菜单事件（显示主界面 / 退出）
@@ -381,8 +479,12 @@ impl eframe::App for App {
         // 无边框窗口：系统不再提供边缘拖拽，八向热区要自己铺。
         resize_borders(ui);
 
-        // ===== 整体布局：最外层自绘标题栏 + 左侧整高侧边栏 + 右侧顶栏/内容 =====
-        // Panel 之间的调用顺序决定占位顺序，所以最外层不要先开 CentralPanel。
+        // ===== 整体布局 =====
+        // 自绘标题栏（整宽，含侧栏折叠按钮与三个窗口键）
+        // → 左侧整高侧边栏
+        // → 右侧一整块浅底"外壳"（左上圆角），里面是 chips 行 + 内容区。
+        // 以前顶栏是白底独立一条，结果侧栏白 / 顶栏白 / 内容浅灰之间出现
+        // 一条横向的白灰分界带；现在顶栏并进外壳的浅底里，只靠间距分层。
         egui::Panel::top("adl_titlebar")
             .exact_size(titlebar_h())
             .resizable(false)
@@ -390,33 +492,29 @@ impl eframe::App for App {
             .frame(titlebar_frame())
             .show(ui, |ui| self.titlebar(ui));
 
+        let sw = if self.sidebar_collapsed {
+            theme().spacing.sidebar_w_collapsed
+        } else {
+            sidebar_w()
+        };
         egui::Panel::left("adl_sidebar")
-            .exact_size(sidebar_w())
+            .exact_size(sw)
             .resizable(false)
             .show_separator_line(false)
             .frame(sidebar_frame())
             .show(ui, |ui| self.sidebar(ui));
 
-        egui::Panel::top("adl_topbar")
-            .exact_size(topbar_h())
-            .resizable(false)
-            .show_separator_line(false)
-            .frame(topbar_frame())
-            .show(ui, |ui| self.topbar(ui));
-
-        // 状态提示条（6 秒后消失）
+        // 状态提示条（6 秒后消失）——放在外壳正上方，不参与圆角
         if let Some((msg, err, at)) = &self.status {
             if at.elapsed() < Duration::from_secs(6) {
-                let color = if *err {
-                    egui::Color32::from_rgb(0xB0, 0x30, 0x30)
+                let p = pal();
+                let (color, fill) = if *err {
+                    (p.danger, p.err_bg)
                 } else {
-                    egui::Color32::from_rgb(0x2E, 0x7D, 0x6B)
+                    (egui::Color32::from_rgb(0x2E, 0x7D, 0x6B), p.ok_bg)
                 };
-                let fill = if *err {
-                    egui::Color32::from_rgb(0xFD, 0xEF, 0xEF)
-                } else {
-                    egui::Color32::from_rgb(0xEC, 0xF7, 0xF4)
-                };
+                let text = msg.clone();
+                let is_err = *err;
                 egui::Panel::top("adl_statusbar")
                     .resizable(false)
                     .show_separator_line(false)
@@ -427,28 +525,40 @@ impl eframe::App for App {
                     )
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.colored_label(color, if *err { "⚠" } else { "✓" });
-                            ui.colored_label(color, msg.as_str());
+                            ui.colored_label(color, if is_err { "!" } else { "OK" });
+                            ui.colored_label(color, text);
                         });
                     });
             }
         }
 
         egui::CentralPanel::default()
-            .frame(content_frame())
+            .frame(shell_frame())
             .show(ui, |ui| {
+                self.topbar(ui);
+                ui.add_space(2.0);
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         match self.tab.clone() {
+                            Tab::Home => self.page_home(ui),
                             Tab::Tasks => self.page_tasks(ui),
-                            Tab::Add => self.page_add(ui),
                             Tab::Settings => self.page_settings(ui),
                             Tab::Plugin(_, _) => self.page_plugin(ui),
                         }
                     });
             });
+
+        // 添加下载弹窗
+        if self.add_open {
+            self.show_add_modal(&ctx);
+        }
+
+        // 关闭行为首次询问
+        if self.close_ask.is_some() {
+            self.show_close_modal(&ctx);
+        }
 
         // 命令面板
         if self.cmd_open {
@@ -465,65 +575,182 @@ impl App {
         adl_ui::widgets::nav_item(ui, selected, label)
     }
 
-    /// 左侧整高边栏：导航 + 底部状态
+    /// 左侧整高边栏。
     ///
+    /// 布局参考 DSH 的侧栏：最上面是 ADL 图标块，接着是主操作按钮（新建下载），
+    /// 然后是主导航 + 插件分组，最后把"设置"钉在左下角。
     /// 品牌字（ADL / 下载器）已在自绘标题栏里，这里不再重复 ——
     /// 否则窗口顶部会出现两次"ADL 下载器"。
+    ///
+    /// 收起时只留首字（中文字体没有图标字形，用单字当"图标"最稳）。
     fn sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(6.0);
-        ui.label(egui::RichText::new("导航").size(11.5).color(muted()));
-        ui.add_space(6.0);
+        let collapsed = self.sidebar_collapsed;
 
-        if self.nav_item(ui, self.tab == Tab::Tasks, "任务列表") {
+        // ── 图标块 ──
+        ui.add_space(4.0);
+        let (icon_rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), if collapsed { 34.0 } else { 46.0 }),
+            egui::Sense::hover(),
+        );
+        if collapsed {
+            let r = egui::Rect::from_center_size(icon_rect.center(), egui::vec2(28.0, 28.0));
+            ui.painter()
+                .rect_filled(r, egui::CornerRadius::same(8), teal());
+            ui.painter().text(
+                r.center(),
+                egui::Align2::CENTER_CENTER,
+                "A",
+                egui::FontId::proportional(15.0),
+                egui::Color32::WHITE,
+            );
+        } else {
+            let r = egui::Rect::from_min_size(
+                egui::pos2(icon_rect.left(), icon_rect.top() + 6.0),
+                egui::vec2(34.0, 34.0),
+            );
+            ui.painter()
+                .rect_filled(r, egui::CornerRadius::same(9), teal());
+            ui.painter().text(
+                r.center(),
+                egui::Align2::CENTER_CENTER,
+                "A",
+                egui::FontId::proportional(18.0),
+                egui::Color32::WHITE,
+            );
+            ui.painter().text(
+                egui::pos2(r.right() + 10.0, r.center().y - 7.0),
+                egui::Align2::LEFT_CENTER,
+                "ADL",
+                egui::FontId::proportional(14.0),
+                ink(),
+            );
+            ui.painter().text(
+                egui::pos2(r.right() + 10.0, r.center().y + 9.0),
+                egui::Align2::LEFT_CENTER,
+                "下载器",
+                egui::FontId::proportional(11.0),
+                muted(),
+            );
+        }
+        ui.add_space(8.0);
+
+        // ── 主操作：新建下载（取代原来的"添加下载"导航项）──
+        let btn_h = 34.0;
+        let (btn_rect, _) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), btn_h), egui::Sense::hover());
+        let label = if collapsed { "+" } else { "+ 新建下载" };
+        if adl_ui::widgets::small_button(ui, btn_rect, label, true) {
+            self.f_url.clear();
+            self.f_out.clear();
+            self.add_open = true;
+        }
+        ui.add_space(12.0);
+
+        // ── 主导航 ──
+        let home_label = if collapsed { "主" } else { "主页" };
+        if self.nav_item(ui, self.tab == Tab::Home, home_label) {
+            self.tab = Tab::Home;
+        }
+        ui.add_space(2.0);
+        let tasks_label = if collapsed { "列" } else { "任务列表" };
+        if self.nav_item(ui, self.tab == Tab::Tasks, tasks_label) {
             self.tab = Tab::Tasks;
         }
-        ui.add_space(2.0);
-        if self.nav_item(ui, self.tab == Tab::Add, "添加下载") {
-            self.tab = Tab::Add;
-        }
-        ui.add_space(2.0);
-        if self.nav_item(ui, self.tab == Tab::Settings, "设置") {
-            self.tab = Tab::Settings;
-        }
 
+        // ── 插件：页面 + 最多 5 个设置入口，超出的走"更多设置" ──
         let pages = self
             .plugin_snapshot
             .get("pages")
             .and_then(|x| x.as_array())
             .cloned()
             .unwrap_or_default();
-        if !pages.is_empty() {
-            ui.add_space(18.0);
-            ui.label(egui::RichText::new("插件页面").size(11.5).color(muted()));
-            ui.add_space(6.0);
+        // 有设置的插件各算一个入口；最多在侧栏放 5 个，其余收进"更多"
+        let mut setting_plugins: Vec<(String, String)> = Vec::new();
+        if let Some(arr) = self.plugin_snapshot.get("settings").and_then(|x| x.as_array()) {
+            for s in arr {
+                let plugin = s.get("plugin").and_then(|x| x.as_str()).unwrap_or("");
+                if plugin.is_empty() {
+                    continue;
+                }
+                if !setting_plugins.iter().any(|(p, _)| p == plugin) {
+                    setting_plugins.push((plugin.to_string(), plugin.to_string()));
+                }
+            }
+        }
+        let shown = setting_plugins.len().min(5);
+        let has_more = setting_plugins.len() > shown;
+
+        if !pages.is_empty() || !setting_plugins.is_empty() {
+            ui.add_space(14.0);
+            if !collapsed {
+                ui.label(egui::RichText::new("插件").size(11.5).color(muted()));
+                ui.add_space(6.0);
+            }
             for p in pages {
-                let plugin = p.get("plugin").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                let plugin = p
+                    .get("plugin")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let id = p.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                let title = p.get("title").and_then(|x| x.as_str()).unwrap_or(&id).to_string();
+                let title = p
+                    .get("title")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or(&id)
+                    .to_string();
                 let selected =
                     matches!(&self.tab, Tab::Plugin(pl, pg) if pl == &plugin && pg == &id);
-                if self.nav_item(ui, selected, &title) {
+                let label = if collapsed {
+                    title.chars().next().unwrap_or('·').to_string()
+                } else {
+                    title.clone()
+                };
+                if self.nav_item(ui, selected, &label) {
                     self.tab = Tab::Plugin(plugin.clone(), id.clone());
                     self.plugin_view = None;
                     self.reload_plugin_view();
                 }
                 ui.add_space(2.0);
             }
+            for (plugin, name) in setting_plugins.iter().take(shown) {
+                let tab_id = format!("settings:{plugin}");
+                let selected =
+                    matches!(&self.tab, Tab::Plugin(pl, pg) if pl == "adl" && pg == &tab_id);
+                let label = if collapsed {
+                    name.chars().next().unwrap_or('·').to_string()
+                } else {
+                    format!("{name} 设置")
+                };
+                if self.nav_item(ui, selected, &label) {
+                    self.tab = Tab::Plugin("adl".to_string(), tab_id);
+                }
+                ui.add_space(2.0);
+            }
+            if has_more {
+                let label = if collapsed { "…" } else { "更多设置…" };
+                if self.nav_item(ui, false, label) {
+                    self.tab = Tab::Settings;
+                }
+                ui.add_space(2.0);
+            }
         }
 
+        // ── 底部：设置 + 模式胶囊 + 快捷键提示 ──
         let trusted = self
             .plugin_snapshot
             .get("trusted")
             .and_then(|x| x.as_bool())
             .unwrap_or(false);
         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-            ui.add_space(2.0);
-            ui.label(
-                egui::RichText::new("Ctrl+K 命令面板")
-                    .size(11.0)
-                    .color(muted()),
-            );
-            ui.add_space(8.0);
+            if !collapsed {
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new("Ctrl+K 命令面板")
+                        .size(11.0)
+                        .color(muted()),
+                );
+                ui.add_space(6.0);
+            }
             let (txt, fg, bg) = if trusted {
                 (
                     "信任模式",
@@ -533,26 +760,39 @@ impl App {
             } else {
                 ("安全模式", teal(), egui::Color32::from_rgb(0xDD, 0xEE, 0xE9))
             };
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(76.0, 22.0), egui::Sense::hover());
+            let w = if collapsed { 34.0 } else { 76.0 };
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 22.0), egui::Sense::hover());
             ui.painter()
                 .rect_filled(rect, egui::CornerRadius::same(11), bg);
             ui.painter().text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                txt,
+                if collapsed { "安" } else { txt },
                 egui::FontId::proportional(12.0),
                 fg,
             );
+            ui.add_space(8.0);
+            // 设置钉在左下角
+            let settings_label = if collapsed { "设" } else { "设置" };
+            if self.nav_item(ui, self.tab == Tab::Settings, settings_label) {
+                self.tab = Tab::Settings;
+            }
             ui.add_space(4.0);
         });
     }
 
     fn page_title(&self) -> String {
         match &self.tab {
+            Tab::Home => "主页".to_string(),
             Tab::Tasks => "任务列表".to_string(),
-            Tab::Add => "添加下载".to_string(),
             Tab::Settings => "设置".to_string(),
             Tab::Plugin(plugin, page) => {
+                // 插件设置伪页面：`adl` + `settings:<pluginId>`
+                if plugin == "adl" {
+                    if let Some(pid) = page.strip_prefix("settings:") {
+                        return format!("{pid} · 设置");
+                    }
+                }
                 let p = page.clone();
                 let pl = plugin.clone();
                 self.plugin_snapshot
@@ -562,9 +802,12 @@ impl App {
                         arr.iter().find_map(|n| {
                             let same_plugin =
                                 n.get("plugin").and_then(|x| x.as_str()) == Some(pl.as_str());
-                            let same_page = n.get("id").and_then(|x| x.as_str()) == Some(p.as_str());
+                            let same_page =
+                                n.get("id").and_then(|x| x.as_str()) == Some(p.as_str());
                             if same_plugin && same_page {
-                                n.get("title").and_then(|x| x.as_str()).map(|s| s.to_string())
+                                n.get("title")
+                                    .and_then(|x| x.as_str())
+                                    .map(|s| s.to_string())
                             } else {
                                 None
                             }
@@ -575,16 +818,16 @@ impl App {
         }
     }
 
-    /// 顶栏按钮：自绘（不依赖布局容器，位置绝对可控）
-    fn topbar_button(ui: &mut egui::Ui, rect: egui::Rect, label: &str, primary: bool) -> bool {
-        adl_ui::widgets::small_button(ui, rect, label, primary)
-    }
-
-    /// 自绘标题栏：品牌 + 可拖动空白区 + 最小化/最大化/关闭。
+    /// 自绘标题栏：折叠键 + 可拖动空白区 + 最小化/最大化/关闭。
     ///
     /// 窗口用 `.with_decorations(false)` 关掉了系统标题栏，所以这里的拖动与
     /// 双击最大化必须自己实现（`ViewportCommand::StartDrag` / `Maximized`）。
     /// 拖动区只覆盖标题栏里除按钮外的部分，否则点按钮会变成拖窗口。
+    ///
+    /// 折叠键放最左上角（与用户要的第 5 张参考图一致）：这一栏与窗口三键
+    /// 本该是同一个横条，而不是让侧栏顶部再单独占一行。
+    /// 品牌字不在这里画 —— 侧栏图标块已经有"ADL / 下载器"，
+    /// 标题栏再写一遍就成了窗口顶部左右各一个。
     fn titlebar(&mut self, ui: &mut egui::Ui) {
         // 跟随系统状态（用户用快捷键 Win+↑ 时也要同步）
         if let Some(m) = ui.ctx().input(|i| i.viewport().maximized) {
@@ -593,6 +836,19 @@ impl App {
 
         let band = ui.available_rect_before_wrap();
         let cy = band.center().y;
+
+        // 折叠/展开侧栏
+        let tw = 34.0;
+        let toggle_rect = egui::Rect::from_center_size(
+            egui::pos2(band.left() + tw / 2.0, cy),
+            egui::vec2(tw, band.height().min(34.0)),
+        );
+        if adl_ui::widgets::sidebar_toggle(ui, toggle_rect, self.sidebar_collapsed) {
+            self.sidebar_collapsed = !self.sidebar_collapsed;
+            let mut cfg = self.gui.cfg.lock().unwrap();
+            cfg.sidebar_collapsed = self.sidebar_collapsed;
+            let _ = cfg.save();
+        }
 
         // 右侧三个窗口按钮，从右缘往左排
         let bw = 46.0;
@@ -604,12 +860,16 @@ impl App {
         let max_rect = close_rect.translate(egui::vec2(-bw, 0.0));
         let min_rect = max_rect.translate(egui::vec2(-bw, 0.0));
 
-        // 品牌与拖动区（覆盖到最小化按钮左侧，留 6px 空隙）
+        // 品牌与拖动区（折叠按钮右侧 → 最小化按钮左侧，留 6px 空隙）
         let drag_rect = egui::Rect::from_min_max(
-            band.left_top(),
+            egui::pos2(toggle_rect.right() + 4.0, band.top()),
             egui::pos2(min_rect.left() - 6.0, band.bottom()),
         );
-        let drag = ui.interact(drag_rect, ui.scope_id().with("adl_titlebar_drag"), egui::Sense::click_and_drag());
+        let drag = ui.interact(
+            drag_rect,
+            ui.scope_id().with("adl_titlebar_drag"),
+            egui::Sense::click_and_drag(),
+        );
         if drag.drag_started() {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
         }
@@ -617,23 +877,13 @@ impl App {
             self.toggle_maximize(ui.ctx());
         }
 
-        ui.painter().text(
-            egui::pos2(drag_rect.left() + 4.0, cy),
-            egui::Align2::LEFT_CENTER,
-            "ADL",
-            egui::FontId::proportional(14.0),
-            pal().accent,
-        );
-        ui.painter().text(
-            egui::pos2(drag_rect.left() + 42.0, cy),
-            egui::Align2::LEFT_CENTER,
-            "下载器",
-            egui::FontId::proportional(12.0),
-            pal().muted,
-        );
+        // 品牌字在侧栏图标块里（标题栏只留折叠键 + 拖动区 + 窗口三键），
+        // 这里不再重复画一遍 —— 否则窗口顶部左右各一个"ADL 下载器"。
+        let _ = drag_rect;
 
         if adl_ui::widgets::window_button(ui, min_rect, adl_ui::WindowButton::Minimize) {
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
         let kind = if self.maximized {
             adl_ui::WindowButton::Restore
@@ -653,35 +903,108 @@ impl App {
         ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(self.maximized));
     }
 
-    /// 顶栏：页标题 + 右侧操作（自绘按钮，绝对定位到面板右缘）
+    /// 顶栏：左侧页面标题，右侧一排状态 chip（参考 DSH 的顶栏）。
     ///
-    /// 不放"退出"按钮了：标题栏右上角已经有系统级关闭键，重复摆两个关闭
+    /// 这些 chip 都是"可点的状态指示"，不是纯装饰：
+    ///   任务列表 → 回任务页（当前就在任务页时高亮）
+    ///   限速档位 → 弹菜单选预设，直接改 `cfg.limit`
+    ///   并行线路 → 所有进行中任务的活跃连接数之和（有流量时点是青绿）
+    ///   下载进度 → 剩余/已完成，悬停可看细节
+    ///
+    /// 不放"退出"按钮：标题栏右上角已经有系统级关闭键，重复摆两个关闭
     /// 入口会让人犹豫"这两个有什么区别"。
     fn topbar(&mut self, ui: &mut egui::Ui) {
         let title = self.page_title();
-        let band = ui.available_rect_before_wrap();
-        let cy = band.center().y;
-        let bh = 28.0;
+        let tasks = snapshot(&self.gui);
 
-        // 左侧标题
-        ui.painter().text(
-            egui::pos2(band.left() + 2.0, cy),
-            egui::Align2::LEFT_CENTER,
-            &title,
-            egui::FontId::proportional(16.0),
-            ink(),
-        );
+        // 限速：从配置读当前档位，chip 上直接显示
+        let (limit, unit) = {
+            let cfg = self.gui.cfg.lock().unwrap();
+            (cfg.limit, cfg.limit_unit.clone())
+        };
+        let limit_label = if limit == 0 {
+            "不限速".to_string()
+        } else {
+            format!("限速 {}", format_speed_unit(limit, &unit))
+        };
+        let conns: u32 = tasks
+            .iter()
+            .filter(|t| t.status == "downloading")
+            .map(|t| t.connections)
+            .sum();
+        let running = tasks.iter().filter(|t| t.status == "downloading").count();
+        let done = tasks.iter().filter(|t| t.status == "completed").count();
+        let progress_label = if running > 0 {
+            format!("剩余 {running} / 完成 {done}")
+        } else {
+            format!("完成 {done} 总计 {}", tasks.len())
+        };
 
-        // 右侧按钮，从右边缘往左排
-        let w_add = 96.0;
-        let right = band.right();
-        let add_rect = egui::Rect::from_center_size(
-            egui::pos2(right - w_add / 2.0, cy),
-            egui::vec2(w_add, bh),
-        );
+        let mut go_tasks = false;
+        let mut picked_limit: Option<u64> = None;
 
-        if Self::topbar_button(ui, add_rect, "+ 添加下载", true) {
-            self.tab = Tab::Add;
+        ui.horizontal(|ui| {
+            ui.add_space(2.0);
+            ui.label(egui::RichText::new(title).size(16.0).color(ink()));
+
+            // chip 靠右：右到左布局会把第一个 add 放到最右边
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(2.0);
+
+                // 后台任务
+                let p = adl_ui::widgets::chip(ui, &progress_label, None, false);
+                p.on_hover_text(format!("进行中 {running}，已完成 {done}"));
+
+                // 并行线路
+                let dot = if conns > 0 { Some(teal()) } else { Some(muted()) };
+                adl_ui::widgets::chip(ui, &format!("{conns} 条线路"), dot, false)
+                    .on_hover_text("当前所有下载任务加起来的活跃连接数（服务器会限流）");
+
+                // 限速档位 + 菜单
+                let lr = adl_ui::widgets::chip(ui, &limit_label, None, false);
+                lr.clone()
+                    .on_hover_text("点这里切换限速档位（也可以去设置里改精确值）");
+                egui::Popup::menu(&lr).show(|ui| {
+                    ui.set_min_width(160.0);
+                    for (v, label) in [
+                        (0u64, "不限速"),
+                        (1 << 20, "1 MB/s"),
+                        (2 << 20, "2 MB/s"),
+                        (5 << 20, "5 MB/s"),
+                        (10 << 20, "10 MB/s"),
+                    ] {
+                        if ui.selectable_label(limit == v, label).clicked() {
+                            picked_limit = Some(v);
+                            ui.close();
+                        }
+                    }
+                });
+
+                // 任务列表（最左）
+                if adl_ui::widgets::chip(ui, "任务列表", None, self.tab == Tab::Tasks).clicked() {
+                    go_tasks = true;
+                }
+            });
+        });
+
+        if go_tasks {
+            self.tab = Tab::Tasks;
+        }
+        if let Some(v) = picked_limit {
+            {
+                let mut cfg = self.gui.cfg.lock().unwrap();
+                cfg.limit = v;
+                let _ = cfg.save();
+            }
+            self.s_limit = v;
+            self.set_status(
+                if v == 0 {
+                    "已切换为不限速".to_string()
+                } else {
+                    format!("限速已设为 {}", format_speed_unit(v, &unit))
+                },
+                false,
+            );
         }
     }
 
@@ -717,7 +1040,7 @@ impl App {
 
         let tasks = snapshot(&self.gui);
         if tasks.is_empty() {
-            adl_ui::widgets::empty_state(ui, "还没有下载任务，去「添加下载」吧。");
+            adl_ui::widgets::empty_state(ui, "还没有下载任务，点左上角「+ 新建下载」开始。");
             return;
         }
         ui.add_space(8.0);
@@ -818,23 +1141,29 @@ impl App {
         }
     }
 
-    fn page_add(&mut self, ui: &mut egui::Ui) {
-        // 标题已在顶栏显示
-        ui.add_space(2.0);
-        // 这里的输入框要撑满宽度（URL 很长），所以不适合 form() 的定宽控件格，
-        // 但仍复用 card / section_title / hint 保持与设置页一致的观感。
+    /// 添加下载：改成居中弹窗（取代原来的整页表单）。
+    ///
+    /// 弹窗里两个输入框撑满宽度（URL 很长，不适合 form() 的定宽控件格），
+    /// 回车（或在地址框里 Enter）直接开始；Esc / 点背板 = 取消。
+    fn show_add_modal(&mut self, ctx: &egui::Context) {
         let mut start = false;
-        adl_ui::widgets::card(ui, |ui| {
-            adl_ui::widgets::section_title(ui, "新建任务");
-            ui.add_space(10.0);
+        let mut cancel = false;
+
+        let resp = egui::Modal::new(egui::Id::unique("adl_add_modal")).show(ctx, |ui| {
+            ui.set_width(520.0);
+            adl_ui::widgets::section_title(ui, "新建下载");
+            ui.add_space(12.0);
 
             ui.label("下载地址");
             ui.add_space(4.0);
-            ui.add(
+            let url_edit = ui.add(
                 egui::TextEdit::singleline(&mut self.f_url)
                     .hint_text("https://…")
                     .desired_width(f32::INFINITY),
             );
+            if url_edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                start = true;
+            }
 
             ui.add_space(12.0);
             ui.label("保存文件名");
@@ -845,47 +1174,334 @@ impl App {
                     .desired_width(f32::INFINITY),
             );
 
-            ui.add_space(14.0);
-            if ui.button("开始下载").clicked() {
-                start = true;
-            }
-            ui.add_space(6.0);
+            ui.add_space(16.0);
+            ui.horizontal(|ui| {
+                if ui.button("开始下载").clicked() {
+                    start = true;
+                }
+                if ui.button("取消").clicked() {
+                    cancel = true;
+                }
+            });
+            ui.add_space(8.0);
             adl_ui::widgets::hint(
                 ui,
                 "浏览器插件接管时会自动带着来源、Cookie 等，无需手动填。",
             );
         });
+
+        if resp.should_close() {
+            cancel = true;
+        }
         if start {
             self.do_add();
+        } else if cancel {
+            self.add_open = false;
         }
+    }
+
+    /// 首次点关闭时问一次"退出还是最小化到托盘"。
+    ///
+    /// 用户明确要求：必须能记住选择，否则每次都弹窗会很烦。
+    /// 勾了"记住"就写进 config.toml；不勾则只对本次生效。
+    fn show_close_modal(&mut self, ctx: &egui::Context) {
+        let mut choice: Option<&str> = None;
+        let mut cancel = false;
+
+        let resp = egui::Modal::new(egui::Id::unique("adl_close_modal")).show(ctx, |ui| {
+            ui.set_width(400.0);
+            adl_ui::widgets::section_title(ui, "关闭窗口时怎么做？");
+            ui.add_space(10.0);
+            adl_ui::widgets::hint(
+                ui,
+                "你现在还有没下完的任务。选「最小化到托盘」下载会继续跑；\
+                 选「退出程序」会先保存进度再退出，下次可以接着下。",
+            );
+            ui.add_space(14.0);
+
+            ui.horizontal(|ui| {
+                if ui.button("最小化到托盘").clicked() {
+                    choice = Some("tray");
+                }
+                if ui.button("退出程序").clicked() {
+                    choice = Some("close");
+                }
+                if ui.button("取消").clicked() {
+                    cancel = true;
+                }
+            });
+
+            ui.add_space(10.0);
+            if let Some(ask) = self.close_ask.as_mut() {
+                ui.checkbox(&mut ask.remember, "记住我的选择（以后不再询问）");
+            }
+        });
+
+        if resp.should_close() {
+            cancel = true;
+        }
+        if cancel {
+            self.close_ask = None;
+            return;
+        }
+        if let Some(action) = choice {
+            let remember = self.close_ask.as_ref().map(|a| a.remember).unwrap_or(false);
+            if remember {
+                self.remember_close_action(action);
+            } else {
+                self.close_ask = None;
+                if action == "tray" {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                } else {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+    }
+
+    /// 主页：四个统计卡片 + 下载热力图（周 / 月 / 年）。
+    ///
+    /// 数据源是 `history.json` 的 `started_unix`，所以只统计"走完整个流程"
+    /// 的任务（包括失败的）—— 中断后没记账的不在内，这与任务列表口径一致。
+    fn page_home(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(2.0);
+        let tasks = snapshot(&self.gui);
+        let total = tasks.len();
+        let done = tasks.iter().filter(|t| t.status == "completed").count();
+        let failed = tasks.iter().filter(|t| t.status == "failed").count();
+        let bytes: u64 = tasks.iter().filter(|t| t.status == "completed").map(|t| t.total).sum();
+
+        // 四张统计卡：宽度必须"刚好填满一行"。
+        //
+        // 之前写成 `(avail - gap*3)/4` 然后又每张后面 `add_space(gap)`，
+        // 于是 4 张卡吃了 4 份间距而不是 3 份，最右那张被裁掉半个。
+        // 这里改成把间距交给 `item_spacing`：horizontal 只会在**元素之间**
+        // 插间距，n 个元素天然只有 n-1 个间隙。
+        let gap = 10.0;
+        let n = 4usize;
+        let avail = ui.available_width();
+        let w = ((avail - gap * (n as f32 - 1.0)) / n as f32 - 1.0).max(80.0);
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            for (val, label, tone) in [
+                (format!("{total}"), "任务总数", ink()),
+                (format!("{done}"), "已完成", teal()),
+                (
+                    format!("{failed}"),
+                    "失败",
+                    egui::Color32::from_rgb(0xB0, 0x30, 0x30),
+                ),
+                (format_bytes(bytes), "累计下载", ink()),
+            ] {
+                adl_ui::widgets::cell(ui, w, |ui| {
+                    adl_ui::widgets::stat_card(ui, &val, label, tone);
+                });
+            }
+        });
+
+        ui.add_space(16.0);
+        adl_ui::widgets::card(ui, |ui| {
+            ui.horizontal(|ui| {
+                adl_ui::widgets::section_title(ui, "下载热力图");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let items = [
+                        (Range::Year, "年"),
+                        (Range::Month, "月"),
+                        (Range::Week, "周"),
+                    ];
+                    if let Some(r) = adl_ui::widgets::segmented(ui, self.home_range, &items) {
+                        self.home_range = r;
+                    }
+                });
+            });
+            ui.add_space(10.0);
+
+            // 历史里每个任务落在"哪一天"：按范围铺格子
+            let hist = adl_app::history::History::load();
+            let now = adl_app::history::now_unix();
+            let day = 86_400u64;
+            let cols = match self.home_range {
+                Range::Week => 7,
+                Range::Month => 7,
+                Range::Year => 53,
+            };
+            let rows = match self.home_range {
+                Range::Week => 1,
+                Range::Month => 5,
+                Range::Year => 7,
+            };
+            let start_days_ago = (cols * rows) as u64 - 1;
+            // 先按网格顺序铺满 0，再用历史里的 started_unix 累加计数
+            let mut counts = vec![0u32; cols * rows];
+            for t in &hist.tasks {
+                if t.started_unix == 0 {
+                    continue;
+                }
+                let ago_days = now.saturating_sub(t.started_unix) / day;
+                if ago_days > start_days_ago {
+                    continue;
+                }
+                let idx = (start_days_ago - ago_days) as usize; // 0 = 最早
+                // 年视图：一列一周、一行一天；周/月视图：一行一周、一格一天
+                let i = if matches!(self.home_range, Range::Year) {
+                    (idx / 7) * rows + (idx % 7)
+                } else {
+                    idx
+                };
+                if i < counts.len() {
+                    counts[i] += 1;
+                }
+            }
+            let cells: Vec<(usize, usize, u8)> = counts
+                .iter()
+                .enumerate()
+                .map(|(i, &n)| {
+                    let level = match n {
+                        0 => 0,
+                        1 => 1,
+                        2..=3 => 2,
+                        4..=7 => 3,
+                        _ => 4,
+                    };
+                    if matches!(self.home_range, Range::Year) {
+                        (i / rows, i % rows, level)
+                    } else {
+                        (i % cols, i / cols, level)
+                    }
+                })
+                .collect();
+            adl_ui::widgets::heatmap(ui, &cells, cols, rows);
+
+            ui.add_space(8.0);
+            let label = match self.home_range {
+                Range::Week => "最近 7 天",
+                Range::Month => "最近 5 周",
+                Range::Year => "最近 1 年",
+            };
+            adl_ui::widgets::hint(
+                ui,
+                &format!("{label}每天启动的下载数量，颜色越深越多（数据来自下载历史）。"),
+            );
+        });
     }
 
     fn page_settings(&mut self, ui: &mut egui::Ui) {
         // 标题已在顶栏显示
         ui.add_space(2.0);
 
-        // 以前这里是 200 行 Grid::new(..) + label_cell + add_sized + end_row 的
-        // 重复样板，现在每个字段一行 `Field`。新增一项设置只需加一行。
+        // ── 并发：只给档位，不给自由输入 ──
+        // 用户要求"最大值 + 固定 1/2/4/8/16/32/64，本质还是自适应"：
+        // 这里选的是**上限**，引擎会按服务器实际放行量自动收敛。
+        let mut save_conn = false;
+        adl_ui::widgets::card(ui, |ui| {
+            adl_ui::widgets::section_title(ui, "并发上限");
+            ui.add_space(4.0);
+            let opts: [(u64, &str); 7] = [
+                (1, "1"),
+                (2, "2"),
+                (4, "4"),
+                (8, "8"),
+                (16, "16"),
+                (32, "32"),
+                (64, "64"),
+            ];
+            if let Some(v) = adl_ui::widgets::segmented(ui, self.s_conn, &opts) {
+                self.s_conn = v;
+                save_conn = true;
+            }
+            ui.add_space(6.0);
+            adl_ui::widgets::hint(
+                ui,
+                "服务器通常不会给满（常见 16 只放 9）。引擎会按实际放行量自动收敛，\
+                 稳定后偶尔试探 +1，被拒就退回并把试探间隔翻倍，避免触发反爬。",
+            );
+        });
+        if save_conn {
+            let mut cfg = self.gui.cfg.lock().unwrap();
+            cfg.connections = adl_core::clamp_concurrency(self.s_conn as usize);
+            let _ = cfg.save();
+        }
+
+        ui.add_space(12.0);
+
+        // ── 限速：数值 + 单位选择（英文单位，中文读起来别扭）──
+        let mut save_limit = false;
+        adl_ui::widgets::card(ui, |ui| {
+            adl_ui::widgets::section_title(ui, "限速");
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                let unit_scale = unit_scale_of(&self.limit_unit);
+                let mut shown = self.s_limit / unit_scale.max(1) as u64;
+                let resp = ui.add(
+                    egui::DragValue::new(&mut shown)
+                        .speed(1.0)
+                        .range(0..=10_000u64),
+                );
+                if resp.changed() {
+                    self.s_limit = shown.saturating_mul(unit_scale.max(1) as u64);
+                    save_limit = true;
+                }
+                let units: [(&str, &str); 5] = [
+                    ("auto", "自动"),
+                    ("B/s", "B/s"),
+                    ("KB/s", "KB/s"),
+                    ("MB/s", "MB/s"),
+                    ("GB/s", "GB/s"),
+                ];
+                let mut cur = self.limit_unit.clone();
+                if cur.is_empty() {
+                    cur = "auto".to_string();
+                }
+                egui::ComboBox::from_id_salt("adl_limit_unit")
+                    .width(96.0)
+                    .selected_text(units.iter().find(|(v, _)| *v == cur).map(|(_, l)| *l).unwrap_or("自动"))
+                    .show_ui(ui, |ui| {
+                        for (v, l) in units {
+                            if ui.selectable_value(&mut cur, v.to_string(), l).clicked() {
+                                self.limit_unit = v.to_string();
+                                save_limit = true;
+                            }
+                        }
+                    });
+                ui.label(
+                    egui::RichText::new(if self.s_limit == 0 {
+                        "不限速".to_string()
+                    } else {
+                        format_speed_unit(self.s_limit, &self.limit_unit)
+                    })
+                    .color(muted()),
+                );
+            });
+            ui.add_space(6.0);
+            adl_ui::widgets::hint(
+                ui,
+                "0 = 不限速。限速是全局上限，所有任务共享同一个令牌桶。",
+            );
+        });
+        if save_limit {
+            let mut cfg = self.gui.cfg.lock().unwrap();
+            cfg.limit = self.s_limit;
+            cfg.limit_unit = self.limit_unit.clone();
+            let _ = cfg.save();
+        }
+
+        ui.add_space(12.0);
+
+        // ── 其它：目录与代理 ──
+        let mut fields = vec![
+            adl_ui::Field::text("默认下载目录", &mut self.s_dir).hint("留空 = 当前目录"),
+            adl_ui::Field::text("HTTP 代理", &mut self.s_proxy)
+                .hint("http://127.0.0.1:7890（留空 = 直连）"),
+        ];
+        adl_ui::form(ui, "其它", &mut fields);
+
+        ui.add_space(10.0);
         let mode_opts: [(&str, &str); 2] = [
             ("safe", "安全（只读观察 / 拦截）"),
             ("trusted", "信任（可改写请求 / 替换界面）"),
         ];
-        let mut fields = vec![
-            adl_ui::Field::text("默认下载目录", &mut self.s_dir).hint("留空 = 当前目录"),
-            adl_ui::Field::number("并发数（1–64，自适应）", &mut self.s_conn, 1..=64)
-                .note("服务器不给满会自动降，稳定后偶尔试探 +1"),
-            adl_ui::Field::number("限速（字节/秒，0 = 不限）", &mut self.s_limit, 0..=1_000_000_000),
-            adl_ui::Field::text("HTTP 代理", &mut self.s_proxy)
-                .hint("http://127.0.0.1:7890（留空 = 直连）"),
-            adl_ui::Field::checkbox(
-                "HTTP/1.1",
-                &mut self.s_http1,
-                "强制使用 HTTP/1.1（某些站点 h2 有问题时）",
-            ),
-        ];
-        adl_ui::form(ui, "下载", &mut fields);
-
-        ui.add_space(10.0);
         let mut plug_fields = vec![
             adl_ui::Field::select("插件模式", &mut self.s_mode, &mode_opts)
                 .note("信任模式下插件才能改写请求、注册按钮与替换内置页面"),
@@ -893,6 +1509,47 @@ impl App {
                 .hint("留空 = exe 同级 plugins"),
         ];
         adl_ui::form(ui, "插件", &mut plug_fields);
+
+        // ── 关闭行为 ──
+        ui.add_space(10.0);
+        adl_ui::widgets::card(ui, |ui| {
+            adl_ui::widgets::section_title(ui, "关闭窗口时");
+            ui.add_space(6.0);
+            let cur = self.gui.cfg.lock().unwrap().close_action.clone();
+            let opts: [(&str, &str); 3] = [
+                ("ask", "每次询问"),
+                ("tray", "最小化到托盘"),
+                ("close", "退出程序"),
+            ];
+            let mut cur_s = if cur.is_empty() { "ask".to_string() } else { cur.clone() };
+            if ui
+                .horizontal(|ui| {
+                    let mut changed = false;
+                    for (v, l) in opts {
+                        if ui.selectable_label(cur_s == v, l).clicked() {
+                            cur_s = v.to_string();
+                            changed = true;
+                        }
+                    }
+                    changed
+                })
+                .inner
+            {
+                let mut cfg = self.gui.cfg.lock().unwrap();
+                cfg.close_action = if cur_s == "ask" {
+                    String::new()
+                } else {
+                    cur_s.clone()
+                };
+                let _ = cfg.save();
+            }
+            ui.add_space(6.0);
+            adl_ui::widgets::hint(
+                ui,
+                "第一次点关闭会问一次并可以记住。选「最小化到托盘」下载继续跑；\
+                 选「退出程序」会先存进度，下次可续传。",
+            );
+        });
 
         ui.add_space(14.0);
         let mut save = false;
@@ -1005,10 +1662,20 @@ impl App {
     }
 
     fn page_plugin(&mut self, ui: &mut egui::Ui) {
-        let plugin = match self.tab.clone() {
-            Tab::Plugin(p, _) => p,
+        let (plugin, page) = match self.tab.clone() {
+            Tab::Plugin(p, g) => (p, g),
             _ => return,
         };
+
+        // 侧栏"插件设置"入口用的是伪页面 `adl` + `settings:<pluginId>`：
+        // 它不是插件自己渲染的页，而是宿主把该插件的 settings 项单独列出来。
+        if plugin == "adl" {
+            if let Some(pid) = page.strip_prefix("settings:") {
+                self.page_plugin_settings(ui, pid);
+                return;
+            }
+        }
+
         ui.add_space(2.0);
         let mut dispatch: Vec<Dispatch> = Vec::new();
         if self.plugin_view.is_none() {
@@ -1029,6 +1696,115 @@ impl App {
                 Dispatch::Action { plugin, action } => self.run_action(&plugin, &action),
                 Dispatch::Setting { plugin, key, value } => self.save_plugin_setting(&plugin, &key, &value),
             }
+        }
+    }
+
+    /// 单个插件的设置页（侧栏入口点进来的那个）。
+    fn page_plugin_settings(&mut self, ui: &mut egui::Ui, plugin_id: &str) {
+        ui.add_space(2.0);
+        let settings: Vec<Value> = self
+            .plugin_snapshot
+            .get("settings")
+            .and_then(|x| x.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter(|s| s.get("plugin").and_then(|x| x.as_str()) == Some(plugin_id))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if settings.is_empty() {
+            adl_ui::widgets::empty_state(ui, "这个插件没有声明可配置项。");
+            return;
+        }
+
+        let mut pending: Vec<(String, String, String)> = Vec::new();
+        adl_ui::widgets::card(ui, |ui| {
+            for s in &settings {
+                let plugin = s.get("plugin").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                let key = s.get("key").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                let label = s.get("label").and_then(|x| x.as_str()).unwrap_or(&key).to_string();
+                let kind = s.get("kind").and_then(|x| x.as_str()).unwrap_or("string").to_string();
+                let value = s
+                    .get("value")
+                    .and_then(|x| x.as_str())
+                    .map(|v| v.to_string())
+                    .or_else(|| s.get("default").and_then(|x| x.as_str()).map(|v| v.to_string()))
+                    .unwrap_or_default();
+                let editable = s.get("editable").and_then(|x| x.as_bool()).unwrap_or(false);
+                let note = s.get("note").and_then(|x| x.as_str()).map(|v| v.to_string());
+
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 12.0;
+                    adl_ui::widgets::label_cell(ui, 210.0, &label);
+                    adl_ui::widgets::cell(ui, 280.0, |ui| match kind.as_str() {
+                        "boolean" => {
+                            let mut b = value == "true";
+                            if ui
+                                .add_enabled(editable, egui::Checkbox::new(&mut b, ""))
+                                .changed()
+                            {
+                                pending.push((plugin.clone(), key.clone(), b.to_string()));
+                            }
+                        }
+                        "select" => {
+                            let opts: Vec<String> = s
+                                .get("options")
+                                .and_then(|x| x.as_array())
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(|o| o.as_str().map(|s| s.to_string()))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            let mut cur = value.clone();
+                            ui.add_enabled_ui(editable, |ui| {
+                                egui::ComboBox::from_id_salt(format!("page.{plugin}.{key}"))
+                                    .width(260.0)
+                                    .selected_text(cur.clone())
+                                    .show_ui(ui, |ui| {
+                                        for o in &opts {
+                                            ui.selectable_value(&mut cur, o.clone(), o.clone());
+                                        }
+                                    });
+                            });
+                            if cur != value {
+                                pending.push((plugin.clone(), key.clone(), cur));
+                            }
+                        }
+                        _ => {
+                            let buf = self
+                                .plugin_edit
+                                .entry((plugin.clone(), key.clone()))
+                                .or_insert_with(|| value.clone());
+                            if ui
+                                .add_enabled(
+                                    editable,
+                                    egui::TextEdit::singleline(buf).desired_width(260.0),
+                                )
+                                .changed()
+                            {
+                                pending.push((plugin.clone(), key.clone(), buf.clone()));
+                            }
+                        }
+                    });
+                    if !editable {
+                        adl_ui::widgets::hint(ui, "（信任模式下才可改）");
+                    }
+                });
+                if let Some(n) = note {
+                    ui.horizontal(|ui| {
+                        adl_ui::widgets::label_cell(ui, 210.0, "");
+                        adl_ui::widgets::hint(ui, &n);
+                    });
+                }
+                ui.add_space(8.0);
+            }
+        });
+
+        for (p, k, v) in pending {
+            self.save_plugin_setting(&p, &k, &v);
         }
     }
 
@@ -1670,6 +2446,38 @@ fn format_speed(bps: u64) -> String {
     }
 }
 
+/// 单位字符串 → 每个单位多少字节；`auto` 返回 0（表示让 `format_speed` 自己挑）。
+fn unit_scale_of(unit: &str) -> u32 {
+    match unit {
+        "B/s" => 1,
+        "KB/s" => 1024,
+        "MB/s" => 1024 * 1024,
+        "GB/s" => 1024 * 1024 * 1024,
+        _ => 0, // auto
+    }
+}
+
+/// 按用户选的单位显示速度。
+///
+/// 中文"兆字节/秒"读起来别扭，这里统一走 `MB/s` 这类英文单位；
+/// `auto` 时退化为自适应（沿用 `format_speed`）。
+fn format_speed_unit(bps: u64, unit: &str) -> String {
+    if bps == 0 {
+        return "0 B/s".to_string();
+    }
+    match unit_scale_of(unit) {
+        0 => format_speed(bps),
+        scale => {
+            let v = bps as f64 / scale as f64;
+            if scale == 1 {
+                format!("{bps} B/s")
+            } else {
+                format!("{v:.1} {}", unit)
+            }
+        }
+    }
+}
+
 // ───────────────────────── 与后端交互（复用原有逻辑） ─────────────────────────
 
 fn plugins_root(cfg: &Config) -> Option<PathBuf> {
@@ -1872,6 +2680,7 @@ pub(crate) fn add_task(gui: &Arc<Gui>, args: &Value) -> Result<Value, String> {
             completed: 0,
             total: 0,
             speed: 0,
+            connections: 0,
             path: None,
             error: None,
             handle: None,
@@ -1893,6 +2702,7 @@ pub(crate) fn add_task(gui: &Arc<Gui>, args: &Value) -> Result<Value, String> {
                         t.completed = p.completed;
                         t.total = p.total;
                         t.speed = p.speed_bps;
+                        t.connections = p.connections;
                     }
                 }
             }
@@ -1909,10 +2719,12 @@ pub(crate) fn add_task(gui: &Arc<Gui>, args: &Value) -> Result<Value, String> {
                     t.total = r.total;
                     t.path = Some(r.path.to_string_lossy().to_string());
                     t.speed = r.speed_bps();
+                    t.connections = 0;
                 }
                 Err(e) => {
                     t.status = "failed".into();
                     t.error = Some(e.to_string());
+                    t.connections = 0;
                 }
             }
         }

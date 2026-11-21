@@ -616,7 +616,7 @@ pub async fn download(
                             last_any_progress = now;
                         }
                         hard_failures = 0;
-                        emit_progress(&table, total, &speed, &hooks, &on_progress);
+                        emit_progress(&table, total, &speed, active.len(), &hooks, &on_progress);
                         if newly > 0 || last_save.elapsed() >= Duration::from_secs(2) {
                             cf.update_from(&table);
                             let _ = cf.save(&target_path);
@@ -641,7 +641,7 @@ pub async fn download(
                         cf.update_from(&table);
                         let _ = cf.save(&target_path);
                         last_save = Instant::now();
-                        emit_progress(&table, total, &speed, &hooks, &on_progress);
+                        emit_progress(&table, total, &speed, active.len(), &hooks, &on_progress);
                     }
 
                     WorkerEvent::Stopped { id, token, written } => {
@@ -652,7 +652,7 @@ pub async fn download(
                         cf.update_from(&table);
                         let _ = cf.save(&target_path);
                         last_save = Instant::now();
-                        emit_progress(&table, total, &speed, &hooks, &on_progress);
+                        emit_progress(&table, total, &speed, active.len(), &hooks, &on_progress);
                     }
 
                     WorkerEvent::Failed { id, token, error } => {
@@ -757,7 +757,7 @@ pub async fn download(
                     }
                 }
 
-                emit_progress(&table, total, &speed, &hooks, &on_progress);
+                emit_progress(&table, total, &speed, active.len(), &hooks, &on_progress);
                 if last_save.elapsed() >= Duration::from_secs(2) {
                     cf.update_from(&table);
                     let _ = cf.save(&target_path);
@@ -1126,6 +1126,7 @@ async fn download_unknown_length(
                 completed: total,
                 total: 0,
                 speed_bps: speed_tracker.bps(),
+                connections: 1,
             };
             hooks.on_progress(p);
             if let Some(cb) = &on_progress {
@@ -1184,6 +1185,7 @@ fn emit_progress(
     table: &SegmentTable,
     total: u64,
     speed: &SpeedTracker,
+    conns: usize,
     hooks: &Arc<dyn Hooks>,
     cb: &Option<ProgressFn>,
 ) {
@@ -1191,6 +1193,7 @@ fn emit_progress(
         completed: table.completed(),
         total,
         speed_bps: speed.bps(),
+        connections: conns as u32,
     };
     hooks.on_progress(p);
     if let Some(f) = cb {
