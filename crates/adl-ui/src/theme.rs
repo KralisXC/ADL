@@ -264,6 +264,19 @@ impl Theme {
         style.spacing.interact_size.y = 30.0;
         style.spacing.scroll.bar_width = 10.0;
 
+        // 动画时长：egui 自带用它做 hover / 展开 / 折叠的插值。
+        // 默认 0.2 在这个界面上偏"拖"，0.14 更利落但仍能看清过渡。
+        style.animation_time = 0.14;
+
+        // 关掉"点住文字就能拖选"的网页式行为。
+        //
+        // egui 默认把每个 `Label` 都做成可选中，桌面上这是反直觉的：点一下
+        // 任务名会留下一条蓝色选区，而且框选时会把整屏文字连成一片。这里
+        // 全局关掉，只对真正需要复制的内容（插件渲染器的 `code` / `copy`）
+        // 用 `Label::selectable(true)` 单独放开。
+        style.interaction.selectable_labels = false;
+        style.interaction.multi_widget_text_select = false;
+
         style
             .text_styles
             .insert(TextStyle::Body, FontId::proportional(t.body));

@@ -1,4 +1,4 @@
-//! ADL 图形界面：纯 Rust 原生 UI（egui / eframe），**不依赖 WebView2**。
+﻿//! ADL 图形界面：纯 Rust 原生 UI（egui / eframe），**不依赖 WebView2**。
 //! 跨平台：Windows / Linux / macOS 均可编译运行。
 //!
 //! 本文件只负责“壳”（窗口与交互）；下载引擎在 `adl-core`，插件在 `adl-plugin`，
@@ -145,12 +145,95 @@ struct App {
     maximized: bool,
     /// "正在退出"闸门：用户确认退出后放行 Close，避免被自己的关闭拦截挡回去。
     closing: bool,
+    /// 弹窗淡入计时器
+    fade: Fade,
 }
 
 /// 首次点关闭时问用户"退出还是最小化"。
 struct CloseAsk {
     /// 勾选"记住我的选择"
     remember: bool,
+}
+
+/// 按比例缩放一个颜色的 alpha（保留 RGB）。
+///
+/// 不能直接用 `gamma_multiply`：它把 RGB 也一起乘，白色卡片淡到一半会变成
+/// **灰色**卡片，看起来像蒙了层脏东西，而不是"半透明地浮出来"。
+fn fade_color(c: egui::Color32, a: f32) -> egui::Color32 {
+    let a = (c.a() as f32 * a.clamp(0.0, 1.0)).round() as u8;
+    egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
+}
+
+/// 弹窗淡入用的 `Frame`：底色 / 描边 / 阴影一起跟着 `a` 走。
+///
+/// 为什么要显式给 `Modal` 传 frame：`Modal` 内部是 `Frame::popup(style)` 在
+/// **内容画完之后**才 `paint` 卡片，`ui.set_opacity` 只影响"之后画的图元"，
+/// 管不到它。不这么写的话，文字在淡入、白卡却是"啪"地一下出现的。
+fn fade_frame(ctx: &egui::Context, a: f32) -> egui::Frame {
+    // `Context` 没有 `style()`，只有按主题取的 `style_of`；本项目 Light/Dark
+    // 装的是同一份样式，取 Light 即可。
+    let mut f = egui::Frame::popup(&ctx.style_of(egui::Theme::Light));
+    f.fill = fade_color(f.fill, a);
+    f.stroke.color = fade_color(f.stroke.color, a);
+    f.shadow.color = fade_color(f.shadow.color, a);
+    f
+}
+
+/// 弹窗淡入时长（秒）。0.14 和 `style.animation_time` 对齐，切换时不打架。
+const FADE_SECS: f32 = 0.14;
+
+/// 状态提示条显示时长与"末尾淡出"区间。
+const STATUS_SECS: f32 = 6.0;
+const STATUS_FADE: f32 = 0.45;
+
+/// 弹窗淡入计时器。
+///
+/// 为什么不用 `ctx.animate_bool`：egui 的动画管理器在**首次**遇到某个 id 时
+/// 直接把 `last_value` 初始化成目标值并原样返回，也就是"第一帧就是全不透明"，
+/// 根本不会播动画（`animation_manager.rs` 里 `None => insert(...); end`）。
+/// 弹窗恰恰每次都换 id、每帧只在打开期间存在，正好踩中这个分支。
+///
+/// 所以这里自己记时间戳：overlay 身份一变就重置起点，`alpha()` 按经过时间
+/// 给出 0→1 的缓出曲线。
+struct Fade {
+    /// 当前 overlay 的身份（0 = 没有弹窗，1/2/3 = 添加/关闭/命令面板）
+    key: u8,
+    /// 淡入起点
+    start: Option<Instant>,
+}
+
+impl Default for Fade {
+    fn default() -> Self {
+        Self {
+            key: 0,
+            start: None,
+        }
+    }
+}
+
+impl Fade {
+    /// 每帧绘制前调用：overlay 换了就重置起点。
+    fn track(&mut self, key: u8) {
+        if self.key != key {
+            self.key = key;
+            self.start = if key == 0 { None } else { Some(Instant::now()) };
+        }
+    }
+
+    /// 0.0（刚打开）→ 1.0（完全不透明），`dur` 秒内走完，缓出曲线。
+    fn alpha(&self, dur: f32) -> f32 {
+        let Some(t0) = self.start else {
+            return 1.0;
+        };
+        let t = (t0.elapsed().as_secs_f32() / dur.max(0.001)).clamp(0.0, 1.0);
+        // 缓出：开头快、结尾慢，观感比线性"软"。
+        1.0 - (1.0 - t) * (1.0 - t)
+    }
+
+    /// 是否还在淡入（用来决定要不要继续请求重绘）。
+    fn running(&self, dur: f32) -> bool {
+        self.start.is_some() && self.alpha(dur) < 1.0
+    }
 }
 
 impl App {
@@ -219,7 +302,8 @@ impl App {
             cmd_query: String::new(),
             _tray: tray,
             maximized: false,
-        closing: false,
+            closing: false,
+            fade: Fade::default(),
         }
     }
 
@@ -517,14 +601,22 @@ impl eframe::App for App {
         }
 
         // 状态提示条（6 秒后消失）——放在外壳正上方，不参与圆角
+        //
+        // 最后 0.45 秒做淡出，否则一条通栏色带会"啪"地消失，很突兀。
+        // 淡出期间继续请求重绘，不然静止的窗口只会重绘一次就停住。
         if let Some((msg, err, at)) = &self.status {
-            if at.elapsed() < Duration::from_secs(6) {
+            let el = at.elapsed().as_secs_f32();
+            if el < STATUS_SECS {
                 let p = pal();
                 let (color, fill) = if *err {
                     (p.danger, p.err_bg)
                 } else {
                     (egui::Color32::from_rgb(0x2E, 0x7D, 0x6B), p.ok_bg)
                 };
+                let alpha = ((STATUS_SECS - el) / STATUS_FADE).clamp(0.0, 1.0);
+                if alpha < 1.0 {
+                    ctx.request_repaint();
+                }
                 let text = msg.clone();
                 let is_err = *err;
                 egui::Panel::top("adl_statusbar")
@@ -532,10 +624,11 @@ impl eframe::App for App {
                     .show_separator_line(false)
                     .frame(
                         egui::Frame::new()
-                            .fill(fill)
+                            .fill(fill.gamma_multiply(alpha))
                             .inner_margin(egui::Margin::symmetric(20, 6)),
                     )
                     .show(ui, |ui| {
+                        ui.set_opacity(alpha);
                         ui.horizontal(|ui| {
                             ui.colored_label(color, if is_err { "!" } else { "OK" });
                             ui.colored_label(color, text);
@@ -568,6 +661,21 @@ impl eframe::App for App {
                         }
                     });
             });
+
+        // 弹窗淡入：先根据"当前开着哪个 overlay"确定身份，再决定透明度。
+        let overlay = if self.add_open {
+            1
+        } else if self.close_ask.is_some() {
+            2
+        } else if self.cmd_open {
+            3
+        } else {
+            0
+        };
+        self.fade.track(overlay);
+        if self.fade.running(FADE_SECS) {
+            ctx.request_repaint();
+        }
 
         // 添加下载弹窗
         if self.add_open {
@@ -1147,7 +1255,14 @@ impl App {
         let mut start = false;
         let mut cancel = false;
 
-        let resp = egui::Modal::new(egui::Id::unique("adl_add_modal")).show(ctx, |ui| {
+        let a = self.fade.alpha(FADE_SECS);
+        let resp = egui::Modal::new(egui::Id::unique("adl_add_modal"))
+            .frame(fade_frame(ctx, a))
+            .show(ctx, |ui| {
+            // 淡入：`Modal` 自己没有透明度参数，而且背板是在 `Area::show` 里
+            // 最先画的（`set_opacity` 只影响之后画的图元），所以这里只能让
+            // 内容本身淡入 —— 观感上足够了，背板瞬间变暗反而像"已经打开"。
+            ui.set_opacity(a);
             ui.set_width(520.0);
             adl_ui::widgets::section_title(ui, "新建下载");
             ui.add_space(12.0);
@@ -1206,7 +1321,11 @@ impl App {
         let mut choice: Option<&str> = None;
         let mut cancel = false;
 
-        let resp = egui::Modal::new(egui::Id::unique("adl_close_modal")).show(ctx, |ui| {
+        let a = self.fade.alpha(FADE_SECS);
+        let resp = egui::Modal::new(egui::Id::unique("adl_close_modal"))
+            .frame(fade_frame(ctx, a))
+            .show(ctx, |ui| {
+            ui.set_opacity(a);
             ui.set_width(400.0);
             adl_ui::widgets::section_title(ui, "关闭窗口时怎么做？");
             ui.add_space(10.0);
@@ -1828,6 +1947,7 @@ impl App {
             .anchor(egui::Align2::CENTER_TOP, [0.0, 120.0])
             .open(&mut open)
             .show(ctx, |ui| {
+                ui.set_opacity(self.fade.alpha(FADE_SECS));
                 ui.add(
                     egui::TextEdit::singleline(&mut self.cmd_query)
                         .hint_text("搜索命令…")
@@ -2363,12 +2483,18 @@ fn render_node(ui: &mut egui::Ui, plugin: &str, node: &Value, out: &mut Vec<Disp
             });
         }
         "code" => {
-            // 等宽只读文本（日志/哈希）
-            ui.label(
-                egui::RichText::new(s_of(node, "value"))
-                    .monospace()
-                    .small()
-                    .color(pal().muted),
+            // 等宽只读文本（日志/哈希）。
+            //
+            // 全站默认关掉了"拖选文字"（见 `Theme::apply`），但哈希、日志、
+            // 错误堆栈这类内容用户真的会想复制，所以这里显式放开。
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(s_of(node, "value"))
+                        .monospace()
+                        .small()
+                        .color(pal().muted),
+                )
+                .selectable(true),
             );
         }
         "timestamp" => {
@@ -2383,11 +2509,14 @@ fn render_node(ui: &mut egui::Ui, plugin: &str, node: &Value, out: &mut Vec<Disp
             let btn = if label.is_empty() { "复制" } else { label };
             ui.horizontal(|ui| {
                 if !v.is_empty() {
-                    ui.label(
-                        egui::RichText::new(&v)
-                            .monospace()
-                            .small()
-                            .color(pal().muted),
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&v)
+                                .monospace()
+                                .small()
+                                .color(pal().muted),
+                        )
+                        .selectable(true),
                     );
                 }
                 if ui
