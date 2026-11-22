@@ -20,5 +20,5 @@ pub use theme::{Palette, Radius, Spacing, TextSize, Theme};
 pub use widgets::{
     ChipIcon, WindowButton, badge, card, cell, chip, empty_state, hairline, heatmap, hint,
     icon_chip, label_cell, mode_pill, nav_bar, nav_item, nav_item_anim, rule, section_title,
-    segmented, sidebar_toggle, small_button, stat_card, window_button,
+    segmented, sidebar_toggle, small_button, stat_card, switch, window_button,
 };

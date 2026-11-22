@@ -99,8 +99,80 @@ enum Tab {
     Plugins,
     /// 消息中心：下载完成 / 失败 / 插件通知留档在这里。
     Notices,
+    /// 终端：命令行界面，替代原来的 Ctrl+K 浮层命令面板。
+    ///
+    /// 做成独立页面而不是浮层，是因为浮层每次只活一次、没有历史，
+    /// 想翻上一条命令的输出就得重新跑一遍。终端页能留下滚动历史，
+    /// 也更接近用户熟悉的 PowerShell。
+    Terminal,
     Settings,
     Plugin(String, String),
+}
+
+/// 插件页的三个分段（对应 DSH 的"已安装 / 插件市场 / 发现"）。
+///
+/// "插件市场"和"发现"目前只有骨架：用户说以后要接自己的 GitHub 插件源，
+/// 先把入口和文案占住，免得以后加进来时整页要重排。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PluginsTab {
+    Installed,
+    Market,
+    Discover,
+}
+
+/// 终端里一行输出的级别（只影响颜色）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LineKind {
+    /// 用户敲的命令回显
+    Echo,
+    /// 正常输出
+    Out,
+    /// 提示 / 帮助
+    Info,
+    /// 错误
+    Err,
+}
+
+/// 终端页的状态：一屏历史 + 当前输入 + 上下翻历史。
+struct Terminal {
+    lines: Vec<(LineKind, String)>,
+    input: String,
+    /// 按 ↑ 翻的历史（最新的在末尾）
+    history: Vec<String>,
+    /// 当前翻到第几条；`None` = 正在编辑新行
+    hist_pos: Option<usize>,
+    /// 请求焦点：刚按 Ctrl+K 进来、或者执行完一条命令后，光标要留在输入框
+    focus: bool,
+}
+
+impl Default for Terminal {
+    fn default() -> Self {
+        let mut lines = Vec::new();
+        lines.push((
+            LineKind::Info,
+            "ADL 终端 · 输入 help 看可用命令，↑/↓ 翻历史，Esc 清空输入".to_string(),
+        ));
+        Self {
+            lines,
+            input: String::new(),
+            history: Vec::new(),
+            hist_pos: None,
+            focus: false,
+        }
+    }
+}
+
+impl Terminal {
+    fn push(&mut self, kind: LineKind, text: impl Into<String>) {
+        for line in text.into().lines() {
+            self.lines.push((kind, line.to_string()));
+        }
+        // 只留最近 500 行：终端页没有分页，多了就纯占内存。
+        if self.lines.len() > 500 {
+            let cut = self.lines.len() - 500;
+            self.lines.drain(0..cut);
+        }
+    }
 }
 
 /// 主页热力图的时间跨度。
@@ -149,8 +221,10 @@ struct App {
     wake: Arc<AtomicBool>,
     suspend: Arc<AtomicBool>,
     resume: Arc<AtomicBool>,
-    cmd_open: bool,
-    cmd_query: String,
+    /// 终端页状态（Ctrl+K 进入）
+    term: Terminal,
+    /// 插件页当前分段（已安装 / 插件市场 / 发现）
+    plugins_tab: PluginsTab,
     // 托盘图标：持有即可保活（Windows 上 tray-icon 自己带消息线程）
     _tray: Option<TrayIcon>,
     // 自绘标题栏用的最大化状态（从 ViewportInfo 同步，点击时本地翻转以即时响应）
@@ -210,8 +284,14 @@ const FADE_SECS: f32 = 0.14;
 /// 侧栏竖条跨行滑动时长。比弹窗稍长一点，滑得太快就看不出"滑"了。
 const NAV_SLIDE_SECS: f32 = 0.18;
 
-/// 选中底色从左到右擦入的时长，也用于页面内容的下刷淡入。
+/// 选中底色淡入的时长，也用于页面内容的下刷淡入。
 const NAV_FILL_SECS: f32 = 0.16;
+
+/// 侧栏收起 / 展开的时长。
+///
+/// 比换页动效长一些：位移 212px 这种幅度，0.16 秒看完只会觉得"闪了一下"，
+/// 0.22 秒才看得出是"被推出去"。
+const SIDEBAR_SECS: f32 = 0.22;
 
 /// 状态提示条显示时长与"末尾淡出"区间。
 const STATUS_SECS: f32 = 6.0;
@@ -289,7 +369,7 @@ impl App {
 
         let cfg = gui.cfg.lock().unwrap().clone();
         // ADL_TAB 仅用于开发/截图脚本直达某个页面，不写进文档：
-        //   home | tasks | plugins | notices | settings | add | plugin:<pluginId>:<pageId>
+        //   home | tasks | plugins | notices | terminal | settings | add | plugin:<pluginId>:<pageId>
         // `add` 现在打开弹窗而不是切页。
         let mut add_open = false;
         let initial_tab = match std::env::var("ADL_TAB").unwrap_or_default().as_str() {
@@ -300,6 +380,7 @@ impl App {
             "home" => Tab::Home,
             "plugins" => Tab::Plugins,
             "notices" => Tab::Notices,
+            "terminal" => Tab::Terminal,
             "settings" => Tab::Settings,
             s if s.starts_with("plugin:") => {
                 let mut it = s.trim_start_matches("plugin:").splitn(2, ':');
@@ -337,8 +418,8 @@ impl App {
             wake,
             suspend,
             resume,
-            cmd_open: false,
-            cmd_query: String::new(),
+            term: Terminal::default(),
+            plugins_tab: PluginsTab::Installed,
             _tray: tray,
             maximized: false,
             closing: false,
@@ -487,22 +568,6 @@ impl App {
         }
     }
 
-    fn run_command(&mut self, plugin: &str, command: &str) {
-        let hooks = self.gui.hooks.lock().unwrap().clone();
-        match hooks.run_command(plugin, command) {
-            Some(v) => {
-                let msg = v
-                    .get("message")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("命令已执行")
-                    .to_string();
-                self.set_status(msg, false);
-            }
-            None => self.set_status("插件命令不可用（需要 trusted 模式）", true),
-        }
-        self.cmd_open = false;
-    }
-
     fn save_plugin_setting(&mut self, plugin: &str, key: &str, value: &str) {
         if let Err(e) = save_plugin_setting(plugin, key, value) {
             self.set_status(e, true);
@@ -636,9 +701,17 @@ impl eframe::App for App {
             }
         }
 
-        // Ctrl+K 命令面板
+        // Ctrl+K：跳到终端页（不再是浮层命令面板）。
+        //
+        // 再按一次回到原来的页面 —— 但只在"当前就在终端"时才回退，
+        // 否则从别的页面按 Ctrl+K 会被误判成"关闭终端"而什么也没发生。
         if ctx.input(|i| i.key_pressed(egui::Key::K) && i.modifiers.ctrl) {
-            self.cmd_open = !self.cmd_open;
+            if self.tab == Tab::Terminal {
+                self.tab = Tab::Tasks;
+            } else {
+                self.tab = Tab::Terminal;
+                self.term.focus = true;
+            }
         }
 
         self.refresh_plugin_snapshot();
@@ -663,19 +736,49 @@ impl eframe::App for App {
         //
         // 一开始做成"收窄到 56px 只剩首字"，实测那样很怪（首字导航既认不出
         // 也不好看）。现在收起 = 真的不要侧栏，重新展开靠标题栏最左上角那个
-        // 汉堡键。
+        // 折叠键。
         //
-        // 换页进度在这里算（而不是在 `sidebar` 里），因为侧栏收起时页面照样
-        // 要下刷 —— 时钟必须独立于侧栏是否存在。
+        // 但"硬切"会闪一下：侧栏整块消失的同时外壳横移 212px，观感像窗口
+        // 抖了一下。所以宽度改成插值 —— 面板一直存在，只是 `exact_size`
+        // 从 `sidebar_w()` 收到 0。
+        //
+        // 关键：**面板内容按原宽排版、靠裁剪裁掉溢出**。如果让宽度真去挤压
+        // 内部布局，导航文字会在中途换行、按钮被压扁，动起来像坏的。
+        //
+        // 换页进度也在这一层算（而不是在 `sidebar` 里），因为侧栏收起时页面
+        // 照样要下刷 —— 时钟必须独立于侧栏是否存在。
         self.page_fill = self.tick_page(&ctx);
 
-        if !self.sidebar_collapsed {
+        let target_w = if self.sidebar_collapsed { 0.0 } else { sidebar_w() };
+        let mut w = ctx.animate_value_with_time(
+            egui::Id::unique("adl_sidebar_width"),
+            target_w,
+            SIDEBAR_SECS,
+        );
+        // `animate_value_with_time` 在动画结束后仍返回目标值，这里夹一下防止
+        // 浮点残留让面板留一条 0.4px 的缝。
+        if (w - target_w).abs() < 0.5 {
+            w = target_w;
+        } else {
+            ctx.request_repaint();
+        }
+        if w > 0.5 {
+            let reveal = (w / sidebar_w()).clamp(0.0, 1.0);
             egui::Panel::left("adl_sidebar")
-                .exact_size(sidebar_w())
+                .exact_size(w)
                 .resizable(false)
                 .show_separator_line(false)
                 .frame(sidebar_frame())
-                .show(ui, |ui| self.sidebar(ui));
+                .show(ui, |ui| {
+                    // 裁剪 + 定宽：内容始终按完整侧栏宽排版，多出来的部分被
+                    // 面板边缘切掉，于是看起来像"侧栏被推出去/拉进来"。
+                    ui.set_clip_rect(ui.max_rect());
+                    ui.set_width(sidebar_w());
+                    // 宽度只剩一半时内容还完整，只用透明度跟着收，避免
+                    // 出现"半截文字卡在边上"。
+                    ui.set_opacity((reveal * 1.6).clamp(0.0, 1.0));
+                    self.sidebar(ui);
+                });
         }
 
         // 状态提示条（6 秒后消失）——放在外壳正上方，不参与圆角
@@ -738,6 +841,13 @@ impl eframe::App for App {
                 }
                 ui.scope(|ui| {
                     ui.set_opacity(pf);
+                    if self.tab == Tab::Terminal {
+                        // 终端自己管滚动、高度钉满视口：外面再套一层页面
+                        // ScrollArea 的话，`PS>` 输入行会被视口边界切掉一半
+                        // （终端的输入框必须永远停在看得见的地方）。
+                        self.page_terminal(ui);
+                        return;
+                    }
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
@@ -747,6 +857,7 @@ impl eframe::App for App {
                                 Tab::Tasks => self.page_tasks(ui),
                                 Tab::Plugins => self.page_plugins(ui),
                                 Tab::Notices => self.page_notices(ui),
+                                Tab::Terminal => self.page_terminal(ui),
                                 Tab::Settings => self.page_settings(ui),
                                 Tab::Plugin(_, _) => self.page_plugin(ui),
                             }
@@ -772,8 +883,6 @@ impl eframe::App for App {
             1
         } else if self.close_ask.is_some() {
             2
-        } else if self.cmd_open {
-            3
         } else {
             0
         };
@@ -790,11 +899,6 @@ impl eframe::App for App {
         // 关闭行为首次询问
         if self.close_ask.is_some() {
             self.show_close_modal(&ctx);
-        }
-
-        // 命令面板
-        if self.cmd_open {
-            self.show_command_palette(&ctx);
         }
 
         ctx.request_repaint_after(Duration::from_millis(250));
@@ -867,6 +971,12 @@ impl App {
         if track(ui, self.tab == Tab::Notices, &label) {
             self.tab = Tab::Notices;
         }
+        ui.add_space(2.0);
+        // 终端：原 Ctrl+K 命令面板改成的独立页面，有滚动历史。
+        if track(ui, self.tab == Tab::Terminal, "终端") {
+            self.tab = Tab::Terminal;
+            self.term.focus = true;
+        }
 
         // ── 插件：页面 + 最多 5 个设置入口，超出的走"更多设置" ──
         let pages = self
@@ -892,11 +1002,14 @@ impl App {
         let has_more = setting_plugins.len() > shown;
 
         if !pages.is_empty() || !setting_plugins.is_empty() {
-            ui.add_space(14.0);
-            // 分组标题叫"插件页面"而不是"插件"：上面那个常驻导航项已经叫
-            // "插件"了，两个同名会让人以为是同一个入口。
-            ui.label(egui::RichText::new("插件页面").size(11.5).color(muted()));
-            ui.add_space(6.0);
+            // 分隔只留一条极淡的线，不再写"插件页面"这种小字分组标题。
+            //
+            // 原来那行灰色小字既难看清，又把插件页压成了"二级入口"，而用户
+            // 的心智是"插件页也是页面"，与主页/任务列表平级。现在插件声明的
+            // 页面直接排进主导航，靠一条 `hairline` 做视觉分隔就够了。
+            ui.add_space(10.0);
+            adl_ui::widgets::hairline(ui);
+            ui.add_space(8.0);
             for p in pages {
                 let plugin = p
                     .get("plugin")
@@ -944,8 +1057,9 @@ impl App {
             .unwrap_or(false);
         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
             ui.add_space(2.0);
+            // 提示里别再写"命令面板"：那已经是终端页了，键位还是 Ctrl+K。
             ui.label(
-                egui::RichText::new("Ctrl+K 命令面板")
+                egui::RichText::new("Ctrl+K 终端")
                     .size(11.0)
                     .color(muted()),
             );
@@ -1027,6 +1141,7 @@ impl App {
             Tab::Tasks => "任务列表".to_string(),
             Tab::Plugins => "插件".to_string(),
             Tab::Notices => "消息".to_string(),
+            Tab::Terminal => "终端".to_string(),
             Tab::Settings => "设置".to_string(),
             Tab::Plugin(plugin, page) => {
                 // 插件设置伪页面：`adl` + `settings:<pluginId>`
@@ -1090,17 +1205,9 @@ impl App {
             let _ = cfg.save();
         }
 
-        // 侧栏隐藏时品牌字会跟着消失，所以在标题栏里补一个 "ADL"。
-        // 侧栏显示时不画 —— 否则顶部会出现两个 ADL。
-        if self.sidebar_collapsed {
-            ui.painter().text(
-                egui::pos2(toggle_rect.right() + 10.0, cy),
-                egui::Align2::LEFT_CENTER,
-                "ADL",
-                egui::FontId::proportional(14.0),
-                teal(),
-            );
-        }
+        // 侧栏收起后标题栏不再补画 "ADL"（用户要求）。
+        // 收起时整个界面只剩折叠键与窗口三键，品牌字跟着侧栏一起消失，
+        // 这样"收起"才是真的收干净，而不是换个地方继续占位。
 
         // 右侧三个窗口按钮，从右缘往左排
         let bw = 46.0;
@@ -2010,6 +2117,40 @@ impl App {
         }
         let mut open_dir = false;
         let mut refresh = false;
+        let mut add_clicked = false;
+        let mut open_market_cfg = false;
+
+        // ── 顶部：说明 + 右侧动作（DSH 那种排布）──
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("安装、启用和配置插件")
+                    .small()
+                    .color(muted()),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("+ 添加插件").clicked() {
+                    add_clicked = true;
+                }
+                if ui.button("刷新").clicked() {
+                    refresh = true;
+                }
+            });
+        });
+        ui.add_space(10.0);
+
+        // ── 三段切换 ──
+        let tabs = [
+            (PluginsTab::Installed, "已安装"),
+            (PluginsTab::Market, "插件市场"),
+            (PluginsTab::Discover, "发现"),
+        ];
+        if let Some(t) = adl_ui::widgets::segmented(ui, self.plugins_tab, &tabs) {
+            self.plugins_tab = t;
+        }
+        ui.add_space(12.0);
+
+        match self.plugins_tab {
+            PluginsTab::Installed => {
         adl_ui::widgets::card(ui, |ui| {
             adl_ui::widgets::section_title(ui, "插件目录");
             ui.add_space(4.0);
@@ -2120,6 +2261,16 @@ impl App {
                     if has_ui {
                         adl_ui::widgets::badge(ui, "有界面", pal().accent);
                     }
+                    // 开关放最右：和 DSH 的插件页一致（名称在左、开关在右），
+                    // 一排扫下去就能看出哪些开着。
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if adl_ui::widgets::switch(ui, enabled).clicked() {
+                                toggle = Some((id.to_string(), !enabled));
+                            }
+                        },
+                    );
                 });
 
                 if !desc.is_empty() {
@@ -2163,13 +2314,6 @@ impl App {
                     });
                 }
 
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    let label = if enabled { "停用" } else { "启用" };
-                    if ui.button(label).clicked() {
-                        toggle = Some((id.to_string(), !enabled));
-                    }
-                });
             });
             ui.add_space(8.0);
         }
@@ -2194,6 +2338,78 @@ impl App {
                     },
                     false,
                 );
+            }
+        }
+            }
+            PluginsTab::Market => {
+                // 插件市场目前是空壳：源地址还没定（用户计划接自己的 GitHub
+                // 仓库），所以这里只把"将来会有什么"说清楚，不做假列表 ——
+                // 假数据会让人以为已经能装了。
+                adl_ui::widgets::card(ui, |ui| {
+                    adl_ui::widgets::section_title(ui, "插件市场");
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "还没有配置插件市场源。\n\
+                             之后会接一个从 GitHub 拉取插件索引的官方源，在这里浏览并一键安装。",
+                        )
+                        .size(12.5)
+                        .color(muted()),
+                    );
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("来源配置").clicked() {
+                            // 现在唯一能配的"来源"就是本地插件目录，直接带用户去，
+                            // 比留一个点了没反应的按钮好。
+                            open_market_cfg = true;
+                        }
+                    });
+                    ui.add_space(8.0);
+                    adl_ui::widgets::hint(
+                        ui,
+                        "插件市场需要插件源索引（JSON）与签名校验，等官方源就绪后开放。",
+                    );
+                });
+            }
+            PluginsTab::Discover => {
+                adl_ui::widgets::card(ui, |ui| {
+                    adl_ui::widgets::section_title(ui, "发现");
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "这里以后会放编辑推荐和社区热门插件。\n\
+                             现在插件都是本地目录里的，没有在线榜单可看。",
+                        )
+                        .size(12.5)
+                        .color(muted()),
+                    );
+                    ui.add_space(10.0);
+                    adl_ui::widgets::hint(ui, "打开「已安装」可以管理本地插件。");
+                });
+            }
+        }
+
+        if open_market_cfg {
+            // 直接给本地插件目录：目前"来源"只有这一个。
+            if let Some(dir) = root.as_ref() {
+                if let Err(e) = platform::open_path(dir) {
+                    self.set_status(format!("打开目录失败: {e}"), true);
+                }
+            }
+        }
+        if add_clicked {
+            // 没有在线安装源，所以"添加插件"的实际含义就是：把插件文件夹拷进
+            // 目录里。这里直接把目录打开，并说清楚要拷什么。
+            if let Some(dir) = root.as_ref() {
+                match platform::open_path(dir) {
+                    Ok(()) => self.set_status(
+                        "已打开插件目录：把含 plugin.toml 的文件夹放进去，再点「刷新」",
+                        false,
+                    ),
+                    Err(e) => self.set_status(format!("打开目录失败: {e}"), true),
+                }
+            } else {
+                self.set_status("还没配置插件目录，先去设置里填一个", true);
             }
         }
     }
@@ -2396,6 +2612,509 @@ impl App {
         }
     }
 
+    /// 终端页：一个能留历史的命令行（取代原来的 Ctrl+K 浮层命令面板）。
+    ///
+    /// 为什么做成页面而不是浮层：浮层关掉就没了，想翻上一条命令的输出只能
+    /// 重跑；而且用户明确说想要"终端那种（win 的 powershell）"。
+    fn page_terminal(&mut self, ui: &mut egui::Ui) {
+        // 终端配色不走主题：这是"深色控制台"这一个孤岛，主题是浅色的。
+        let bg = egui::Color32::from_rgb(0x1B, 0x21, 0x20);
+        let border = egui::Color32::from_rgb(0x2E, 0x37, 0x35);
+        let ink_out = egui::Color32::from_rgb(0xD6, 0xDC, 0xDA);
+        let ink_info = egui::Color32::from_rgb(0x86, 0x95, 0x92);
+        let ink_echo = egui::Color32::from_rgb(0x7A, 0xC8, 0xB4);
+        let ink_err = egui::Color32::from_rgb(0xE3, 0x86, 0x86);
+        let color_of = |k: LineKind| match k {
+            LineKind::Echo => ink_echo,
+            LineKind::Out => ink_out,
+            LineKind::Info => ink_info,
+            LineKind::Err => ink_err,
+        };
+
+        // 大框占满可用高度，输入行钉在底部 —— 就像真的终端。
+        //
+        // 高度要先把 Frame 的内边距（symmetric(14,10) → 上下各 10）扣掉，
+        // 否则内容比框高 20px，`PS>` 那一行会被裁在框外看不见。
+        let full_h = ui.available_height().max(200.0);
+        let inner_h = (full_h - 20.0).max(160.0);
+        let input_h = 30.0;
+        let log_h = (inner_h - input_h - 6.0).max(120.0);
+
+        let mut submit = false;
+
+        egui::Frame::new()
+            .fill(bg)
+            .stroke(egui::Stroke::new(1.0, border))
+            .corner_radius(egui::CornerRadius::same(10))
+            .inner_margin(egui::Margin::symmetric(14, 10))
+            .show(ui, |ui| {
+                ui.set_height(inner_h);
+
+                // ── 历史输出 ──
+                egui::ScrollArea::vertical()
+                    .id_salt("adl_term_log")
+                    .max_height(log_h)
+                    .auto_shrink([false, false])
+                    // 新输出总是把视图顶到底部，省得每次执行完还要手动滚
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        for (kind, text) in &self.term.lines {
+                            match kind {
+                                LineKind::Echo => {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                        ui.label(
+                                            egui::RichText::new(">")
+                                                .monospace()
+                                                .size(12.5)
+                                                .color(ink_info),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(text)
+                                                .monospace()
+                                                .size(12.5)
+                                                .color(ink_echo),
+                                        );
+                                    });
+                                }
+                                k => {
+                                    let c = color_of(*k);
+                                    ui.label(
+                                        egui::RichText::new(text).monospace().size(12.5).color(c),
+                                    );
+                                }
+                            }
+                        }
+                    });
+
+                // ── 输入行 ──
+                ui.add_space(6.0);
+                // Enter 必须在建 TextEdit **之前**读：单行 TextEdit 收到回车
+                // 会 `consume_key(Enter)` 并 surrender_focus，等它返回之后
+                // 再 `key_pressed(Enter)` 永远是 false（实测第一次回车丢键）。
+                let (enter, up, down, esc) = ui.input(|i| {
+                    (
+                        i.key_pressed(egui::Key::Enter),
+                        i.key_pressed(egui::Key::ArrowUp),
+                        i.key_pressed(egui::Key::ArrowDown),
+                        i.key_pressed(egui::Key::Escape),
+                    )
+                });
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.label(
+                        egui::RichText::new("PS>")
+                            .monospace()
+                            .size(12.5)
+                            .color(ink_echo),
+                    );
+                    let te = ui.add(
+                        egui::TextEdit::singleline(&mut self.term.input)
+                            .font(egui::TextStyle::Monospace)
+                            .desired_width(f32::INFINITY)
+                            .text_color(ink_out)
+                            .background_color(egui::Color32::from_rgb(0x23, 0x2B, 0x29))
+                            .margin(egui::Margin::symmetric(8, 5))
+                            .hint_text(
+                                egui::RichText::new("输入 help 看命令").color(ink_info),
+                            ),
+                    );
+                    if self.term.focus {
+                        te.request_focus();
+                        self.term.focus = false;
+                    }
+                    // 只有输入框有焦点时才拦方向键/Esc，否则在别的页面按 ↑
+                    // 也会翻终端历史（虽然看不见，但会莫名其妙改掉输入）。
+                    // `lost_focus()` 也要算：回车那一帧焦点已经交还了。
+                    let active = te.has_focus() || te.lost_focus();
+                    if active {
+                        if esc {
+                            self.term.input.clear();
+                            self.term.hist_pos = None;
+                        }
+                        if up && !self.term.history.is_empty() {
+                            // 第一次按 ↑ 从最新一条往上翻；翻到头就停在最老那条。
+                            let next = match self.term.hist_pos {
+                                None => self.term.history.len() - 1,
+                                Some(0) => 0,
+                                Some(i) => i - 1,
+                            };
+                            self.term.hist_pos = Some(next);
+                            self.term.input = self.term.history[next].clone();
+                        }
+                        if down {
+                            match self.term.hist_pos {
+                                // 翻回底部 = 回到正在编辑的空行
+                                Some(i) if i + 1 >= self.term.history.len() => {
+                                    self.term.hist_pos = None;
+                                    self.term.input.clear();
+                                }
+                                Some(i) => {
+                                    self.term.hist_pos = Some(i + 1);
+                                    self.term.input = self.term.history[i + 1].clone();
+                                }
+                                None => {}
+                            }
+                        }
+                        if enter {
+                            submit = true;
+                        }
+                    }
+                });
+            });
+
+        if submit {
+            let line = self.term.input.trim().to_string();
+            self.term.input.clear();
+            self.term.hist_pos = None;
+            if !line.is_empty() {
+                self.term.history.push(line.clone());
+                self.term.push(LineKind::Echo, line.clone());
+                self.term_exec(&line);
+            }
+            // 执行完把光标留在输入框，连敲才顺手
+            self.term.focus = true;
+        }
+    }
+
+    /// 执行终端里的一行命令。
+    ///
+    /// 所有输出都写进 `self.term`（不弹 toast、不写状态条）—— 终端页自己
+    /// 就是输出面板，再飘一条 6 秒消失的提示反而找不到。
+    fn term_exec(&mut self, line: &str) {
+        let mut it = line.split_whitespace();
+        let cmd = it.next().unwrap_or("").to_ascii_lowercase();
+        let args: Vec<String> = it.map(|s| s.to_string()).collect();
+
+        match cmd.as_str() {
+            "help" | "?" | "" => {
+                self.term.push(
+                    LineKind::Info,
+                    "可用命令：\n\
+                     \x20 help                      显示这份帮助\n\
+                     \x20 clear                     清空屏幕\n\
+                     \x20 tasks [ls]                列出下载任务\n\
+                     \x20 add <url> [文件名]         新建下载\n\
+                     \x20 pause <id> | pause all    暂停\n\
+                     \x20 resume <id>               继续（按 URL 从控制文件续传）\n\
+                     \x20 rm <id>                   从列表移除（不删文件）\n\
+                     \x20 settings                  显示当前配置\n\
+                     \x20 set dir <路径>             改默认下载目录\n\
+                     \x20 set connections <1-64>    改并发上限\n\
+                     \x20 set limit <字节/秒，0=不限> 改限速\n\
+                     \x20 mode safe|trusted         切换插件模式\n\
+                     \x20 plugin list               列出插件\n\
+                     \x20 plugin run <插件> <命令>   跑插件命令（需 trusted）\n\
+                     \x20 open <id>                 在资源管理器里定位已下完的文件",
+                );
+            }
+            "clear" | "cls" => {
+                // 把开头的横幅留下，只清后面的输出 —— 清成全黑会让人以为卡死
+                self.term.lines.truncate(1);
+            }
+            "tasks" | "ls" => {
+                let tasks = snapshot(&self.gui);
+                if tasks.is_empty() {
+                    self.term.push(LineKind::Info, "还没有任务");
+                } else {
+                    let mut rows = String::new();
+                    for t in &tasks {
+                        let (label, _) = status_style(&t.status);
+                        let prog = if t.total > 0 {
+                            format!("{:.1}%", t.completed as f64 * 100.0 / t.total as f64)
+                        } else {
+                            "-".to_string()
+                        };
+                        rows.push_str(&format!(
+                            "  #{:<3} {:<6} {:>7}  {:<10}  {}\n",
+                            t.id,
+                            label,
+                            prog,
+                            format_speed(t.speed),
+                            display_name(t)
+                        ));
+                    }
+                    self.term.push(
+                        LineKind::Out,
+                        format!("  ID   状态      进度    速度        文件\n{rows}"),
+                    );
+                }
+            }
+            "add" => {
+                if args.is_empty() {
+                    self.term
+                        .push(LineKind::Err, "用法：add <url> [文件名]");
+                    return;
+                }
+                let mut payload = json!({ "url": args[0] });
+                if let Some(name) = args.get(1) {
+                    payload["out"] = json!(name);
+                }
+                match add_task(&self.gui, &payload) {
+                    Ok(v) => {
+                        let id = v.get("id").and_then(|x| x.as_u64()).unwrap_or(0);
+                        self.term
+                            .push(LineKind::Out, format!("已添加任务 #{id}：{}", args[0]));
+                    }
+                    Err(e) => self.term.push(LineKind::Err, format!("添加失败：{e}")),
+                }
+            }
+            "pause" => {
+                if args.first().map(|s| s.as_str()) == Some("all") {
+                    pause_all(&self.gui);
+                    self.term.push(LineKind::Out, "已暂停全部任务");
+                } else if let Some(id) = args.first().and_then(|s| s.parse::<u64>().ok()) {
+                    match pause_task(&self.gui, &json!({ "id": id })) {
+                        Ok(_) => self.term.push(LineKind::Out, format!("已暂停 #{id}")),
+                        Err(e) => self.term.push(LineKind::Err, e),
+                    }
+                } else {
+                    self.term.push(LineKind::Err, "用法：pause <id> | pause all");
+                }
+            }
+            "resume" => {
+                let Some(id) = args.first().and_then(|s| s.parse::<u64>().ok()) else {
+                    self.term.push(LineKind::Err, "用法：resume <id>");
+                    return;
+                };
+                let url = snapshot(&self.gui)
+                    .into_iter()
+                    .find(|t| t.id == id)
+                    .map(|t| t.url);
+                match url {
+                    None => self.term.push(LineKind::Err, format!("#{id} 不存在")),
+                    Some(url) => {
+                        // 续传走的是"重新 add 同一条 URL"：引擎会找到同名
+                        // `.adl` 控制文件，从断点接着下，而不是从头开始。
+                        match add_task(&self.gui, &json!({ "url": url })) {
+                            Ok(v) => {
+                                let nid =
+                                    v.get("id").and_then(|x| x.as_u64()).unwrap_or(0);
+                                self.term.push(
+                                    LineKind::Out,
+                                    format!("已继续 #{id}（新任务 #{nid}，从断点续传）"),
+                                );
+                            }
+                            Err(e) => self.term.push(LineKind::Err, format!("继续失败：{e}")),
+                        }
+                    }
+                }
+            }
+            "rm" => {
+                let Some(id) = args.first().and_then(|s| s.parse::<u64>().ok()) else {
+                    self.term.push(LineKind::Err, "用法：rm <id>");
+                    return;
+                };
+                match remove_task(&self.gui, &json!({ "id": id, "files": false })) {
+                    Ok(_) => self.term.push(LineKind::Out, format!("已移除 #{id}（文件保留）")),
+                    Err(e) => self.term.push(LineKind::Err, e),
+                }
+            }
+            "open" => {
+                let Some(id) = args.first().and_then(|s| s.parse::<u64>().ok()) else {
+                    self.term.push(LineKind::Err, "用法：open <id>");
+                    return;
+                };
+                let path = snapshot(&self.gui)
+                    .into_iter()
+                    .find(|t| t.id == id)
+                    .and_then(|t| t.path);
+                match path {
+                    Some(p) if std::path::Path::new(&p).exists() => {
+                        match platform::open_path(std::path::Path::new(&p)) {
+                            Ok(_) => self.term.push(LineKind::Out, format!("已打开 {p}")),
+                            Err(e) => self.term.push(LineKind::Err, format!("打开失败：{e}")),
+                        }
+                    }
+                    Some(p) => self
+                        .term
+                        .push(LineKind::Err, format!("文件还不存在：{p}")),
+                    None => self
+                        .term
+                        .push(LineKind::Err, format!("#{id} 还没落盘")),
+                }
+            }
+            "settings" => {
+                let cfg = self.gui.cfg.lock().unwrap().clone();
+                self.term.push(
+                    LineKind::Out,
+                    format!(
+                        "  下载目录  {}\n  并发上限  {}\n  限速      {}\n  代理      {}\n  插件模式  {}\n  插件目录  {}",
+                        cfg.dir,
+                        cfg.connections,
+                        if cfg.limit == 0 {
+                            "不限速".to_string()
+                        } else {
+                            format_speed(cfg.limit)
+                        },
+                        if cfg.proxy.is_empty() {
+                            "直连".to_string()
+                        } else {
+                            cfg.proxy.clone()
+                        },
+                        cfg.mode,
+                        if cfg.plugin_dir.is_empty() {
+                            "exe 同级 plugins".to_string()
+                        } else {
+                            cfg.plugin_dir.clone()
+                        },
+                    ),
+                );
+            }
+            "set" => {
+                let key = args.first().map(|s| s.to_ascii_lowercase()).unwrap_or_default();
+                let value = args.get(1).cloned().unwrap_or_default();
+                match key.as_str() {
+                    "dir" => {
+                        if value.is_empty() {
+                            self.term.push(LineKind::Err, "用法：set dir <路径>");
+                            return;
+                        }
+                        // `/` 统一换成 `\`：终端里手打路径常常是斜杠，
+                        // 而 Windows 上混着用会让后续 `PathBuf` 拼名字很别扭。
+                        let dir = value.replace('/', "\\");
+                        let mut cfg = self.gui.cfg.lock().unwrap();
+                        cfg.dir = dir.clone();
+                        let _ = cfg.save();
+                        drop(cfg);
+                        self.s_dir = dir.clone();
+                        self.term.push(LineKind::Out, format!("下载目录 → {dir}"));
+                    }
+                    "connections" | "conn" => {
+                        match value.parse::<usize>() {
+                            Ok(n) => {
+                                let n = adl_core::clamp_concurrency(n);
+                                let mut cfg = self.gui.cfg.lock().unwrap();
+                                cfg.connections = n;
+                                let _ = cfg.save();
+                                drop(cfg);
+                                self.s_conn = n as u64;
+                                self.term
+                                    .push(LineKind::Out, format!("并发上限 → {n}"));
+                            }
+                            Err(_) => self
+                                .term
+                                .push(LineKind::Err, "并发要填数字（1-64）"),
+                        }
+                    }
+                    "limit" => match value.parse::<u64>() {
+                        Ok(n) => {
+                            let mut cfg = self.gui.cfg.lock().unwrap();
+                            cfg.limit = n;
+                            let _ = cfg.save();
+                            drop(cfg);
+                            self.s_limit = n;
+                            self.term.push(
+                                LineKind::Out,
+                                if n == 0 {
+                                    "限速 → 不限速".to_string()
+                                } else {
+                                    format!("限速 → {}", format_speed(n))
+                                },
+                            );
+                        }
+                        Err(_) => self
+                            .term
+                            .push(LineKind::Err, "限速要填字节/秒（0 = 不限）"),
+                    },
+                    _ => self
+                        .term
+                        .push(LineKind::Err, "用法：set dir|connections|limit <值>"),
+                }
+            }
+            "mode" => {
+                let m = args.first().map(|s| s.to_ascii_lowercase()).unwrap_or_default();
+                if m != "safe" && m != "trusted" {
+                    self.term.push(LineKind::Err, "用法：mode safe | mode trusted");
+                    return;
+                }
+                let mut cfg = self.gui.cfg.lock().unwrap();
+                cfg.mode = m.clone();
+                let _ = cfg.save();
+                let new_cfg = cfg.clone();
+                drop(cfg);
+                *self.gui.hooks.lock().unwrap() = build_hooks(&new_cfg);
+                self.s_mode = m.clone();
+                self.plugin_snapshot_at = Instant::now() - Duration::from_secs(3600);
+                self.term.push(
+                    LineKind::Out,
+                    format!(
+                        "插件模式 → {m}{}",
+                        if m == "safe" {
+                            "（只读观察 / 拦截，Transform 类 hook 不生效）"
+                        } else {
+                            "（允许改写请求、注册按钮、替换页面）"
+                        }
+                    ),
+                );
+            }
+            "plugin" => {
+                let sub = args.first().map(|s| s.to_ascii_lowercase()).unwrap_or_default();
+                match sub.as_str() {
+                    "list" | "ls" => {
+                        let all = self
+                            .plugin_snapshot
+                            .get("all")
+                            .and_then(|x| x.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        if all.is_empty() {
+                            self.term.push(LineKind::Info, "没有插件");
+                        } else {
+                            let mut rows = String::new();
+                            for p in &all {
+                                let id = p.get("id").and_then(|x| x.as_str()).unwrap_or("?");
+                                let ver = p.get("version").and_then(|x| x.as_str()).unwrap_or("");
+                                let trusted = p
+                                    .get("trusted")
+                                    .and_then(|x| x.as_bool())
+                                    .unwrap_or(false);
+                                rows.push_str(&format!(
+                                    "  {:<26} {:<8} {}\n",
+                                    id,
+                                    ver,
+                                    if trusted { "信任" } else { "安全" }
+                                ));
+                            }
+                            self.term
+                                .push(LineKind::Out, format!("  插件                       版本     模式\n{rows}"));
+                        }
+                    }
+                    "run" => {
+                        let (Some(p), Some(c)) = (args.get(1), args.get(2)) else {
+                            self.term
+                                .push(LineKind::Err, "用法：plugin run <插件> <命令>");
+                            return;
+                        };
+                        let hooks = self.gui.hooks.lock().unwrap().clone();
+                        match hooks.run_command(p, c) {
+                            Some(v) => {
+                                let msg = v
+                                    .get("message")
+                                    .and_then(|x| x.as_str())
+                                    .unwrap_or("命令已执行")
+                                    .to_string();
+                                self.term.push(LineKind::Out, msg);
+                            }
+                            None => self.term.push(
+                                LineKind::Err,
+                                "命令不可用（要用 trusted 模式，且插件确实声明了该命令）",
+                            ),
+                        }
+                    }
+                    _ => self
+                        .term
+                        .push(LineKind::Err, "用法：plugin list | plugin run <插件> <命令>"),
+                }
+            }
+            other => self.term.push(
+                LineKind::Err,
+                format!("未知命令：{other}（输入 help 看可用命令）"),
+            ),
+        }
+    }
+
     fn page_plugin(&mut self, ui: &mut egui::Ui) {
         let (plugin, page) = match self.tab.clone() {
             Tab::Plugin(p, g) => (p, g),
@@ -2543,56 +3262,6 @@ impl App {
         }
     }
 
-    fn show_command_palette(&mut self, ctx: &egui::Context) {
-        let commands: Vec<(String, String, String)> = self
-            .plugin_snapshot
-            .get("commands")
-            .and_then(|x| x.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|c| {
-                        Some((
-                            c.get("plugin")?.as_str()?.to_string(),
-                            c.get("id")?.as_str()?.to_string(),
-                            c.get("title")?.as_str()?.to_string(),
-                        ))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let mut open = self.cmd_open;
-        let mut chosen: Option<(String, String)> = None;
-        egui::Window::new("命令面板")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_TOP, [0.0, 120.0])
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.set_opacity(self.fade.alpha(FADE_SECS));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.cmd_query)
-                        .hint_text("搜索命令…")
-                        .desired_width(320.0),
-                );
-                let q = self.cmd_query.to_lowercase();
-                ui.separator();
-                for (plugin, id, title) in &commands {
-                    if !q.is_empty() && !title.to_lowercase().contains(&q) {
-                        continue;
-                    }
-                    if ui.button(title).clicked() {
-                        chosen = Some((plugin.clone(), id.clone()));
-                    }
-                }
-                if commands.is_empty() {
-                    ui.label(egui::RichText::new("当前没有插件命令（trusted 模式可用）").weak());
-                }
-            });
-        self.cmd_open = open;
-        if let Some((p, id)) = chosen {
-            self.run_command(&p, &id);
-        }
-    }
 }
 
 // ───────────────────────── 无边框窗口的边缘缩放 ─────────────────────────

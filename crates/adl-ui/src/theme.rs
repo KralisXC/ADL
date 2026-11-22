@@ -348,6 +348,10 @@ impl Theme {
     ///
     /// 只切左上（`nw`），其余三角保持直角：另外三个角贴着窗口边缘，
     /// 切了反而会在边缘露出白边。
+    ///
+    /// 底部留 12px：内容区是可以滚动的，`bottom: 0` 会让滚到底时最后一张
+    /// 卡片的下边框正好贴在窗口边缘上，看起来像被"截断"了（用户报过这个
+    /// 现象）。留一条空白，卡片才是"浮在页面里"而不是"被窗口切掉"。
     pub fn shell_frame(&self) -> egui::Frame {
         let (x, _) = self.spacing.content_pad;
         egui::Frame::new()
@@ -362,7 +366,7 @@ impl Theme {
                 left: x,
                 right: x,
                 top: 8,
-                bottom: 0,
+                bottom: 12,
             })
     }
 

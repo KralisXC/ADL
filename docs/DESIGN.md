@@ -1498,22 +1498,23 @@ fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
 - 最左上角是**折叠键**，与窗口三键同一条横条（`Panel::top` 里先画折叠键，
   再画右侧三个 `window_button`），不再让侧栏顶部单独占一行。
 - 侧栏内部顺序：品牌行（只有 `ADL` 三个字，青绿 19px）→ **`+ 新建下载`** →
-  主页 / 任务列表 → `插件` 分组（插件页面 + 每个有 settings 的插件一个入口，
-  **最多 5 个**，超出显示"更多设置…"）→ 底部 `Layout::bottom_up`（Ctrl+K 提示 /
-  模式胶囊 / **设置**）。
+  主页 / 任务列表 / 插件 / 消息 / 终端 → 插件页面（`hairline` 分隔后紧接，**不再有
+  "插件页面"小字分组标题**）→ 底部 `Layout::bottom_up`（Ctrl+K 提示 / 模式胶囊 / **设置**）。
 - **品牌不再用方块图标**。第一版是"`A` 方块 + ADL / 下载器"两行，用户要求
   "直接写 ADL 就行了" —— 手画的方块字母和字体渲染的正文放一起永远对不齐，
   而且侧栏本来就是自己画的，不需要 logo 撑门面。
 - **收起态 = 整个侧栏不渲染**（用户："侧栏收起后直接完全隐藏，不要窄轨"）。
-  `Panel::left("adl_sidebar")` 外层包一个 `if !self.sidebar_collapsed`，
   早先那套"56px 窄轨 + 首字当图标"的方案连同 `Spacing::sidebar_w_collapsed`
   令牌一起删除（中文字体没有图标字形，用单字当图标本来就只是妥协）。
-  代价是侧栏隐藏后品牌字跟着消失 → `titlebar()` 在 `self.sidebar_collapsed`
-  时于 `toggle_rect.right() + 10.0` 补画一个 14px 的 `ADL`。
-- **折叠键图标要画"点完之后的样子"**：`sidebar_toggle(ui, rect, will_expand)` ——
-  侧栏展开时画**方框+竖线**（表示"点了会收起"），收起时画**三条横线汉堡**
-  （表示"点了会展开"）。这是用户明确指出的：第一版两种状态画的是同一个图标。
+  收起时**品牌字跟着一起消失**（用户："收起之后这个 adl 可以不用显示"），
+  `titlebar()` 不再补画。
+- **折叠键图标固定成同一个**：`sidebar_toggle(ui, rect, _will_expand)` 永远画
+  **带竖向分隔线的圆角矩形**。第一版按"点了会变成什么"画了两种图标（展开时方框+竖线、
+  收起时汉堡），用户的反馈是收起后"图像变不一样了"，看着像换了颗按钮。
+  参数保留 `_will_expand` 只为签名稳定，实际不再影响画法。
+  收起的动作反馈交给**侧栏本身的宽度动画**（0.22s），不再靠图标变化提示。
 - 侧栏不再有"添加下载"导航项 —— 添加改成了弹窗，入口是 `+ 新建下载`。
+- **选中态是整块淡入**（不是从左到右擦入，见 §13.12）。
 
 #### 13.11.4 添加下载 → Modal
 
@@ -1689,7 +1690,7 @@ style.interaction.multi_widget_text_select = false;
   同理，`accent_soft`（#E2F1ED）的选中底色非常淡，肉眼容易漏看，用像素采样判定更可靠：
   代码行被选中后背景从 `244,248,248` 变成 `226,241,237`。
 
-### 13.12 换页动效：竖条滑动、底色擦入、页面下刷
+### 13.12 换页动效：竖条滑动、底色淡入、页面下刷
 
 用户原话：「侧边栏的左边的小绿条也弄一下吧…我想的是这个小绿条下移之后到这个按钮
 然后这个按钮亮起来（左到右）然后页面上到下刷新出来（可以快速一点，有微微的观感
@@ -1697,7 +1698,7 @@ style.interaction.multi_widget_text_select = false;
 然后这个其他的才显示出来。」
 
 三件事共用**一个时钟**：`tick_page()` 每帧返回 `page_fill`（0→1，缓出
-`1-(1-t)²`），页签一变就重置起点。侧栏擦入和页面下刷都读它，才像"一次切换"。
+`1-(1-t)²`），页签一变就重置起点。侧栏淡入和页面下刷都读它，才像"一次切换"。
 
 **① 竖条必须跨行插值，所以不能由每一行自己画。** 这是整件事的关键：切页那一帧
 旧选中行已经不渲染了，如果竖条还留在 `nav_item` 里，它只会"原地消失、在下一行
@@ -1712,16 +1713,30 @@ style.interaction.multi_widget_text_select = false;
 所以用 `nav_slide: Option<f32>` 兜底：`None` 时直接 `= top`，否则第一次进侧栏
 竖条会从顶上滑下来。
 
-**② 底色"从左到右"靠裁剪矩形，不是整块淡入。** 整块淡入只是"啪一下亮起来"，没有
-方向感。用 painter 的裁剪区限制已画出的宽度：
+**② 底色是整块淡入，不是从左到右擦入。** 第一版做的是裁剪矩形擦入（记录在此，
+作为"别再做回去"的参考）：
 
 ```rust
-let mut pnt = ui.painter().clone();
+// 已删除：用户后来觉得"那块底色扫过来太抢眼"
 let wipe = Rect::from_min_max(rect.min,
     pos2(rect.left() + rect.width() * fill, rect.bottom()));
 pnt.set_clip_rect(pnt.clip_rect().intersect(wipe));
 pnt.rect_filled(rect, CornerRadius::same(th.radius.nav), p.accent_soft);
 ```
+
+现在直接按 `fill` 算 alpha 整块画：
+
+```rust
+let a = (fill.clamp(0.0, 1.0) * 255.0).round() as u8;
+if a > 0 {
+    let c = p.accent_soft;
+    let fill = Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a);
+    ui.painter().rect_filled(rect, CornerRadius::same(th.radius.nav), fill);
+}
+```
+
+⚠️ **只能改 alpha，不能用 `Color32::gamma_multiply`**：它会把 RGB 一起乘下去，
+淡到一半时 `accent_soft` 会变成发暗的脏青色，而不是"同一颜色更透明"。
 
 **③ 页面下刷 = 淡入 + 8px 位移。** 只做淡入像"慢慢显影"，加一点位移才有"刷新
 出来"的方向感。幅度故意很小（8px / 0.16s）—— 用户要的是"微微的观感"，做大了
@@ -1738,15 +1753,18 @@ pnt.rect_filled(rect, CornerRadius::same(th.radius.nav), p.accent_soft);
 
 **验证方法**：把 `NAV_SLIDE_SECS`/`NAV_FILL_SECS`/`FADE_SECS` 临时放大到 1.2~1.6 秒，
 用 `burst.cs` 连拍。实测 `burst-03.png`（t≈963ms）能同时看到：竖条停在"主页"与
-"任务列表"之间、主页底色擦入到约 60% 宽、页面内容半透明 —— 三项动效都在动。
+"任务列表"之间、主页底色淡入到约 60%、页面内容半透明 —— 三项动效都在动。
 
 ### 13.13 常驻插件页与消息中心
 
 **常驻「插件」页**（`Tab::Plugins`，`ADL_TAB=plugins`）
 
-用户要的是"安装插件和管理插件的地方"。它和侧栏下面那个"**插件页面**"分组是两件事：
+用户要的是"安装插件和管理插件的地方"。它和侧栏下面那些插件页是两件事：
 `Tab::Plugin(id, page)` 是**插件自己声明的页面**（由插件返回组件树、宿主负责画），
 而 `Tab::Plugins` 是宿主的管理页，**一个插件都没装也能进**。
+
+页面布局照着 DSH 的插件页做：顶部「安装、启用和配置插件」+ 右侧「刷新 / + 添加插件」，
+下面三个 tab（已安装 / 插件市场 / 发现），列表项**名称在左、开关在右**。
 
 - **数据源**：`adl_plugin::ui::collect()` 新增的 `"all"` 键。原有的 `"plugins"`
   只收"有 UI 的"插件（`pages/actions/settings/commands` 任一非空），而真正干活的
@@ -1762,6 +1780,13 @@ pnt.rect_filled(rect, CornerRadius::same(th.radius.nav), p.accent_soft);
   `*gui.hooks.lock() = build_hooks(&new_cfg)` → 快照立即失效。
   卡片闭包里已经借了 `self.gui` 的锁，**在闭包里写配置会死锁** —— 点击结果先收到
   `let mut toggle: Option<(String, bool)>`，全部卡片画完再落盘。
+- **插件市场 / 发现是空壳，而且故意是空壳**：源地址还没定（用户计划接自己的 GitHub
+  仓库），所以两页只把"将来会有什么"说清楚。**不做假列表** —— 假数据会让人以为已经
+  能装了。「来源配置」按钮和「+ 添加插件」都落到"打开本地插件目录"，因为现在唯一的
+  "来源"就是它；留一个点了没反应的按钮比没有按钮更糟。
+- **新控件 `switch(ui, on) -> Response`**（`crates/adl-ui/src/widgets.rs`）：38×21
+  圆角 11 的轨道 + r=8 白圆点，`animate_bool_responsive` 驱动平移。配一个
+  `mix_color(a, b, t)` 做逐通道插值（`Color32` 没有 `lerp`）。
 
 **消息中心**（`crates/adl-gui/src/notice.rs`，`Tab::Notices`，`ADL_TAB=notices`）
 
@@ -1806,7 +1831,39 @@ pnt.rect_filled(rect, CornerRadius::same(th.radius.nav), p.accent_soft);
   `.color()` 的 strong 文本都会画成白字**，在白卡上整行消失。这个 bug 让插件名
   整行空白了一轮，最后靠像素扫描才发现。
 
-### 13.14 待续
+### 13.14 终端页（替代 Ctrl+K 命令面板）
+
+用户原话：「这个命令面板可以变成终端那种（win的powershell）单独页面。」
+
+原来的命令面板是个 `Window` 浮层：按 Ctrl+K 弹出、选一条就跑、关掉就没了。问题不在
+交互而在**输出** —— 命令跑完的提示飘在状态条上 6 秒就消失，想翻上一条只能重跑。
+
+- `Tab::Terminal`（`ADL_TAB=terminal`），Ctrl+K 改成"跳到终端页 / 已经在就跳回任务列表"。
+  ⚠️ 必须是"当前就在终端才回退"，否则从别的页按 Ctrl+K 会被判成"关闭"。
+- **终端自己管滚动、高度钉满视口**：外面那层页面 `ScrollArea` 要跳过
+  （`if self.tab == Tab::Terminal { self.page_terminal(ui); return; }`）。套两层滚动区
+  时 `PS>` 输入行会被视口边界切掉一半 —— 终端的输入框必须永远停在看得见的地方。
+- 高度要先把 `Frame` 的内边距扣掉（`symmetric(14,10)` → 上下各 10），否则内容比框高
+  20px，输入行画到框外看不见。`full_h = ui.available_height()`、`inner_h = (full_h - 20).max(160)`。
+- **深色不跟主题**：这是浅色界面里的一个"深色控制台孤岛"，配色写死
+  （`bg #1B2120` / `border #2E3735` / `out #D6DCDA` / `info #869592` / `echo #7AC8B4` / `err #E38686`）。
+  要是跟着主题走，浅色下就成了"白底终端"，那种观感是错的。
+- 命令：`help` / `clear` / `tasks|ls` / `add <url> [文件名]` / `pause <id>|all` /
+  `resume <id>` / `rm <id>`（不删文件）/ `open <id>` / `settings` /
+  `set dir|connections|limit` / `mode safe|trusted` / `plugin list` / `plugin run <p> <cmd>`。
+  输出一律走 `self.term.push`，**不弹 toast、不写状态条** —— 终端页自己就是输出面板。
+- 历史上限 500 行，`↑/↓` 翻历史，`Esc` 清空当前输入。
+
+🔴 **两个 egui 输入坑（都实测踩过）**：
+
+1. **Enter 必须在建 `TextEdit` 之前读**。单行 `TextEdit` 收到回车会
+   `consume_key(Enter)` 并 `surrender_focus`，等它返回之后再
+   `ui.input(|i| i.key_pressed(Enter))` 永远是 `false` —— 第一次回车直接丢键。
+   所以在 `ui.horizontal` 之前先把 `enter/up/down/esc` 一次读出来。
+2. 判断"输入框是活动的"要用 `te.has_focus() || te.lost_focus()`：回车那一帧焦点已经
+   交还了，只看 `has_focus()` 会漏掉这一下。
+
+### 13.15 待续
 - Linux/macOS 需在 `eframe` features 补 `x11`/`wayland`；`platform.rs` 的 Win32 部分已用 `#[cfg(windows)]` 隔离。
 - 旧的 `web/`（Vue）与 `static_server.rs` 已不再编入（保留仅作历史），后续可清理。
 - `render_node` 已改用 `adl_ui` 的 `badge`/`card`/`hairline`，但 `table`/`kv`/`grid`
@@ -1821,15 +1878,24 @@ pnt.rect_filled(rect, CornerRadius::same(th.radius.nav), p.accent_soft);
   窗口非最大化时铺；最大化下要跳过，否则鼠标贴屏幕边缘会误触 resize 光标。
 - 侧栏"完全隐藏"后没有保留任何窄轨，所以**折叠键是唯一入口** —— 它必须
   一直画在标题栏里，`titlebar()` 不能因为侧栏隐藏就少画那一块。
+  侧栏收起/展开现在是 0.22 秒的宽度动画（`Panel::left` 一直存在、只动 `exact_size`），
+  面板内部必须 `set_clip_rect` + `set_width(sidebar_w())` 固定排版宽度，否则文字会
+  在中途换行、按钮被压扁。
 - 文本选择已全局关闭，只对 `code`/`copy` 放开。若以后加了"日志"类页面想让整段
   可选，记得用 `Label::new(..).selectable(true)` 逐个放开，别把全局开关又打开。
-- 淡入目前只覆盖三个 overlay（添加下载 / 关闭询问 / 命令面板）和状态条。页面切换
-  还是硬切；若要做，得给 `Tab` 变化也接一条 `Fade` 通道。
+- 淡入覆盖三个 overlay（添加下载 / 关闭询问 / 消息 toast）和状态条。页面切换现在走
+  的是 §13.12 的"下刷"通道，不再是硬切。
 - 消息中心只有"全部已读 / 清空"两个批量动作，没有单条已读、没有按级别过滤。
   条数上限 200 已经够用，真要翻旧账再补。
 - 插件页只有"启用/停用/打开目录/重新扫描"，**没有卸载**：删目录是不可逆操作，
   等以后想清楚了再做（要做也得先确认"是删 `plugins/<id>/` 还是移到回收站"）。
 - 插件通知目前都是 `Level::Info`。`notify` 权限没带级别字段，若要区分
   "警告/错误"，得先在 manifest 或 `adl.notify()` 的 payload 里加 `level`。
+- **插件市场是空壳**：`PluginsTab::Market` / `Discover` 只有说明文字。要做真的，得先定
+  索引 JSON 的格式（`id/name/version/download_url/sha256/min_api`）、下载与解压策略
+  （看到 `plugin.toml` 才认）、**签名校验**（否则等于开放任意代码执行），以及"装到哪"
+  （`plugins/<id>/`，重名要确认覆盖）。用户明确说会接自己的 GitHub 源。
+- 终端页的命令是硬编码的 `match`，没有补全、没有 `--help` 子命令、没有把插件命令
+  动态列进 `help`（`plugin list` 只列 id，不带命令）。
 
 

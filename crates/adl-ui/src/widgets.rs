@@ -38,11 +38,12 @@ pub fn nav_item(ui: &mut Ui, selected: bool, label: &str) -> bool {
     nav_item_anim(ui, selected, label, 1.0).clicked()
 }
 
-/// 带"底色从左到右擦入"的导航项，返回整行的 `Response`。
+/// 带淡入的导航项，返回整行的 `Response`。
 ///
-/// `fill` 是擦入进度（0.0..=1.0）。左侧那根 3px 竖条**不在这里画** ——
-/// 它要在整栏画完之后单独画一次（见 `nav_bar`），否则切换页面时竖条
-/// 只能"瞬间跳行"，做不出滑动。调用方拿 `.rect` 记下选中行的位置。
+/// `fill` 是选中底色的不透明度（0.0..=1.0）。早先这里是"从左到右擦入"，
+/// 用户觉得那块底色扫过来太抢眼，改成整体淡入。
+/// 左侧那根 3px 竖条**不在这里画** —— 它要在整栏画完之后单独画一次
+/// （见 `nav_bar`），否则切换页面时竖条只能"瞬间跳行"，做不出滑动。
 pub fn nav_item_anim(ui: &mut Ui, selected: bool, label: &str, fill: f32) -> egui::Response {
     let th = Theme::from_ui(ui);
     let p = &th.palette;
@@ -56,17 +57,14 @@ pub fn nav_item_anim(ui: &mut Ui, selected: bool, label: &str, fill: f32) -> egu
             .rect_filled(rect, CornerRadius::same(th.radius.nav), p.hover_bg);
     }
     if selected {
-        // 底色从左到右擦入：靠裁剪矩形限制已画出的宽度。
-        // 不这么做就只能整块淡入，观感是"啪一下亮起来"，没有方向感。
-        let fill = fill.clamp(0.0, 1.0);
-        if fill > 0.0 {
-            let mut pnt = ui.painter().clone();
-            let wipe = Rect::from_min_max(
-                rect.min,
-                egui::pos2(rect.left() + rect.width() * fill, rect.bottom()),
-            );
-            pnt.set_clip_rect(pnt.clip_rect().intersect(wipe));
-            pnt.rect_filled(rect, CornerRadius::same(th.radius.nav), p.accent_soft);
+        // 只改 alpha、不改 RGB：整块 `gamma_multiply` 会连颜色一起压暗，
+        // 淡到一半会变成脏青色，而不是"浅底慢慢浮出来"。
+        let a = (fill.clamp(0.0, 1.0) * 255.0).round() as u8;
+        if a > 0 {
+            let c = p.accent_soft;
+            let fill = Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a);
+            ui.painter()
+                .rect_filled(rect, CornerRadius::same(th.radius.nav), fill);
         }
     }
 
@@ -174,6 +172,52 @@ pub fn badge(ui: &mut Ui, text: &str, color: Color32) -> Response {
         color,
     );
     resp
+}
+
+/// 开关（插件启停、布尔型设置）。
+///
+/// egui 自带的 `Checkbox` 是方形勾选框；在"启用/停用某个东西"的语境里，
+/// 长条滑块（左边关/右边开）比打勾更直观 —— 所以自己画一个。
+///
+/// 圆点靠 `animate_bool_responsive` 平移：切一次开关会看到它滑过去，
+/// 而不是"啪"地跳一下。
+pub fn switch(ui: &mut Ui, on: bool) -> Response {
+    let th = Theme::from_ui(ui);
+    let p = &th.palette;
+
+    let (rect, resp) = ui.allocate_exact_size(vec2(38.0, 21.0), Sense::click());
+    let t = ui.ctx().animate_bool_responsive(resp.id, on);
+
+    // 轨道颜色也跟着淡：`line`（关）→ `accent`（开）
+    let track = mix_color(p.line, p.accent, t);
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(11), track);
+
+    let knob_r = 8.0;
+    let travel = rect.width() - 2.0 * (knob_r + 2.5);
+    let cx = rect.left() + knob_r + 2.5 + travel * t;
+    ui.painter()
+        .circle_filled(egui::pos2(cx, rect.center().y), knob_r, Color32::WHITE);
+
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp
+}
+
+/// 两色之间按 `t`（0..=1）插值。
+///
+/// `Color32` 没有现成的 lerp：`gamma_multiply` 只是整体缩放亮度，
+/// 从浅灰到青绿这种换色必须逐通道算。
+fn mix_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let f = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgba_unmultiplied(
+        f(a.r(), b.r()),
+        f(a.g(), b.g()),
+        f(a.b(), b.b()),
+        f(a.a(), b.a()),
+    )
 }
 
 /// 卡片容器（白底 + 圆角 + 细描边 + 内边距），并让内容撑满可用宽度。
@@ -645,10 +689,13 @@ pub fn stat_card(ui: &mut Ui, value: &str, label: &str, tone: Color32) {
 
 /// 侧栏显隐按钮。
 ///
-/// 图标画的是"点下去会变成什么"，不是"现在是什么"（用户要求）：
-/// - 侧栏正显示 → 画一个带分隔条的方框（点了会收起来）
-/// - 侧栏已隐藏 → 画三条横线（汉堡，点了会展开）
-pub fn sidebar_toggle(ui: &mut Ui, rect: Rect, will_expand: bool) -> bool {
+/// 图标**固定不变**：一个带竖向分隔线的圆角矩形（左边那块 = 侧栏）。
+///
+/// 早先画的是"点下去会变成什么"——展开时画带分隔线的方框、收起时画三条
+/// 横线。用户反馈"收起来之后图标变了个样，像换了个按钮"，所以改成始终
+/// 画同一个符号。`_will_expand` 保留在签名里是为了让调用方继续表达意图，
+/// 图标本身不再依赖它。
+pub fn sidebar_toggle(ui: &mut Ui, rect: Rect, _will_expand: bool) -> bool {
     let th = Theme::from_ui(ui);
     let p = &th.palette;
     let resp = ui.interact(
@@ -664,33 +711,18 @@ pub fn sidebar_toggle(ui: &mut Ui, rect: Rect, will_expand: bool) -> bool {
     let stroke = egui::Stroke::new(1.2, fg);
     let c = rect.center();
 
-    if will_expand {
-        // 汉堡：三条横线
-        for i in -1..=1 {
-            let y = c.y + i as f32 * 3.6;
-            ui.painter().line_segment(
-                [egui::pos2(c.x - 6.0, y), egui::pos2(c.x + 6.0, y)],
-                stroke,
-            );
-        }
-    } else {
-        // 带分隔线的方框（左边那块 = 侧栏）
-        let outer = Rect::from_center_size(c, vec2(14.0, 11.2));
-        ui.painter().rect_stroke(
-            outer,
-            CornerRadius::same(2),
-            stroke,
-            egui::StrokeKind::Inside,
-        );
-        let x = outer.left() + 4.6;
-        ui.painter().line_segment(
-            [
-                egui::pos2(x, outer.top() + 1.0),
-                egui::pos2(x, outer.bottom() - 1.0),
-            ],
-            stroke,
-        );
-    }
+    let outer = Rect::from_center_size(c, vec2(14.0, 11.2));
+    ui.painter()
+        .rect_stroke(outer, CornerRadius::same(2), stroke, egui::StrokeKind::Inside);
+    let x = outer.left() + 4.6;
+    ui.painter().line_segment(
+        [
+            egui::pos2(x, outer.top() + 1.0),
+            egui::pos2(x, outer.bottom() - 1.0),
+        ],
+        stroke,
+    );
+
     resp.clicked()
 }
 
