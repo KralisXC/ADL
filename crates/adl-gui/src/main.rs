@@ -1,4 +1,4 @@
-﻿//! ADL 图形界面：纯 Rust 原生 UI（egui / eframe），**不依赖 WebView2**。
+//! ADL 图形界面：纯 Rust 原生 UI（egui / eframe），**不依赖 WebView2**。
 //! 跨平台：Windows / Linux / macOS 均可编译运行。
 //!
 //! 本文件只负责“壳”（窗口与交互）；下载引擎在 `adl-core`，插件在 `adl-plugin`，
@@ -147,6 +147,15 @@ struct App {
     closing: bool,
     /// 弹窗淡入计时器
     fade: Fade,
+    /// 侧栏竖条此刻画在哪（`None` = 还没初始化，首帧直接吸附到目标位置）
+    nav_slide: Option<f32>,
+    /// 换页时刻：驱动底色擦入与页面下刷。页签一变就重置。
+    page_start: Option<Instant>,
+    /// 上一帧的页签，用来检测换页
+    page_last_tab: Option<Tab>,
+    /// 本帧的换页进度（0.0..=1.0，缓出）。每帧在 `ui()` 开头算一次，
+    /// 侧栏擦入和页面下刷共用同一个值，两者才像同一次切换。
+    page_fill: f32,
 }
 
 /// 首次点关闭时问用户"退出还是最小化"。
@@ -181,6 +190,12 @@ fn fade_frame(ctx: &egui::Context, a: f32) -> egui::Frame {
 
 /// 弹窗淡入时长（秒）。0.14 和 `style.animation_time` 对齐，切换时不打架。
 const FADE_SECS: f32 = 0.14;
+
+/// 侧栏竖条跨行滑动时长。比弹窗稍长一点，滑得太快就看不出"滑"了。
+const NAV_SLIDE_SECS: f32 = 0.18;
+
+/// 选中底色从左到右擦入的时长，也用于页面内容的下刷淡入。
+const NAV_FILL_SECS: f32 = 0.16;
 
 /// 状态提示条显示时长与"末尾淡出"区间。
 const STATUS_SECS: f32 = 6.0;
@@ -304,6 +319,10 @@ impl App {
             maximized: false,
             closing: false,
             fade: Fade::default(),
+            nav_slide: None,
+            page_start: None,
+            page_last_tab: None,
+            page_fill: 1.0,
         }
     }
 
@@ -591,6 +610,11 @@ impl eframe::App for App {
         // 一开始做成"收窄到 56px 只剩首字"，实测那样很怪（首字导航既认不出
         // 也不好看）。现在收起 = 真的不要侧栏，重新展开靠标题栏最左上角那个
         // 汉堡键。
+        //
+        // 换页进度在这里算（而不是在 `sidebar` 里），因为侧栏收起时页面照样
+        // 要下刷 —— 时钟必须独立于侧栏是否存在。
+        self.page_fill = self.tick_page(&ctx);
+
         if !self.sidebar_collapsed {
             egui::Panel::left("adl_sidebar")
                 .exact_size(sidebar_w())
@@ -649,17 +673,29 @@ impl eframe::App for App {
                 ui.add_space(4.0);
                 adl_ui::widgets::rule(ui);
                 ui.add_space(4.0);
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        match self.tab.clone() {
-                            Tab::Home => self.page_home(ui),
-                            Tab::Tasks => self.page_tasks(ui),
-                            Tab::Settings => self.page_settings(ui),
-                            Tab::Plugin(_, _) => self.page_plugin(ui),
-                        }
-                    });
+
+                // 页面内容下刷：换页后淡入 + 从上方 8px 处落下来。
+                //
+                // 只做淡入像"慢慢显影"，加一点位移才有"刷新出来"的方向感。
+                // 幅度故意很小（8px / 0.16s）—— 用户要的是"微微的观感"。
+                let pf = self.page_fill.clamp(0.0, 1.0);
+                if pf < 1.0 {
+                    ui.add_space((1.0 - pf) * 8.0);
+                }
+                ui.scope(|ui| {
+                    ui.set_opacity(pf);
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            match self.tab.clone() {
+                                Tab::Home => self.page_home(ui),
+                                Tab::Tasks => self.page_tasks(ui),
+                                Tab::Settings => self.page_settings(ui),
+                                Tab::Plugin(_, _) => self.page_plugin(ui),
+                            }
+                        });
+                });
             });
 
         // 弹窗淡入：先根据"当前开着哪个 overlay"确定身份，再决定透明度。
@@ -697,11 +733,6 @@ impl eframe::App for App {
 }
 
 impl App {
-    /// 单个导航项：整宽、圆角、选中/悬停高亮（不用 emoji —— 中文字体里没有表情字形，会显示成方块）
-    fn nav_item(&mut self, ui: &mut egui::Ui, selected: bool, label: &str) -> bool {
-        adl_ui::widgets::nav_item(ui, selected, label)
-    }
-
     /// 左侧整高边栏。
     ///
     /// 布局参考 DSH 的侧栏：最上面是 `ADL` 品牌字，接着是主操作按钮（新建下载），
@@ -728,11 +759,26 @@ impl App {
         ui.add_space(12.0);
 
         // ── 主导航 ──
-        if self.nav_item(ui, self.tab == Tab::Home, "主页") {
+        //
+        // 这一段写法有点绕，原因是"小绿条要跨行滑动"：竖条不能由每一行自己画
+        // —— 切页那一帧旧选中行已经不渲染了，竖条会原地消失再在下一行冒出来，
+        // 就是用户说的"点任务列表时直接出现"。所以这里只记录选中行在哪，
+        // 等整栏画完再用 `nav_bar` 统一画一次。
+        let fill = self.page_fill;
+        let mut sel_geom: Option<(f32, f32, f32)> = None;
+        let mut track = |ui: &mut egui::Ui, sel: bool, label: &str| {
+            let r = adl_ui::widgets::nav_item_anim(ui, sel, label, fill);
+            if sel {
+                sel_geom = Some((r.rect.left(), r.rect.top(), r.rect.height()));
+            }
+            r.clicked()
+        };
+
+        if track(ui, self.tab == Tab::Home, "主页") {
             self.tab = Tab::Home;
         }
         ui.add_space(2.0);
-        if self.nav_item(ui, self.tab == Tab::Tasks, "任务列表") {
+        if track(ui, self.tab == Tab::Tasks, "任务列表") {
             self.tab = Tab::Tasks;
         }
 
@@ -777,7 +823,7 @@ impl App {
                     .to_string();
                 let selected =
                     matches!(&self.tab, Tab::Plugin(pl, pg) if pl == &plugin && pg == &id);
-                if self.nav_item(ui, selected, &title) {
+                if track(ui, selected, &title) {
                     self.tab = Tab::Plugin(plugin.clone(), id.clone());
                     self.plugin_view = None;
                     self.reload_plugin_view();
@@ -789,13 +835,13 @@ impl App {
                 let selected =
                     matches!(&self.tab, Tab::Plugin(pl, pg) if pl == "adl" && pg == &tab_id);
                 let label = format!("{name} 设置");
-                if self.nav_item(ui, selected, &label) {
+                if track(ui, selected, &label) {
                     self.tab = Tab::Plugin("adl".to_string(), tab_id);
                 }
                 ui.add_space(2.0);
             }
             if has_more {
-                if self.nav_item(ui, false, "更多设置…") {
+                if track(ui, false, "更多设置…") {
                     self.tab = Tab::Settings;
                 }
                 ui.add_space(2.0);
@@ -837,11 +883,54 @@ impl App {
             );
             ui.add_space(8.0);
             // 设置钉在左下角
-            if self.nav_item(ui, self.tab == Tab::Settings, "设置") {
+            if track(ui, self.tab == Tab::Settings, "设置") {
                 self.tab = Tab::Settings;
             }
             ui.add_space(4.0);
         });
+
+        // 整栏画完，最后补画竖条 —— 它要跨行滑动，所以必须由这里统一决定位置。
+        //
+        // `slide` 是插值后的 y（朝 `top` 缓动）。首帧 `nav_slide` 是 `None`，
+        // 直接吸附到目标位置，避免进侧栏时竖条从顶上滑下来。
+        if let Some((left, top, h)) = sel_geom {
+            let ctx = ui.ctx();
+            let slide = match self.nav_slide {
+                Some(_) => {
+                    let t = ctx.animate_value_with_time(
+                        egui::Id::unique("adl_nav_slide"),
+                        top,
+                        NAV_SLIDE_SECS,
+                    );
+                    if (t - top).abs() > 0.5 {
+                        ctx.request_repaint();
+                    }
+                    t
+                }
+                None => top,
+            };
+            self.nav_slide = Some(slide);
+            adl_ui::widgets::nav_bar(ui, left, slide, h);
+        }
+    }
+
+    /// 换页进度：0.0..=1.0，缓出。
+    ///
+    /// 页签一变就重置起点，于是选中底色重新从左到右铺一遍、页面内容同时
+    /// 从上往下刷出来。两者共用这一个值，才像"一次切换"而不是两件事。
+    fn tick_page(&mut self, ctx: &egui::Context) -> f32 {
+        if self.page_last_tab.as_ref() != Some(&self.tab) {
+            self.page_last_tab = Some(self.tab.clone());
+            self.page_start = Some(Instant::now());
+        }
+        let Some(t0) = self.page_start else {
+            return 1.0;
+        };
+        let t = (t0.elapsed().as_secs_f32() / NAV_FILL_SECS).clamp(0.0, 1.0);
+        if t < 1.0 {
+            ctx.request_repaint();
+        }
+        1.0 - (1.0 - t) * (1.0 - t)
     }
 
     fn page_title(&self) -> String {
@@ -1258,10 +1347,11 @@ impl App {
         let a = self.fade.alpha(FADE_SECS);
         let resp = egui::Modal::new(egui::Id::unique("adl_add_modal"))
             .frame(fade_frame(ctx, a))
+            // 背板也要跟着淡。`ui.set_opacity` 管不到它 —— 背板是在
+            // `Area::show` 里、进内容闭包之前就画好的。不传这个参数的话
+            // 观感是"背板啪一下变暗，内容慢慢浮出来"，像分两段渲染。
+            .backdrop_color(fade_color(egui::Color32::from_black_alpha(100), a))
             .show(ctx, |ui| {
-            // 淡入：`Modal` 自己没有透明度参数，而且背板是在 `Area::show` 里
-            // 最先画的（`set_opacity` 只影响之后画的图元），所以这里只能让
-            // 内容本身淡入 —— 观感上足够了，背板瞬间变暗反而像"已经打开"。
             ui.set_opacity(a);
             ui.set_width(520.0);
             adl_ui::widgets::section_title(ui, "新建下载");
@@ -1324,6 +1414,7 @@ impl App {
         let a = self.fade.alpha(FADE_SECS);
         let resp = egui::Modal::new(egui::Id::unique("adl_close_modal"))
             .frame(fade_frame(ctx, a))
+            .backdrop_color(fade_color(egui::Color32::from_black_alpha(100), a))
             .show(ctx, |ui| {
             ui.set_opacity(a);
             ui.set_width(400.0);

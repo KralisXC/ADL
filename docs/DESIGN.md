@@ -1681,7 +1681,58 @@ style.interaction.multi_widget_text_select = false;
   同理，`accent_soft`（#E2F1ED）的选中底色非常淡，肉眼容易漏看，用像素采样判定更可靠：
   代码行被选中后背景从 `244,248,248` 变成 `226,241,237`。
 
-### 13.12 待续
+### 13.12 换页动效：竖条滑动、底色擦入、页面下刷
+
+用户原话：「侧边栏的左边的小绿条也弄一下吧…我想的是这个小绿条下移之后到这个按钮
+然后这个按钮亮起来（左到右）然后页面上到下刷新出来（可以快速一点，有微微的观感
+就行）还有就是新建下载这个点出来有点奇怪，就是下载地址和下面哪个的输入框先出来
+然后这个其他的才显示出来。」
+
+三件事共用**一个时钟**：`tick_page()` 每帧返回 `page_fill`（0→1，缓出
+`1-(1-t)²`），页签一变就重置起点。侧栏擦入和页面下刷都读它，才像"一次切换"。
+
+**① 竖条必须跨行插值，所以不能由每一行自己画。** 这是整件事的关键：切页那一帧
+旧选中行已经不渲染了，如果竖条还留在 `nav_item` 里，它只会"原地消失、在下一行
+重新冒出来" —— 正是用户抱怨的"直接出现"。做法：
+
+- `nav_item_anim(ui, selected, label, fill) -> Response` 只画行和底色，**不画竖条**；
+- `sidebar` 里用一个闭包 `track` 统一调用，选中时记下 `(left, top, h)`；
+- 整栏画完之后，才用 `animate_value_with_time(id, top, NAV_SLIDE_SECS)` 求出插值 y，
+  交给 `nav_bar(ui, left, slide, h)` 画一次。
+
+⚠️ `animate_value_with_time` **首帧直接返回目标值**（和 `animate_bool` 同样的坑），
+所以用 `nav_slide: Option<f32>` 兜底：`None` 时直接 `= top`，否则第一次进侧栏
+竖条会从顶上滑下来。
+
+**② 底色"从左到右"靠裁剪矩形，不是整块淡入。** 整块淡入只是"啪一下亮起来"，没有
+方向感。用 painter 的裁剪区限制已画出的宽度：
+
+```rust
+let mut pnt = ui.painter().clone();
+let wipe = Rect::from_min_max(rect.min,
+    pos2(rect.left() + rect.width() * fill, rect.bottom()));
+pnt.set_clip_rect(pnt.clip_rect().intersect(wipe));
+pnt.rect_filled(rect, CornerRadius::same(th.radius.nav), p.accent_soft);
+```
+
+**③ 页面下刷 = 淡入 + 8px 位移。** 只做淡入像"慢慢显影"，加一点位移才有"刷新
+出来"的方向感。幅度故意很小（8px / 0.16s）—— 用户要的是"微微的观感"，做大了
+就成了花活。实现上先 `ui.add_space((1-pf)*8.0)` 再 `ui.scope(|ui| { ui.set_opacity(pf); ... })`。
+
+⚠️ 时钟必须在 `ui()` 里、**侧栏那个 `if` 外面**算（`self.page_fill = self.tick_page(&ctx)`），
+否则侧栏收起时页面不刷新。
+
+**④ 弹窗"分阶段出现"的真凶是背板。** 用户描述的"输入框先出来、其他后出来"，
+实际是 `Modal` 的背板在 `Area::show` 里**最先画**，完全不受 `ui.set_opacity` 影响
+（它只作用于之后画的图元）→ 观感是"背板啪一下变暗 + 内容慢慢浮出"。修法是给
+`Modal` 也传 `backdrop_color(fade_color(Color32::from_black_alpha(100), a))`，让
+背板和内容同步。
+
+**验证方法**：把 `NAV_SLIDE_SECS`/`NAV_FILL_SECS`/`FADE_SECS` 临时放大到 1.2~1.6 秒，
+用 `burst.cs` 连拍。实测 `burst-03.png`（t≈963ms）能同时看到：竖条停在"主页"与
+"任务列表"之间、主页底色擦入到约 60% 宽、页面内容半透明 —— 三项动效都在动。
+
+### 13.13 待续
 - Linux/macOS 需在 `eframe` features 补 `x11`/`wayland`；`platform.rs` 的 Win32 部分已用 `#[cfg(windows)]` 隔离。
 - 旧的 `web/`（Vue）与 `static_server.rs` 已不再编入（保留仅作历史），后续可清理。
 - `render_node` 已改用 `adl_ui` 的 `badge`/`card`/`hairline`，但 `table`/`kv`/`grid`

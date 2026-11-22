@@ -32,7 +32,18 @@ pub fn cell(ui: &mut Ui, w: f32, add: impl FnOnce(&mut Ui)) {
 }
 
 /// 侧边栏导航项：整行可点，选中态浅青底 + 左侧 3px 竖条。
+///
+/// 静态版本（插件页等首次进入的场景直接用这个）。
 pub fn nav_item(ui: &mut Ui, selected: bool, label: &str) -> bool {
+    nav_item_anim(ui, selected, label, 1.0).clicked()
+}
+
+/// 带"底色从左到右擦入"的导航项，返回整行的 `Response`。
+///
+/// `fill` 是擦入进度（0.0..=1.0）。左侧那根 3px 竖条**不在这里画** ——
+/// 它要在整栏画完之后单独画一次（见 `nav_bar`），否则切换页面时竖条
+/// 只能"瞬间跳行"，做不出滑动。调用方拿 `.rect` 记下选中行的位置。
+pub fn nav_item_anim(ui: &mut Ui, selected: bool, label: &str, fill: f32) -> egui::Response {
     let th = Theme::from_ui(ui);
     let p = &th.palette;
     let h = th.spacing.nav_h;
@@ -40,18 +51,23 @@ pub fn nav_item(ui: &mut Ui, selected: bool, label: &str) -> bool {
 
     let (rect, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
 
-    if selected || resp.hovered() {
-        let bg = if selected { p.accent_soft } else { p.hover_bg };
+    if resp.hovered() && !selected {
         ui.painter()
-            .rect_filled(rect, CornerRadius::same(th.radius.nav), bg);
+            .rect_filled(rect, CornerRadius::same(th.radius.nav), p.hover_bg);
     }
     if selected {
-        let bar = Rect::from_min_size(
-            egui::pos2(rect.left(), rect.top() + 8.0),
-            vec2(3.0, rect.height() - 16.0),
-        );
-        ui.painter()
-            .rect_filled(bar, CornerRadius::same(2), p.accent);
+        // 底色从左到右擦入：靠裁剪矩形限制已画出的宽度。
+        // 不这么做就只能整块淡入，观感是"啪一下亮起来"，没有方向感。
+        let fill = fill.clamp(0.0, 1.0);
+        if fill > 0.0 {
+            let mut pnt = ui.painter().clone();
+            let wipe = Rect::from_min_max(
+                rect.min,
+                egui::pos2(rect.left() + rect.width() * fill, rect.bottom()),
+            );
+            pnt.set_clip_rect(pnt.clip_rect().intersect(wipe));
+            pnt.rect_filled(rect, CornerRadius::same(th.radius.nav), p.accent_soft);
+        }
     }
 
     let color = if selected { p.accent } else { p.ink };
@@ -63,7 +79,18 @@ pub fn nav_item(ui: &mut Ui, selected: bool, label: &str) -> bool {
         color,
     );
 
-    resp.clicked()
+    resp
+}
+
+/// 侧栏选中项的 3px 竖条，画在任意 y 上（供滑动动画跨行使用）。
+///
+/// `top` 是竖条顶端在**屏幕坐标**里的 y（调用方负责把行内偏移换算好）。
+/// 竖条本身比行高短 16px，所以这里再往下让 8px 居中。
+pub fn nav_bar(ui: &Ui, left: f32, top: f32, h: f32) {
+    let th = Theme::from_ui(ui);
+    let bar = Rect::from_min_size(egui::pos2(left, top + 8.0), vec2(3.0, h - 16.0));
+    ui.painter()
+        .rect_filled(bar, CornerRadius::same(2), th.palette.accent);
 }
 
 /// 自绘小按钮（顶栏用）。
