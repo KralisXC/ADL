@@ -243,3 +243,28 @@ pub fn open_in_browser(url: &str) {
         .args(["/C", "start", "", url])
         .spawn();
 }
+
+/// 用系统文件管理器打开一个目录（插件页的"打开插件目录"）。
+///
+/// 目录不存在时先建出来：用户第一次点这个按钮时 `plugins/` 往往还没建，
+/// 直接 `start` 一个不存在的路径会静默失败，看起来像按钮没反应。
+pub fn open_path(dir: &std::path::Path) -> std::io::Result<()> {
+    if !dir.exists() {
+        std::fs::create_dir_all(dir)?;
+    }
+    #[cfg(windows)]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", &dir.display().to_string()])
+            .spawn()?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(dir).spawn()?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open").arg(dir).spawn()?;
+    }
+    Ok(())
+}

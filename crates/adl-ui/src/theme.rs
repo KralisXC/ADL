@@ -64,7 +64,10 @@ impl Palette {
             card: Color32::WHITE,
             line: Color32::from_rgb(0xE4, 0xED, 0xEC),
             hair: Color32::from_rgb(0xEE, 0xF3, 0xF2),
-            muted: Color32::from_rgb(0x8A, 0x9A, 0x98),
+            // 原来是 #8A9A98，白底上对比度只有 3.0:1，用户反映"有些字太浅了，
+            // 有点看不清"。压到 #5E6D6B 后约 5.9:1，达到 WCAG AA 正文标准；
+            // 这个色只用于说明文字/标签，压深不会抢正文的视觉层级。
+            muted: Color32::from_rgb(0x5E, 0x6D, 0x6B),
             ink: Color32::from_rgb(0x2A, 0x33, 0x33),
             hover_bg: Color32::from_rgb(0xEC, 0xF3, 0xF2),
             danger: Color32::from_rgb(0xB0, 0x30, 0x30),

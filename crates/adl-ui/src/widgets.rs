@@ -187,13 +187,16 @@ pub fn card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
 }
 
 /// 小节标题（卡片内的"下载" / "插件" 分组标题）。
+///
+/// 用 `ink` 而不是 `muted`：小节标题是卡片内的第一层信息，本该比正文更重；
+/// 之前的浅灰在小字号下几乎糊在白底里。
 pub fn section_title(ui: &mut Ui, text: &str) {
     let th = Theme::from_ui(ui);
     ui.label(
         egui::RichText::new(text)
             .size(th.text.section)
             .strong()
-            .color(th.palette.muted),
+            .color(th.palette.ink),
     );
 }
 

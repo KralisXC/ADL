@@ -6,7 +6,40 @@
 
 use crate::manifest::Permissions;
 use serde_json::{json, Value};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// 插件主动通知的出口。宿主（GUI）在启动时注册一个回调，把 `notify` 变成
+/// 界面上的消息；CLI 不注册，就还退化成写 stderr。
+///
+/// 用全局而不是 `HostCtx` 字段：插件各自跑在独立线程上，`HostCtx` 在插件加载
+/// 时就固定了，而宿主可能比插件晚就绪（GUI 是先建 hooks 再建窗口）。
+pub type NotifySink = Arc<dyn Fn(&str, &str, &str) + Send + Sync>;
+
+static NOTIFY_SINK: OnceLock<Mutex<Option<NotifySink>>> = OnceLock::new();
+
+/// 注册插件通知出口（传 `None` 取消）。后注册的覆盖先注册的。
+pub fn set_notify_sink(sink: Option<NotifySink>) {
+    let slot = NOTIFY_SINK.get_or_init(|| Mutex::new(None));
+    if let Ok(mut g) = slot.lock() {
+        *g = sink;
+    }
+}
+
+fn emit_notify(plugin: &str, title: &str, body: &str) -> bool {
+    let Some(slot) = NOTIFY_SINK.get() else {
+        return false;
+    };
+    let Ok(g) = slot.lock() else {
+        return false;
+    };
+    match g.as_ref() {
+        Some(f) => {
+            f(plugin, title, body);
+            true
+        }
+        None => false,
+    }
+}
 
 /// 运行模式。`safe` 只允许 Observe/Guard 类能力；`trusted` 额外允许网络/文件/设置。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,8 +103,10 @@ impl HostCtx {
                 }
                 let title = p.get("title").and_then(Value::as_str).unwrap_or("");
                 let body = p.get("body").and_then(Value::as_str).unwrap_or("");
-                // M3：写到 stderr；M5 接系统通知与 UI。
-                eprintln!("[plugin:{}] 🔔 {title} — {body}", self.plugin_id);
+                // 宿主有界面时走界面消息（可翻查），否则退回 stderr。
+                if !emit_notify(&self.plugin_id, title, body) {
+                    eprintln!("[plugin:{}] 🔔 {title} — {body}", self.plugin_id);
+                }
                 self.ok()
             }
             "getTask" => {

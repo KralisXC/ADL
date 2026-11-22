@@ -5,6 +5,7 @@
 //! 配置与历史在 `adl-app`。浏览器接管用的本地 HTTP API 仍由 `api_server` 提供。
 
 mod api_server;
+mod notice;
 mod platform;
 
 use std::collections::BTreeMap;
@@ -47,6 +48,9 @@ pub(crate) struct Gui {
     pub(crate) rt: tokio::runtime::Runtime,
     pub(crate) cfg: Mutex<Config>,
     pub(crate) hooks: Mutex<Arc<PluginHooks>>,
+    /// 后台（下载任务、插件线程）要弹给用户的消息。界面每帧取走，
+    /// 因为那些线程拿不到 `App`，只能往这里塞。
+    pub(crate) pending_notices: Mutex<Vec<(notice::Level, String, String)>>,
 }
 
 #[derive(Clone)]
@@ -87,6 +91,14 @@ fn snapshot(gui: &Gui) -> Vec<TaskView> {
 enum Tab {
     Home,
     Tasks,
+    /// 常驻的「插件」页：安装 / 启用停用 / 查看声明。
+    ///
+    /// 和下面的 `Plugin(..)` 是两件事：`Plugin` 是**插件自己声明的页面**
+    /// （由插件返回组件树来画），而 `Plugins` 是宿主自己的管理页，插件没装
+    /// 也能进。
+    Plugins,
+    /// 消息中心：下载完成 / 失败 / 插件通知留档在这里。
+    Notices,
     Settings,
     Plugin(String, String),
 }
@@ -156,6 +168,10 @@ struct App {
     /// 本帧的换页进度（0.0..=1.0，缓出）。每帧在 `ui()` 开头算一次，
     /// 侧栏擦入和页面下刷共用同一个值，两者才像同一次切换。
     page_fill: f32,
+    /// 消息中心（持久化到 `notices.json`）。
+    notices: notice::Store,
+    /// 右下角 toast：当前显示的那条 + 它出现的时间。
+    toast: Option<(notice::Notice, Instant)>,
 }
 
 /// 首次点关闭时问用户"退出还是最小化"。
@@ -200,6 +216,12 @@ const NAV_FILL_SECS: f32 = 0.16;
 /// 状态提示条显示时长与"末尾淡出"区间。
 const STATUS_SECS: f32 = 6.0;
 const STATUS_FADE: f32 = 0.45;
+
+/// 右下角 toast 停留时长与末尾淡出区间。
+///
+/// 比状态条短：toast 盖在内容上，挡久了烦；重要的事都进「消息」页了。
+const TOAST_SECS: f32 = 4.0;
+const TOAST_FADE: f32 = 0.35;
 
 /// 弹窗淡入计时器。
 ///
@@ -267,7 +289,7 @@ impl App {
 
         let cfg = gui.cfg.lock().unwrap().clone();
         // ADL_TAB 仅用于开发/截图脚本直达某个页面，不写进文档：
-        //   home | tasks | settings | add | plugin:<pluginId>:<pageId>
+        //   home | tasks | plugins | notices | settings | add | plugin:<pluginId>:<pageId>
         // `add` 现在打开弹窗而不是切页。
         let mut add_open = false;
         let initial_tab = match std::env::var("ADL_TAB").unwrap_or_default().as_str() {
@@ -276,6 +298,8 @@ impl App {
                 Tab::Tasks
             }
             "home" => Tab::Home,
+            "plugins" => Tab::Plugins,
+            "notices" => Tab::Notices,
             "settings" => Tab::Settings,
             s if s.starts_with("plugin:") => {
                 let mut it = s.trim_start_matches("plugin:").splitn(2, ':');
@@ -323,11 +347,35 @@ impl App {
             page_start: None,
             page_last_tab: None,
             page_fill: 1.0,
+            notices: notice::Store::load(),
+            toast: None,
         }
     }
 
     fn set_status(&mut self, msg: impl Into<String>, err: bool) {
         self.status = Some((msg.into(), err, Instant::now()));
+    }
+
+    /// 记一条消息：落盘 + 立刻弹 toast。
+    ///
+    /// `set_status` 那条 6 秒就消失，重要事件（下完 / 失败 / 插件通知）
+    /// 走这里才翻得回来。
+    fn notify(&mut self, level: notice::Level, title: impl Into<String>, body: impl Into<String>) {
+        let title = title.into();
+        let body = body.into();
+        self.notices.push(level, title.clone(), body.clone());
+        self.notices.save();
+        self.toast = Some((
+            notice::Notice {
+                id: 0,
+                level,
+                title,
+                body,
+                at: adl_app::history::now_unix(),
+                read: false,
+            },
+            Instant::now(),
+        ));
     }
 
     fn refresh_plugin_snapshot(&mut self) {
@@ -336,6 +384,12 @@ impl App {
         }
         let hooks = self.gui.hooks.lock().unwrap().clone();
         self.plugin_snapshot = hooks.ui_snapshot(&load_plugin_settings());
+        if std::env::var_os("ADL_DEBUG_PLUGINS").is_some() {
+            eprintln!(
+                "[dbg] all = {}",
+                serde_json::to_string(&self.plugin_snapshot.get("all")).unwrap_or_default()
+            );
+        }
         self.plugin_snapshot_at = Instant::now();
     }
 
@@ -691,12 +745,27 @@ impl eframe::App for App {
                             match self.tab.clone() {
                                 Tab::Home => self.page_home(ui),
                                 Tab::Tasks => self.page_tasks(ui),
+                                Tab::Plugins => self.page_plugins(ui),
+                                Tab::Notices => self.page_notices(ui),
                                 Tab::Settings => self.page_settings(ui),
                                 Tab::Plugin(_, _) => self.page_plugin(ui),
                             }
                         });
                 });
             });
+
+        // 后台线程（下载任务、插件）投递过来的消息：每帧取空。
+        // 放在弹窗之前取，这样同帧就能弹 toast。
+        let incoming: Vec<(notice::Level, String, String)> = {
+            let mut q = self.gui.pending_notices.lock().unwrap();
+            std::mem::take(&mut *q)
+        };
+        for (level, title, body) in incoming {
+            self.notify(level, title, body);
+        }
+
+        // 右下角 toast：4 秒后自己淡出消失，点了跳「消息」页。
+        self.show_toast(&ctx);
 
         // 弹窗淡入：先根据"当前开着哪个 overlay"确定身份，再决定透明度。
         let overlay = if self.add_open {
@@ -781,6 +850,23 @@ impl App {
         if track(ui, self.tab == Tab::Tasks, "任务列表") {
             self.tab = Tab::Tasks;
         }
+        ui.add_space(2.0);
+        // 常驻插件页：装了什么、启用没启用、声明了哪些 hook，都在这儿看。
+        // 它上面的"插件页面"分组是插件自己声明的页，两者不冲突。
+        if track(ui, self.tab == Tab::Plugins, "插件") {
+            self.tab = Tab::Plugins;
+        }
+        ui.add_space(2.0);
+        // 消息中心：入口带未读数，红了才让人想起来去点。
+        let unread = self.notices.unread();
+        let label = if unread > 0 {
+            format!("消息 ({unread})")
+        } else {
+            "消息".to_string()
+        };
+        if track(ui, self.tab == Tab::Notices, &label) {
+            self.tab = Tab::Notices;
+        }
 
         // ── 插件：页面 + 最多 5 个设置入口，超出的走"更多设置" ──
         let pages = self
@@ -807,7 +893,9 @@ impl App {
 
         if !pages.is_empty() || !setting_plugins.is_empty() {
             ui.add_space(14.0);
-            ui.label(egui::RichText::new("插件").size(11.5).color(muted()));
+            // 分组标题叫"插件页面"而不是"插件"：上面那个常驻导航项已经叫
+            // "插件"了，两个同名会让人以为是同一个入口。
+            ui.label(egui::RichText::new("插件页面").size(11.5).color(muted()));
             ui.add_space(6.0);
             for p in pages {
                 let plugin = p
@@ -937,6 +1025,8 @@ impl App {
         match &self.tab {
             Tab::Home => "主页".to_string(),
             Tab::Tasks => "任务列表".to_string(),
+            Tab::Plugins => "插件".to_string(),
+            Tab::Notices => "消息".to_string(),
             Tab::Settings => "设置".to_string(),
             Tab::Plugin(plugin, page) => {
                 // 插件设置伪页面：`adl` + `settings:<pluginId>`
@@ -1863,6 +1953,446 @@ impl App {
             for (p, k, v) in pending {
                 self.save_plugin_setting(&p, &k, &v);
             }
+        }
+    }
+
+    /// 常驻的「插件」页：装了什么、启用没启用、声明了哪些 hook。
+    ///
+    /// 这一版只做骨架（用户原话"先做大概，不用全部功能做了先"）：能看清单、
+    /// 能开关、能打开插件目录、能刷新。**没有**在线安装/卸载/更新。
+    fn page_plugins(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(2.0);
+
+        let mut all: Vec<Value> = self
+            .plugin_snapshot
+            .get("all")
+            .and_then(|x| x.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        // 顶部：目录位置 + 两个动作
+        let root = {
+            let cfg = self.gui.cfg.lock().unwrap();
+            plugins_root(&cfg)
+        };
+
+        // 停用的插件不在快照里（没被加载），得从目录补回来，否则停用一次
+        // 就再也点不到「启用」了。
+        {
+            let known: Vec<String> = all
+                .iter()
+                .filter_map(|p| p.get("id").and_then(|x| x.as_str()).map(String::from))
+                .collect();
+            all.extend(disabled_plugin_entries(root.as_ref(), &known));
+
+            // 启用的排前面，同组按 id 排，列表才不会因为开关一次就跳动。
+            let enabled_map: Vec<bool> = {
+                let cfg = self.gui.cfg.lock().unwrap();
+                all.iter()
+                    .map(|p| {
+                        let id = p.get("id").and_then(|x| x.as_str()).unwrap_or("");
+                        cfg.plugin_enabled(id)
+                    })
+                    .collect()
+            };
+            let mut idx: Vec<usize> = (0..all.len()).collect();
+            idx.sort_by(|&a, &b| {
+                let id = |i: usize| {
+                    all[i]
+                        .get("id")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                };
+                (!enabled_map[a], id(a)).cmp(&(!enabled_map[b], id(b)))
+            });
+            all = idx.into_iter().map(|i| all[i].clone()).collect();
+        }
+        let mut open_dir = false;
+        let mut refresh = false;
+        adl_ui::widgets::card(ui, |ui| {
+            adl_ui::widgets::section_title(ui, "插件目录");
+            ui.add_space(4.0);
+            // 没有插件目录时 build_hooks 会退化成空集合，这里如实说清楚
+            // 目录在哪（也可能是"还没建出来"）。
+            let shown = root
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "（未配置）".to_string());
+            ui.label(
+                egui::RichText::new(shown)
+                    .font(egui::FontId::monospace(12.5))
+                    .color(pal().ink),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("打开插件目录").clicked() {
+                    open_dir = true;
+                }
+                if ui.button("重新扫描").clicked() {
+                    refresh = true;
+                }
+            });
+            ui.add_space(6.0);
+            adl_ui::widgets::hint(
+                ui,
+                "把插件文件夹（含 plugin.toml）放进这个目录，再点「重新扫描」就会出现在下面。\
+                 插件只在启动/重扫时加载，运行中的任务用不上新加载的插件。",
+            );
+        });
+
+        if open_dir {
+            if let Some(dir) = root.as_ref() {
+                match platform::open_path(dir) {
+                    Ok(()) => {}
+                    Err(e) => self.set_status(format!("打开目录失败: {e}"), true),
+                }
+            }
+        }
+        if refresh {
+            // 重建 hooks + 让快照立刻失效，否则页面要等 1.2 秒才更新。
+            let new_cfg = self.gui.cfg.lock().unwrap().clone();
+            *self.gui.hooks.lock().unwrap() = build_hooks(&new_cfg);
+            self.plugin_snapshot_at = Instant::now() - Duration::from_secs(3600);
+            self.set_status("已重新扫描插件目录", false);
+        }
+
+        ui.add_space(14.0);
+
+        if all.is_empty() {
+            adl_ui::widgets::empty_state(
+                ui,
+                "还没装任何插件。内置的 ua-fixer / auto-concurrency / notify-on-complete / \
+                 block-html 在程序目录的 plugins/ 下。",
+            );
+            return;
+        }
+
+        // 启停要等所有卡片画完再落盘：卡片闭包里已经借了 self.gui 的锁，
+        // 在闭包里写配置容易死锁（同一把 Mutex 重复 lock）。
+        let mut toggle: Option<(String, bool)> = None;
+
+        for p in &all {
+            let id = p.get("id").and_then(|x| x.as_str()).unwrap_or("");
+            if id.is_empty() {
+                continue;
+            }
+            let name = p.get("name").and_then(|x| x.as_str()).unwrap_or(id);
+            let version = p.get("version").and_then(|x| x.as_str()).unwrap_or("");
+            let desc = p.get("description").and_then(|x| x.as_str()).unwrap_or("");
+            let has_ui = p.get("has_ui").and_then(|x| x.as_bool()).unwrap_or(false);
+            let trusted = p.get("trusted").and_then(|x| x.as_bool()).unwrap_or(false);
+            let enabled = self.gui.cfg.lock().unwrap().plugin_enabled(id);
+            let hooks = str_list(p.get("hooks"));
+            let active = str_list(p.get("active_hooks"));
+            // 权限是"声明"，不等于授权：safe 模式下 Transform 类 hook 不生效，
+            // 所以同时显示"声明了几个"和"当前生效几个"。
+            let perms = permission_labels(p.get("permissions"));
+
+            adl_ui::widgets::card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    // 必须显式给色：`.strong()` 走 `visuals.strong_text_color()`，
+                    // 也就是 `widgets.active.text_color()` —— 我们的主题把 active 设为
+                    // 白色（青绿按钮上要白字），于是不带 `.color()` 的 strong 文本
+                    // 会画成白字，在白卡上整行消失。
+                    let title_color = if enabled { ink() } else { muted() };
+                    ui.label(
+                        egui::RichText::new(name)
+                            .size(14.5)
+                            .strong()
+                            .color(title_color),
+                    );
+                    if !version.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!("v{version}"))
+                                .small()
+                                .color(muted()),
+                        );
+                    }
+                    ui.add_space(6.0);
+                    if !enabled {
+                        adl_ui::widgets::badge(ui, "已停用", pal().muted);
+                    } else if trusted {
+                        adl_ui::widgets::badge(ui, "信任模式", pal().warn);
+                    } else {
+                        adl_ui::widgets::badge(ui, "安全模式", pal().accent);
+                    }
+                    if has_ui {
+                        adl_ui::widgets::badge(ui, "有界面", pal().accent);
+                    }
+                });
+
+                if !desc.is_empty() {
+                    ui.add_space(3.0);
+                    ui.label(
+                        egui::RichText::new(desc)
+                            .size(12.5)
+                            .color(if enabled { pal().ink } else { muted() }),
+                    );
+                }
+
+                ui.add_space(6.0);
+                // hook 行：生效的用主色，被安全模式挡住的用灰色并标注。
+                if !hooks.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.label(egui::RichText::new("hook").small().color(muted()));
+                        for h in &hooks {
+                            let on = active.iter().any(|a| a == h);
+                            let short = h.trim_start_matches("on");
+                            if on {
+                                adl_ui::widgets::badge(ui, short, pal().accent);
+                            } else {
+                                adl_ui::widgets::badge(ui, short, pal().muted);
+                            }
+                        }
+                    });
+                }
+                if !perms.is_empty() {
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.label(egui::RichText::new("权限").small().color(muted()));
+                        for (label, on) in &perms {
+                            if *on {
+                                adl_ui::widgets::badge(ui, label, pal().warn);
+                            } else {
+                                adl_ui::widgets::badge(ui, label, pal().muted);
+                            }
+                        }
+                    });
+                }
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let label = if enabled { "停用" } else { "启用" };
+                    if ui.button(label).clicked() {
+                        toggle = Some((id.to_string(), !enabled));
+                    }
+                });
+            });
+            ui.add_space(8.0);
+        }
+
+        if let Some((id, want)) = toggle {
+            let mut cfg = self.gui.cfg.lock().unwrap();
+            cfg.plugins
+                .insert(id.clone(), adl_app::config::PluginCfg { enabled: want });
+            if let Err(e) = cfg.save() {
+                drop(cfg);
+                self.set_status(format!("保存插件开关失败: {e}"), true);
+            } else {
+                let new_cfg = cfg.clone();
+                drop(cfg);
+                *self.gui.hooks.lock().unwrap() = build_hooks(&new_cfg);
+                self.plugin_snapshot_at = Instant::now() - Duration::from_secs(3600);
+                self.set_status(
+                    if want {
+                        format!("已启用插件 {id}")
+                    } else {
+                        format!("已停用插件 {id}")
+                    },
+                    false,
+                );
+            }
+        }
+    }
+
+    /// 消息中心：下载完成 / 失败 / 插件通知留档在这里。
+    ///
+    /// 时间倒序（新的在上面）：追事件的时候人总是想知道"刚才发生了什么"。
+    fn page_notices(&mut self, ui: &mut egui::Ui) {
+        let unread = self.notices.unread();
+        let total = self.notices.items.len();
+
+        let mut mark_read = false;
+        let mut clear = false;
+        adl_ui::widgets::card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(if total == 0 {
+                        "还没有消息".to_string()
+                    } else if unread > 0 {
+                        format!("共 {total} 条，{unread} 条未读")
+                    } else {
+                        format!("共 {total} 条，全部已读")
+                    })
+                    .size(13.0)
+                    .color(ink()),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add_enabled(total > 0, egui::Button::new("清空")).clicked() {
+                        clear = true;
+                    }
+                    if ui
+                        .add_enabled(unread > 0, egui::Button::new("全部已读"))
+                        .clicked()
+                    {
+                        mark_read = true;
+                    }
+                });
+            });
+            ui.add_space(4.0);
+            adl_ui::widgets::hint(
+                ui,
+                "下载完成、下载失败、插件通过 notify 权限发来的提醒都会记在这里。\
+                 最多保留最近 200 条。",
+            );
+        });
+
+        if clear {
+            self.notices.clear();
+            self.notices.save();
+            self.toast = None;
+        } else if mark_read {
+            self.notices.mark_all_read();
+            self.notices.save();
+            self.toast = None;
+        }
+
+        if total == 0 {
+            ui.add_space(10.0);
+            adl_ui::widgets::empty_state(ui, "消息是空的。下完一个文件、或者某个插件提醒你的时候，会出现在这里。");
+            return;
+        }
+
+        ui.add_space(10.0);
+        let items: Vec<notice::Notice> = self.notices.items.iter().rev().cloned().collect();
+        for n in &items {
+            let (dot, tone) = match n.level {
+                notice::Level::Info => (pal().accent, pal().accent),
+                notice::Level::Ok => (egui::Color32::from_rgb(0x2E, 0x7D, 0x6B), pal().accent),
+                notice::Level::Warn => (pal().warn, pal().warn),
+                notice::Level::Error => (pal().danger, pal().danger),
+            };
+            adl_ui::widgets::card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    // 未读用实心点，已读用空心 —— 比改整行底色克制得多。
+                    let dot_at = egui::pos2(ui.cursor().left() + 4.0, ui.cursor().top() + 9.0);
+                    if n.read {
+                        ui.painter().circle_stroke(dot_at, 3.2, egui::Stroke::new(1.2, dot));
+                    } else {
+                        ui.painter().circle_filled(dot_at, 3.4, dot);
+                    }
+                    ui.add_space(14.0);
+                    ui.label(
+                        egui::RichText::new(&n.title)
+                            .size(13.5)
+                            .strong()
+                            .color(if n.read { muted() } else { ink() }),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(notice::ago(n.at))
+                                .small()
+                                .color(muted()),
+                        );
+                        ui.add_space(8.0);
+                        adl_ui::widgets::badge(ui, n.level.label(), tone);
+                    });
+                });
+                if !n.body.is_empty() {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(14.0);
+                        ui.label(
+                            egui::RichText::new(&n.body)
+                                .size(12.5)
+                                .color(if n.read { muted() } else { pal().ink }),
+                        );
+                    });
+                }
+            });
+            ui.add_space(8.0);
+        }
+    }
+
+    /// 右下角 toast：4 秒后淡出。
+    ///
+    /// 刻意不拦截点击（点别处照常生效），但点它本身会跳到「消息」页 ——
+    /// 那种"刚才好像弹了个什么"的时候，一口气就能翻到全部。
+    fn show_toast(&mut self, ctx: &egui::Context) {
+        let Some((n, at)) = self.toast.clone() else {
+            return;
+        };
+        let el = at.elapsed().as_secs_f32();
+        if el > TOAST_SECS {
+            self.toast = None;
+            return;
+        }
+        // 最后 0.35 秒淡出；淡出期间要持续请求重绘，否则窗口静止时会停在半透明。
+        let alpha = ((TOAST_SECS - el) / TOAST_FADE).clamp(0.0, 1.0);
+        if alpha < 1.0 {
+            ctx.request_repaint();
+        }
+
+        let (dot, tone) = match n.level {
+            notice::Level::Info => (pal().accent, pal().accent),
+            notice::Level::Ok => (egui::Color32::from_rgb(0x2E, 0x7D, 0x6B), pal().accent),
+            notice::Level::Warn => (pal().warn, pal().warn),
+            notice::Level::Error => (pal().danger, pal().danger),
+        };
+
+        let mut clicked = false;
+        egui::Area::new(egui::Id::unique("adl_toast"))
+            .order(egui::Order::Tooltip)
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-18.0, -18.0))
+            // `Area` 自带 fade_in，会和这里的 alpha 叠乘；toast 只活 4 秒，
+            // 再叠一层入场淡入会显得发虚，所以关掉。
+            .fade_in(false)
+            .show(ctx, |ui| {
+                ui.set_opacity(alpha);
+                let mut frame = egui::Frame::popup(&ctx.style_of(egui::Theme::Light));
+                frame.fill = fade_color(frame.fill, alpha);
+                frame.stroke.color = fade_color(frame.stroke.color, alpha);
+                frame.shadow.color = fade_color(frame.shadow.color, alpha);
+                let resp = frame
+                    .inner_margin(egui::Margin::symmetric(14, 10))
+                    .show(ui, |ui| {
+                        ui.set_width(300.0);
+                        ui.horizontal(|ui| {
+                            let dot_at =
+                                egui::pos2(ui.cursor().left() + 4.0, ui.cursor().top() + 8.0);
+                            ui.painter().circle_filled(dot_at, 3.6, dot);
+                            ui.add_space(14.0);
+                            ui.label(
+                                egui::RichText::new(&n.title)
+                                    .size(13.0)
+                                    .strong()
+                                    .color(ink()),
+                            );
+                        });
+                        if !n.body.is_empty() {
+                            ui.add_space(3.0);
+                            ui.horizontal(|ui| {
+                                ui.add_space(14.0);
+                                ui.label(
+                                    egui::RichText::new(&n.body).size(12.0).color(muted()),
+                                );
+                            });
+                        }
+                        ui.add_space(3.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(14.0);
+                            adl_ui::widgets::badge(ui, n.level.label(), tone);
+                            ui.label(
+                                egui::RichText::new("点击查看全部")
+                                    .small()
+                                    .color(muted()),
+                            );
+                        });
+                    })
+                    .response;
+                if resp.interact(egui::Sense::click()).clicked() {
+                    clicked = true;
+                }
+            });
+
+        if clicked {
+            self.tab = Tab::Notices;
+            self.toast = None;
+            self.notices.mark_all_read();
+            self.notices.save();
         }
     }
 
@@ -2871,12 +3401,17 @@ fn display_name(t: &TaskView) -> String {
     {
         return name.to_string();
     }
-    let no_query = t.url.split(['?', '#']).next().unwrap_or(&t.url);
+    display_name_of_url(&t.url)
+}
+
+/// 从 URL 猜一个显示名：去掉 query/fragment，取最后一段路径。
+fn display_name_of_url(url: &str) -> String {
+    let no_query = url.split(['?', '#']).next().unwrap_or(url);
     let tail = no_query.trim_end_matches('/');
     let last = tail.rsplit('/').find(|s| !s.is_empty());
     match last {
         Some(s) => s.to_string(),
-        None => t.url.clone(),
+        None => url.to_string(),
     }
 }
 
@@ -2983,12 +3518,120 @@ fn format_speed_unit(bps: u64, unit: &str) -> String {
 
 // ───────────────────────── 与后端交互（复用原有逻辑） ─────────────────────────
 
+/// 从 `ui_snapshot["all"][i]["hooks"]` 这类 JSON 数组里取字符串列表。
+fn str_list(v: Option<&Value>) -> Vec<String> {
+    v.and_then(|x| x.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 把 `permissions` 对象翻成 [(显示名, 是否声明)]，空的权限不显示。
+fn permission_labels(v: Option<&Value>) -> Vec<(String, bool)> {
+    let Some(obj) = v.and_then(|x| x.as_object()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (key, name) in [
+        ("net", "网络"),
+        ("exec", "执行"),
+        ("notify", "通知"),
+    ] {
+        if obj.get(key).and_then(|x| x.as_bool()).unwrap_or(false) {
+            out.push((name.to_string(), true));
+        }
+    }
+    // 文件权限是数组，非空才算声明过。
+    for (key, name) in [("fs_read", "读文件"), ("fs_write", "写文件")] {
+        let n = obj
+            .get(key)
+            .and_then(|x| x.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        if n > 0 {
+            out.push((format!("{name}×{n}"), true));
+        }
+    }
+    out
+}
+
 fn plugins_root(cfg: &Config) -> Option<PathBuf> {
     cfg.plugin_dir_opt().or_else(|| {
         std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.join("plugins")))
     })
+}
+
+/// 补上「已停用」的插件条目。
+///
+/// 快照里的 `all` 来自**已加载**的插件，而 `build_hooks` 在加载阶段就把停用的
+/// 插件过滤掉了 —— 于是停用一次，这个插件就会从清单里彻底消失，再也点不到
+/// 「启用」。这里直接扫目录读 `plugin.toml`，把清单里没有的补成停用条目。
+fn disabled_plugin_entries(root: Option<&PathBuf>, known: &[String]) -> Vec<Value> {
+    let Some(root) = root else {
+        return Vec::new();
+    };
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for e in rd.flatten() {
+        let dir = e.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let manifest = dir.join(adl_plugin::MANIFEST_FILE);
+        if !manifest.is_file() {
+            continue;
+        }
+        // 坏 manifest 直接跳过：这个页面只是清单，不该因为一个坏插件整页报错。
+        let Ok(m) = adl_plugin::Manifest::load(&manifest) else {
+            continue;
+        };
+        if known.iter().any(|k| k == &m.id) {
+            continue;
+        }
+        let mut hooks: Vec<String> = m
+            .hook_subscriptions()
+            .into_iter()
+            .map(|(hp, _)| hp.canonical().to_string())
+            .collect();
+        hooks.sort();
+        let has_ui = !(m.ui.pages.is_empty()
+            && m.ui.actions.is_empty()
+            && m.ui.settings.is_empty()
+            && m.ui.commands.is_empty());
+        out.push(json!({
+            "id": m.id,
+            "name": m.name,
+            "version": m.version,
+            "description": m.description,
+            "api_version": m.api_version,
+            "kind": m.kind,
+            "dir": dir.display().to_string(),
+            "trusted": false,
+            "has_ui": has_ui,
+            "hooks": hooks,
+            // 停用的插件没被加载，谈不上"生效的 hook"，留空即可。
+            "active_hooks": Vec::<String>::new(),
+            "pages": m.ui.pages.len(),
+            "actions": m.ui.actions.len(),
+            "settings": m.ui.settings.len(),
+            "commands": m.ui.commands.len(),
+            "permissions": json!({
+                "net": m.permissions.net,
+                "exec": m.permissions.exec,
+                "notify": m.permissions.notify,
+                "fs_read": m.permissions.fs_read,
+                "fs_write": m.permissions.fs_write,
+            }),
+        }));
+    }
+    out
 }
 
 fn build_hooks(cfg: &Config) -> Arc<PluginHooks> {
@@ -3213,6 +3856,38 @@ pub(crate) fn add_task(gui: &Arc<Gui>, args: &Value) -> Result<Value, String> {
 
         let res = download(opts, hooks, Some(progress)).await;
 
+        // 完成 / 失败都记一条消息：状态条 6 秒就没了，用户切走页面就看不到
+        // "那个到底下完没有"。
+        match &res {
+            Ok(r) => {
+                let name = r
+                    .path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| display_name_of_url(&url));
+                if let Ok(mut q) = gui2.pending_notices.lock() {
+                    q.push((
+                        notice::Level::Ok,
+                        format!("下载完成：{name}"),
+                        format!(
+                            "{} · 用时 {:.1} 秒",
+                            format_bytes(r.total),
+                            start.elapsed().as_secs_f64()
+                        ),
+                    ));
+                }
+            }
+            Err(e) => {
+                if let Ok(mut q) = gui2.pending_notices.lock() {
+                    q.push((
+                        notice::Level::Error,
+                        format!("下载失败：{}", display_name_of_url(&url)),
+                        e.to_string(),
+                    ));
+                }
+            }
+        }
+
         let mut tasks = gui2.tasks.lock().unwrap();
         if let Some(t) = tasks.iter_mut().find(|t| t.id == id) {
             match &res {
@@ -3347,7 +4022,29 @@ fn main() -> eframe::Result {
             .expect("构建 tokio 运行时失败"),
         cfg: Mutex::new(cfg.clone()),
         hooks: Mutex::new(build_hooks(&cfg)),
+        pending_notices: Mutex::new(Vec::new()),
     });
+
+    // 插件线程调 `adl.notify()` 时往 pending_notices 里塞，界面每帧取走。
+    // 插件跑在各自的 OS 线程上，拿不到 `App`，只能走这个通道。
+    {
+        let g = gui.clone();
+        adl_plugin::hostapi::set_notify_sink(Some(std::sync::Arc::new(
+            move |plugin: &str, title: &str, body: &str| {
+                if let Ok(mut q) = g.pending_notices.lock() {
+                    q.push((
+                        notice::Level::Info,
+                        if title.is_empty() {
+                            format!("插件 {plugin}")
+                        } else {
+                            title.to_string()
+                        },
+                        body.to_string(),
+                    ));
+                }
+            },
+        )));
+    }
 
     // 浏览器接管用的本地 API（与 UI 同进程共享状态）
     let api_port = std::env::var("ADL_API_PORT")

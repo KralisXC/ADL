@@ -929,7 +929,15 @@ cargo build --release
   * 服务端放 32 个（≥ 目标）→ 1.03s、SHA 一致、**0 拒绝**（不降档）。
   * 服务端全拒（`max_conc=0`）→ 0.13s 内 fail-fast 报 `HTTP 429` / aria2 码 29，不挂死。
   * 极端 `max_conc=1` → 40s 完成、SHA 一致（人工服务器对"瞬时 2 连接"也回 429，导致多次重试退避，属人为极限场景，不代表真实服务器）。
-- **单测**：`clamp_concurrency_cases` / `controller_drops_to_working_level` / `controller_probes_up_toward_target` / `controller_never_exceeds_target`。
+- **单测**：`clamp_concurrency_cases` / `controller_drops_to_working_level` / `controller_probes_up_toward_target` / `controller_never_exceeds_target` / `line_lost_resets_probe_interval` / `line_lost_backs_off_only_fresh_stall`。
+
+**M2.3 线路停发要立刻重置试探间隔（按用户 m10015 的实际疑问）**：
+- **问题**：向上试探有个真实漏洞 —— 试探**成功**了（新线路撑过了 `PROBE_GRACE`），但下载一段时间后服务器突然不再发数据。这种"停发"既没有连接错误、也没有 4xx，走不到 `on_capacity_failure`，于是 `probe_interval` 会一直卡在被翻倍过的值上（最多 `PROBE_MAX`=**300s**）。表现就是：线路早停了，程序却要再干等五分钟才重新试探。
+- **修法**：ticker 里检测"有连接的 `last_change` 超过 `STALL_SECS`(12s)、且距上次容量事件也超过 12s"，调 `ConcController::on_line_lost(fresh_stalled, floor)`：
+  * `probe_interval` 立刻回到 `PROBE_BASE`(20s)、`probing_since = None`、`last_capacity = now`；
+  * 只有"**新试探的那条线路一个字节都没收到**"（`fresh_stalled`）才 `effective -= 1`，下限是当前真正跑通的连接数（`ok_now.max(1)`）；老线路停发只重置间隔、不降并发。
+- **`last_capacity = now` 兼作节流**：12 秒内最多重置一次，否则每个 tick 都往后推，`now - last_capacity` 永远到不了 `probe_interval`，反而永远试探不上去。
+- **单测**：`line_lost_resets_probe_interval`（300s → 20s，且随后能 +1）、`line_lost_backs_off_only_fresh_stall`（只在新线路零字节时降档，`floor` 保护）。
 
 **M2.2 真实下载场景适配（按用户 m01907 / m02040 的实际经验）**：
 - **默认 UA 冒充浏览器**：`http::DEFAULT_UA` 固定为一个 Windows Chrome UA（`Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36`）。用户明确要求：aria2/ADL 这类基础 UA 会被服务器直接判为爬虫拒绝（百度网盘等反盗链站尤甚）。个别站要特定 UA 时用 `--user-agent` 覆盖。
@@ -1732,7 +1740,73 @@ pnt.rect_filled(rect, CornerRadius::same(th.radius.nav), p.accent_soft);
 用 `burst.cs` 连拍。实测 `burst-03.png`（t≈963ms）能同时看到：竖条停在"主页"与
 "任务列表"之间、主页底色擦入到约 60% 宽、页面内容半透明 —— 三项动效都在动。
 
-### 13.13 待续
+### 13.13 常驻插件页与消息中心
+
+**常驻「插件」页**（`Tab::Plugins`，`ADL_TAB=plugins`）
+
+用户要的是"安装插件和管理插件的地方"。它和侧栏下面那个"**插件页面**"分组是两件事：
+`Tab::Plugin(id, page)` 是**插件自己声明的页面**（由插件返回组件树、宿主负责画），
+而 `Tab::Plugins` 是宿主的管理页，**一个插件都没装也能进**。
+
+- **数据源**：`adl_plugin::ui::collect()` 新增的 `"all"` 键。原有的 `"plugins"`
+  只收"有 UI 的"插件（`pages/actions/settings/commands` 任一非空），而真正干活的
+  `ua-fixer`、`block-html` 恰好没有 UI —— 只列 `"plugins"` 的话管理页会空掉一半。
+  所以 `collect()` 里把 push 提到 `if !has_ui { continue; }` **之前**。
+- **停用的插件会从快照里消失**：`build_hooks` 在加载阶段就 `.filter(|p| cfg.plugin_enabled(&p.id))`，
+  停用过的插件根本没被加载，也就不在 `"all"` 里 —— 表现是"点一次停用，这个插件就
+  从列表里消失了，再也点不到启用"。修法是 `disabled_plugin_entries(root, known)`：
+  扫插件目录、读 `plugin.toml`、跳过已在快照里的，按 `collect()` 同构补一条。
+  坏 manifest 直接 `continue`（一个坏插件不该让整页报错）。
+- **排序**：启用的排前面，同组按 id 排。否则开关一次，卡片会跳到列表另一头。
+- **启停落盘**：`cfg.plugins.insert(id, PluginCfg { enabled })` → `cfg.save()` →
+  `*gui.hooks.lock() = build_hooks(&new_cfg)` → 快照立即失效。
+  卡片闭包里已经借了 `self.gui` 的锁，**在闭包里写配置会死锁** —— 点击结果先收到
+  `let mut toggle: Option<(String, bool)>`，全部卡片画完再落盘。
+
+**消息中心**（`crates/adl-gui/src/notice.rs`，`Tab::Notices`，`ADL_TAB=notices`）
+
+以前所有反馈都走底部状态条，6 秒后消失；用户切走了就再也看不到"那个到底下完没有"。
+
+- `Level{Info, Ok, Warn, Error}` + `Notice{id, level, title, body, at, read}`，落盘到
+  `%LOCALAPPDATA%\ADL\notices.json`（原子写 `.json.tmp`，读的时候剥 BOM，读坏当空库）。
+- **上限 200 条**：这是下载器不是日志系统，留太多只会让「消息」页变成负担。
+- **未读用实心圆点、已读用空心圆**，不改整行底色（克制，也省得和 accent_soft 撞）。
+- 侧栏入口写 `消息 (N)`，N 是未读数；全部已读后回到纯"消息"。
+
+**toast 弹窗**
+
+- `Area::new(Id::unique("adl_toast")).order(Order::Tooltip).anchor(RIGHT_BOTTOM, (-18,-18))`，
+  4 秒后最后 0.35 秒淡出。淡出期间必须 `ctx.request_repaint()`，否则窗口静止时会停在半透明。
+- **`Area` 自带 `fade_in` 会和外层 alpha 叠乘**（`area.rs` 在 ui 建好后自己
+  `multiply_opacity`），toast 只活 4 秒，再叠一层入场淡入会显得发虚 → `.fade_in(false)`。
+- 卡片底色/描边/阴影也要自己跟着 `alpha` 走（`fade_frame` 那套的 `fade_color`），
+  否则会出现"文字淡了、白卡还在"。
+- 点 toast 跳「消息」页并标记全部已读。
+
+**后台线程 → 界面的通道**
+
+下载任务跑在 tokio 上、插件跑在各自的 OS 线程上，它们都拿不到 `App`：
+
+- `Gui::pending_notices: Mutex<Vec<(Level, String, String)>>`，`fn ui()` 每帧
+  `std::mem::take` 取空后逐条 `self.notify(...)`。
+- 插件侧走 `adl_plugin::hostapi::set_notify_sink(Some(Arc::new(...)))`：
+  `adl.notify()` 从"写 stderr"升级成"落到界面上"。**用全局 `OnceLock` 而不是
+  `HostCtx` 字段**，因为 `HostCtx` 在插件加载时就固定了，而宿主（GUI）比插件晚就绪。
+  CLI 不注册 sink，就自然退化成原来的 stderr 行为。
+- 下载完成的文案带"用时 X 秒"：`start.elapsed()` 是 spawn 里那个 `let start`，不是
+  任务结构里的 `elapsed_ms`（后者是给界面进度条用的近似值）。
+
+**文字太浅的修法**（用户 m09142 的第二条要求）
+
+- `Palette::light().muted` 从 `#8A9A98` 压到 **`#5E6D6B`**：白底对比度 3.0:1 → 约 5.9:1，达 WCAG AA。
+- `section_title` 改用 `ink`（小节标题本就该比正文重）。
+- 🔴 **`.strong()` 必须同时 `.color()`**：`widget_text.rs` 里 `strong` 会走
+  `visuals.strong_text_color()`，而它是 `widgets.active.text_color()`；本项目
+  `theme.rs` 把 `active.fg_stroke` 设成白色（青绿按钮上要白字），于是**任何不带
+  `.color()` 的 strong 文本都会画成白字**，在白卡上整行消失。这个 bug 让插件名
+  整行空白了一轮，最后靠像素扫描才发现。
+
+### 13.14 待续
 - Linux/macOS 需在 `eframe` features 补 `x11`/`wayland`；`platform.rs` 的 Win32 部分已用 `#[cfg(windows)]` 隔离。
 - 旧的 `web/`（Vue）与 `static_server.rs` 已不再编入（保留仅作历史），后续可清理。
 - `render_node` 已改用 `adl_ui` 的 `badge`/`card`/`hairline`，但 `table`/`kv`/`grid`
@@ -1751,5 +1825,11 @@ pnt.rect_filled(rect, CornerRadius::same(th.radius.nav), p.accent_soft);
   可选，记得用 `Label::new(..).selectable(true)` 逐个放开，别把全局开关又打开。
 - 淡入目前只覆盖三个 overlay（添加下载 / 关闭询问 / 命令面板）和状态条。页面切换
   还是硬切；若要做，得给 `Tab` 变化也接一条 `Fade` 通道。
+- 消息中心只有"全部已读 / 清空"两个批量动作，没有单条已读、没有按级别过滤。
+  条数上限 200 已经够用，真要翻旧账再补。
+- 插件页只有"启用/停用/打开目录/重新扫描"，**没有卸载**：删目录是不可逆操作，
+  等以后想清楚了再做（要做也得先确认"是删 `plugins/<id>/` 还是移到回收站"）。
+- 插件通知目前都是 `Level::Info`。`notify` 权限没带级别字段，若要区分
+  "警告/错误"，得先在 manifest 或 `adl.notify()` 的 payload 里加 `level`。
 
 

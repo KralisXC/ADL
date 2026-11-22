@@ -22,6 +22,30 @@ fn setting_value(values: &SettingsValues, plugin: &str, key: &str, default: &str
         .unwrap_or_else(|| default.to_string())
 }
 
+/// manifest 里声明的全部 hook 名（`onResolve` 这种规范写法）。
+fn hook_names(p: &LoadedPlugin) -> Vec<String> {
+    p.manifest
+        .hook_subscriptions()
+        .into_iter()
+        .map(|(hp, _)| hp.canonical().to_string())
+        .collect()
+}
+
+/// 当前模式下**实际生效**的 hook 名。
+///
+/// 和 `hook_names` 分开是因为 safe 模式会过滤掉需要 Transform 的点：
+/// 插件页要能告诉用户"你声明了 onPlan，但安全模式下它没跑"。
+fn active_hook_names(p: &LoadedPlugin) -> Vec<String> {
+    let mut v: Vec<String> = p
+        .manifest
+        .active_hooks(p.mode.trusted())
+        .into_iter()
+        .map(|hp| hp.canonical().to_string())
+        .collect();
+    v.sort();
+    v
+}
+
 pub fn collect(plugins: &[LoadedPlugin], values: &SettingsValues, trusted: bool) -> Value {
     let mut pages = Vec::new();
     let mut actions = Vec::new();
@@ -29,6 +53,7 @@ pub fn collect(plugins: &[LoadedPlugin], values: &SettingsValues, trusted: bool)
     let mut commands = Vec::new();
     let mut replace = serde_json::Map::new();
     let mut with_ui = Vec::new();
+    let mut all = Vec::new();
     let mut theme = serde_json::Map::new();
 
     for p in plugins {
@@ -37,6 +62,35 @@ pub fn collect(plugins: &[LoadedPlugin], values: &SettingsValues, trusted: bool)
             || !ui.actions.is_empty()
             || !ui.settings.is_empty()
             || !ui.commands.is_empty();
+
+        // 「全部插件」清单：常驻插件页要显示**没声明 UI 的插件**（它们正是
+        // 干活的那批，比如 ua-fixer / block-html），所以这一份必须在下面的
+        // `continue` 之前收集，不能复用 `with_ui`。
+        all.push(json!({
+            "id": p.id,
+            "name": p.manifest.name,
+            "version": p.manifest.version,
+            "description": p.manifest.description,
+            "api_version": p.manifest.api_version,
+            "kind": p.manifest.kind,
+            "dir": p.dir.display().to_string(),
+            "trusted": p.mode.trusted(),
+            "has_ui": has_ui,
+            "hooks": hook_names(p),
+            "active_hooks": active_hook_names(p),
+            "pages": ui.pages.len(),
+            "actions": ui.actions.len(),
+            "settings": ui.settings.len(),
+            "commands": ui.commands.len(),
+            "permissions": json!({
+                "net": p.manifest.permissions.net,
+                "exec": p.manifest.permissions.exec,
+                "notify": p.manifest.permissions.notify,
+                "fs_read": p.manifest.permissions.fs_read,
+                "fs_write": p.manifest.permissions.fs_write,
+            }),
+        }));
+
         if !has_ui {
             continue;
         }
@@ -100,6 +154,9 @@ pub fn collect(plugins: &[LoadedPlugin], values: &SettingsValues, trusted: bool)
     json!({
         "trusted": trusted,
         "plugins": with_ui,
+        // 全部已加载插件（含没有 UI 的）。侧栏「插件」分组用 `plugins`，
+        // 常驻插件页用 `all` —— 后者才是"装了哪些东西"的完整视图。
+        "all": all,
         "pages": pages,
         "actions": actions,
         "settings": settings,

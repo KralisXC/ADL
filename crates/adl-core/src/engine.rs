@@ -152,6 +152,31 @@ impl ConcController {
             self.probing_since = Some(now);
         }
     }
+
+    /// 某条线路"停了"：连接还在、没有明确错误，但长时间不吐字节。
+    ///
+    /// 这种情况不会走 `on_capacity_failure`（没有 4xx/连接错误），于是
+    /// `probe_interval` 会一直停在被翻倍过很久的值上（最多 `PROBE_MAX` = 5 分钟）。
+    /// 服务器行为明明已经变了，我们却还得再等好几分钟才敢试探下一次 —— 用户
+    /// m10015 要求这时**立刻重置**，下一次试探从 `PROBE_BASE` 重新计时。
+    ///
+    /// `fresh_stalled` = 停在"一条字节都没收到"的新连接上。那多半就是服务器不
+    /// 接受这个并发数，顺手退回 1 条；下限是真正跑通的线路数（`floor`），所以
+    /// 不会一路压到 1 条 —— 压到 9 条而 9 条都在出货时就停下。
+    fn on_line_lost(&mut self, fresh_stalled: bool, floor: usize) -> Option<usize> {
+        let old = self.effective;
+        self.probe_interval = PROBE_BASE;
+        self.probing_since = None;
+        self.last_capacity = Instant::now();
+        if fresh_stalled {
+            self.effective = self.effective.saturating_sub(1).max(floor.max(1));
+        }
+        if self.effective != old {
+            Some(self.effective)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -724,6 +749,30 @@ pub async fn download(
                     let _ = cf.save(&target_path);
                     fatal = Some(AdlError::Stalled);
                     break;
+                }
+                // ── 线路停了：立即重置试探间隔（用户 m10015）──────────
+                //
+                // 试探成功后服务器有可能过一会儿就不给这条线发货了。这种"停了"
+                // 既没有连接错误也没有 4xx，走不到 on_capacity_failure，试探间隔
+                // 就会一直卡在被翻倍过的值上（最多 5 分钟）。这里主动判一次：
+                // 任何一条线超过 STALL_SECS 没有新字节都算"停了"，重置间隔让下一次
+                // 试探从 PROBE_BASE 重新计时；只有"新试探的线路一条字节都没收到"
+                // 才同时把并发退回一档（那才是服务器不接受这个并发数的信号）。
+                let stall_cutoff = Duration::from_secs(STALL_SECS);
+                let ok_now = active.values().filter(|r| r.last_written > 0).count();
+                let any_stalled = active
+                    .values()
+                    .any(|r| now.duration_since(r.last_change) > stall_cutoff);
+                // 节流：on_line_lost 自己会把 last_capacity 推到 now，所以这条判断
+                // 顺带保证了 STALL_SECS 内最多重置一次，不会每 tick 都往后推而永远
+                // 试探不了。
+                let fresh_stalled = active
+                    .values()
+                    .any(|r| r.last_written == 0 && now.duration_since(r.last_change) > stall_cutoff);
+                if any_stalled && now.duration_since(ctrl.last_capacity) > stall_cutoff {
+                    if let Some(new_conc) = ctrl.on_line_lost(fresh_stalled, ok_now) {
+                        hooks.on_degrade(new_conc, "线路停发，重置试探间隔");
+                    }
                 }
                 // ── 僵死检测：慢段抢占 ─────────────────────────────
                 let mut to_preempt: Vec<(u64, usize, usize, u32, u64, u8)> = Vec::new();
@@ -1486,6 +1535,44 @@ mod tests {
             c.maybe_probe();
         }
         assert!(c.effective <= 4);
+    }
+
+    #[test]
+    fn line_lost_resets_probe_interval() {
+        // 试探失败了很多次，间隔被翻到 5 分钟：这时服务器中途停发，下一次试探
+        // 不该还要等 5 分钟，必须立刻回到 PROBE_BASE（用户 m10015）。
+        let mut c = ConcController::new(16);
+        c.effective = 9;
+        c.probe_interval = PROBE_MAX;
+        c.probing_since = Some(Instant::now());
+
+        let changed = c.on_line_lost(false, 9);
+        assert_eq!(c.probe_interval, PROBE_BASE, "间隔应立刻回到基准值");
+        assert!(c.probing_since.is_none(), "试探态应清掉");
+        assert_eq!(changed, None, "没在试探时不该降并发");
+
+        // 回到基准值之后，稳定满 PROBE_BASE 就能马上再探一次。
+        c.last_capacity = Instant::now() - PROBE_BASE - Duration::from_secs(1);
+        c.maybe_probe();
+        assert_eq!(c.effective, 10);
+    }
+
+    #[test]
+    fn line_lost_backs_off_only_fresh_stall() {
+        // 新试探的线路一条字节都没收到 → 服务器不接受这个并发数，退回一档。
+        let mut c = ConcController::new(16);
+        c.effective = 10;
+        let changed = c.on_line_lost(true, 9);
+        assert_eq!(changed, Some(9));
+        assert_eq!(c.effective, 9);
+
+        // 下限是真正跑通的线路数：10 里 9 条还在出货，最多降到 9，不会压到 1。
+        let mut c = ConcController::new(16);
+        c.effective = 10;
+        c.on_line_lost(true, 9);
+        assert_eq!(c.effective, 9, "不应压到比跑通的还低");
+        c.effective = 9;
+        assert_eq!(c.on_line_lost(true, 9), None, "已经在 9 就不再降");
     }
 
     #[test]
