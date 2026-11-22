@@ -2514,22 +2514,49 @@ fn render_node(ui: &mut egui::Ui, plugin: &str, node: &Value, out: &mut Vec<Disp
                     };
                     let (rect, _) =
                         ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+                    // 已完成和当前步都是实心圆，靠"当前步多一圈光晕"区分 ——
+                    // 否则两步同色，用户看不出走到哪了。
+                    if i == cur {
+                        ui.painter().circle_filled(rect.center(), 9.0, c.gamma_multiply(0.22));
+                    }
                     ui.painter().circle_filled(
                         rect.center(),
-                        9.0,
+                        if i == cur { 7.0 } else { 9.0 },
                         if i <= cur { c } else { p.hair },
                     );
-                    ui.painter().text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        format!("{}", i + 1),
-                        egui::FontId::proportional(10.0),
-                        if i <= cur {
-                            egui::Color32::WHITE
-                        } else {
-                            p.muted
-                        },
-                    );
+                    if i < cur {
+                        // 已完成：手画对勾。simhei 没有 ✓ 的字形，用字体符号会
+                        // 渲染成空方块（顶栏图标踩过这个坑）。
+                        let ctr = rect.center();
+                        let s = 4.2;
+                        let stroke = egui::Stroke::new(1.6, egui::Color32::WHITE);
+                        ui.painter().line_segment(
+                            [
+                                egui::pos2(ctr.x - s * 0.9, ctr.y + s * 0.05),
+                                egui::pos2(ctr.x - s * 0.2, ctr.y + s * 0.75),
+                            ],
+                            stroke,
+                        );
+                        ui.painter().line_segment(
+                            [
+                                egui::pos2(ctr.x - s * 0.2, ctr.y + s * 0.75),
+                                egui::pos2(ctr.x + s * 0.95, ctr.y - s * 0.8),
+                            ],
+                            stroke,
+                        );
+                    } else {
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            format!("{}", i + 1),
+                            egui::FontId::proportional(10.0),
+                            if i <= cur {
+                                egui::Color32::WHITE
+                            } else {
+                                p.muted
+                            },
+                        );
+                    }
                     if !label.is_empty() {
                         ui.add_space(6.0);
                         ui.label(
