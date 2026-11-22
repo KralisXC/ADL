@@ -94,6 +94,7 @@ cargo build --release -p adl-gui
 - **添加下载是弹窗**，不再是单独一页；地址框按 Enter 直接开始。
 - **无边框窗口、自绘标题栏**：拖动、双击最大化、八向边缘缩放全部自己实现（`with_decorations(false)` 之后系统不再提供）。三个窗口按钮的图标用线段手画，不依赖字体符号。
 - **关闭行为可选**：首次点关闭会问「最小化到托盘 / 退出程序」，可勾选记住；之后在设置里只能在这两项之间切换（问过就没有"每次询问"这个状态了）。
+- **淡入淡出与文本选择**：弹窗（添加下载 / 关闭询问 / 命令面板）淡入、状态条最后 0.45 秒淡出；全站文本**不可拖选**（只对 `code`/`copy` 的值放开），避免网页式的蓝底选区。
 - **自研 UI 组件库 `crates/adl-ui`**：主题令牌化（换肤只改 `theme.rs`）、`Field`/`form()` 声明式表单、`Column`/`table()` 定宽表格（一列吃剩余、自带虚拟化）、`chip`/`segmented`/`heatmap`/`stat_card`/`window_button`/`hairline`/`nav_item`/`card` 等基础控件。新增一页设置只需几行 `Field`。
 - 支持插件声明式 UI 页面（**29 个组件**：text/heading/badge/status/grid/stat/kv/table/progress/toggle/select/button/alert/collapse/scroll/steps/spinner/copy…）、动作按钮、插件设置、命令面板（Ctrl+K）；插件组件树与本体的界面共用同一套视觉语言与主题令牌。
 - 单实例（再次启动会唤醒已有窗口）、托盘（点托盘「显示主界面」恢复）、系统休眠自动暂停。
@@ -244,6 +245,7 @@ adl.onCommand(() => ({ message: "命令响应" }));
 - ✅ 插件渲染器 29 个组件（grid/stat/kv/table/status/alert/collapse/steps…，语义 tone，未知类型降级不崩）
 - ✅ 外壳重构（顶栏 chips + 主页热力图 + 添加下载弹窗 + 侧栏可完全收起 + 关闭行为可记忆）
 - ✅ 顶栏三 chip 全部手画图标（表盘 / 服务器机架 / 菱形堆叠），不依赖字体符号
+- ✅ 弹窗淡入 / 状态条淡出；全站文本选择默认关闭（`code`/`copy` 例外）
 
 设计文档见 [docs/DESIGN.md](docs/DESIGN.md)。
 

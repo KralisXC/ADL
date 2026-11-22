@@ -1629,6 +1629,58 @@ close_requested → CancelClose → 弹窗 → 用户选"退出程序" → 再�
 排序用 `(rank, id)`：`downloading`(0) → `paused|failed`(1) → 其他(2)，
 所以失败任务浮在最上面，已完成沉底。
 
+#### 13.11.11 淡入淡出与文本选择范围
+
+用户原话：「可以加一些淡入淡出的动画，而且有些就是怎么说可以直接像浏览器文本框选
+那样的，可以给他限制一下。」两件事。
+
+**① 关掉全站文本选择。** egui 默认 `selectable_labels = true`，每个 `ui.label()`
+都能被拖出一片蓝底，观感像网页而不是原生应用。在 `Theme::apply` 里改两行：
+
+```rust
+style.animation_time = 0.14;              // 默认 0.2 偏"拖"
+style.interaction.selectable_labels = false;
+style.interaction.multi_widget_text_select = false;
+```
+
+⚠️ `interaction` 是 **`Style` 的字段**（`style.rs:312`），不是 `Visuals` 的 ——
+写 `v.interaction.…` 编译不过。`install_and_apply` 会给 Light/Dark 两份 style 都套，
+所以一处生效。少数确实该能复制的文本（`render_node` 的 `code` / `copy`）用
+`Label::new(..).selectable(true)` 显式放开，它的语义是
+`self.selectable.unwrap_or_else(|| ui.style().interaction.selectable_labels)`，
+**局部优先于全局**。
+
+**② 弹窗淡入。** 这里有两个非显然的坑：
+
+1. **`ctx.animate_bool` 不能用来做"打开时淡入"**。`animation_manager.rs` 里首次
+   遇到某个 id 走的是 `None => insert(BoolAnim { last_value: end, .. }); end` ——
+   **首帧直接返回终值**。而弹窗只在打开期间存在，每次都命中这个分支。所以改成
+   自管时间戳：`struct Fade { key: u8, start: Option<Instant> }`，`track(key)` 在
+   key 变化时重置，`alpha(dur)` 返回 `1 - (1-t)²`（缓出）。
+2. **必须显式给 `Modal` 传 `frame`**。`Modal` 内部用 `Frame::popup(style)` 在
+   **内容画完之后**才 `paint` 卡片，而 `ui.set_opacity()` 只作用于"之后画的图元"，
+   管不到它。不传的话现象是「文字在淡入、白卡啪一下出现」。`fade_frame()` 把
+   `fill`/`stroke`/`shadow` 的 alpha 一起降到 `a`，再配 `ui.set_opacity(a)` 让内容
+   同步淡入。
+
+另外**不能对白卡用 `gamma_multiply`**：它把 RGB 也一起乘，淡到一半白卡变**灰**卡，
+像蒙了层脏东西。只改 alpha 要用 `Color32::from_rgba_unmultiplied(r, g, b, a)`。
+
+状态条的 6 秒消失也在最后 `STATUS_FADE = 0.45s` 内线性降到 0，不再硬切。
+
+**验证方法（值得复用）**：把 `FADE_SECS` 临时改成 60.0 编译一版，打开弹窗后 3 秒
+截图 —— 卡片、文字、按钮整体接近全透明、只剩背板变暗，才说明 `fade_frame` 生效了。
+只测 0.14s 的正常时长是看不出来的。
+
+🔴 **拖选测试的两个陷阱**（都踩过）：
+- 在 `ScrollArea` 里拖选会触发 **drag-to-scroll**，页面直接滚回顶部，看起来像
+  "选择没生效"其实是被滚走了。要测选择得在不可滚动的区域拖，或先记下滚动位置。
+- **负结果必须先做正对照**。第一次我在页面标题上拖、看到没有蓝底就以为改对了，
+  其实顶栏标题是 `painter.text()` 画的，本来就不参与选择 —— 那次测试什么都没证明。
+  把 `selectable_labels` 临时改回 `true`、在同一位置拖出蓝底，才算证明了检测手段有效。
+  同理，`accent_soft`（#E2F1ED）的选中底色非常淡，肉眼容易漏看，用像素采样判定更可靠：
+  代码行被选中后背景从 `244,248,248` 变成 `226,241,237`。
+
 ### 13.12 待续
 - Linux/macOS 需在 `eframe` features 补 `x11`/`wayland`；`platform.rs` 的 Win32 部分已用 `#[cfg(windows)]` 隔离。
 - 旧的 `web/`（Vue）与 `static_server.rs` 已不再编入（保留仅作历史），后续可清理。
@@ -1644,5 +1696,9 @@ close_requested → CancelClose → 弹窗 → 用户选"退出程序" → 再�
   窗口非最大化时铺；最大化下要跳过，否则鼠标贴屏幕边缘会误触 resize 光标。
 - 侧栏"完全隐藏"后没有保留任何窄轨，所以**折叠键是唯一入口** —— 它必须
   一直画在标题栏里，`titlebar()` 不能因为侧栏隐藏就少画那一块。
+- 文本选择已全局关闭，只对 `code`/`copy` 放开。若以后加了"日志"类页面想让整段
+  可选，记得用 `Label::new(..).selectable(true)` 逐个放开，别把全局开关又打开。
+- 淡入目前只覆盖三个 overlay（添加下载 / 关闭询问 / 命令面板）和状态条。页面切换
+  还是硬切；若要做，得给 `Tab` 变化也接一条 `Fade` 通道。
 
 
