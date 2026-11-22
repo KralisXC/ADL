@@ -81,8 +81,6 @@ impl Palette {
 pub struct Spacing {
     /// 侧边栏宽度
     pub sidebar_w: f32,
-    /// 侧边栏收起后的宽度（只留一条窄轨道）
-    pub sidebar_w_collapsed: f32,
     /// 自绘标题栏高度（窗口无系统边框时用）
     pub titlebar_h: f32,
     /// 顶栏高度
@@ -109,7 +107,6 @@ impl Default for Spacing {
     fn default() -> Self {
         Self {
             sidebar_w: 212.0,
-            sidebar_w_collapsed: 56.0,
             titlebar_h: 40.0,
             topbar_h: 54.0,
             nav_h: 36.0,

@@ -19,6 +19,6 @@ pub use table::{Column, Width, table, truncated, virtual_table};
 pub use theme::{Palette, Radius, Spacing, TextSize, Theme};
 pub use widgets::{
     ChipIcon, WindowButton, badge, card, cell, chip, empty_state, hairline, heatmap, hint,
-    icon_chip, label_cell, mode_pill, nav_item, section_title, segmented, sidebar_toggle,
+    icon_chip, label_cell, mode_pill, nav_item, rule, section_title, segmented, sidebar_toggle,
     small_button, stat_card, window_button,
 };

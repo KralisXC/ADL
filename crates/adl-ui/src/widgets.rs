@@ -213,6 +213,23 @@ pub fn hairline(ui: &mut Ui) {
     );
 }
 
+/// 比 [`hairline`] 更明确的一条分隔线：**低透明度黑**，不是主题色。
+///
+/// 用在"标题行与内容区交界"这种真需要一条视觉边界的地方。`hair` 在这里
+/// 太淡（几乎看不见），`ui.separator()` 又像一道沟。
+pub fn rule(ui: &mut Ui) {
+    let w = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(vec2(w, 1.0), Sense::hover());
+    let y = rect.center().y;
+    ui.painter().line_segment(
+        [
+            egui::pos2(rect.left(), y),
+            egui::pos2(rect.right(), y),
+        ],
+        egui::Stroke::new(0.8, Color32::from_black_alpha(22)),
+    );
+}
+
 /// 自绘标题栏上的窗口按钮。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WindowButton {
@@ -316,9 +333,9 @@ pub fn window_button(ui: &mut Ui, rect: Rect, kind: WindowButton) -> bool {
 pub enum ChipIcon {
     /// 限速：小表盘 + 指针
     Gauge,
-    /// 并行线路：一个人形（和 DSH 那排 chip 同构，读作"几条线在跑"）
+    /// 并行线路：一台机架服务器（几层硬盘抽屉）
     Lines,
-    /// 后台任务：三层堆叠
+    /// 后台任务：上面一颗菱形 + 下面堆叠层
     Stack,
 }
 
@@ -345,24 +362,62 @@ fn paint_chip_icon(ui: &Ui, c: egui::Pos2, icon: ChipIcon, color: Color32) {
             p.circle_filled(c, 1.15, color);
         }
         ChipIcon::Lines => {
-            // 人形：圆头 + 肩部弧线。比"分叉拓扑"好认 —— 那个在 12px 下
-            // 会和"小于号"混淆（实测过）。
-            p.circle_filled(egui::pos2(c.x, c.y - 2.7), 2.15, color);
-            let ry = c.y + 1.0;
-            let mut pts = Vec::with_capacity(12);
-            for i in 0..=11 {
-                // 半椭圆：从左上到右上，只取上半
-                let a = std::f32::consts::PI * (i as f32 / 11.0);
-                pts.push(egui::pos2(c.x - a.cos() * 4.0, ry + a.sin() * 3.2));
+            // 机架服务器：一个竖长方形外框，里面两条分隔线 + 左侧状态点。
+            // 只用线条，厚度统一，12px 下仍然认得出是"一台机器"。
+            let outer = Rect::from_center_size(c, vec2(10.4, 12.0));
+            p.rect_stroke(
+                outer,
+                CornerRadius::same(1),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            for f in [1.0f32 / 3.0, 2.0 / 3.0] {
+                let y = outer.top() + outer.height() * f;
+                p.line_segment(
+                    [egui::pos2(outer.left() + 1.0, y), egui::pos2(outer.right() - 1.0, y)],
+                    egui::Stroke::new(0.9, color),
+                );
             }
-            p.add(egui::Shape::line(pts, stroke));
+            for i in 0..3 {
+                let y = outer.top() + outer.height() * ((i as f32 + 0.5) / 3.0);
+                p.circle_filled(egui::pos2(outer.left() + 2.6, y), 1.0, color);
+            }
         }
         ChipIcon::Stack => {
-            // 三条逐渐收窄的横条，读作"一摞任务"
-            for (i, w) in [11.0f32, 9.0, 7.0].iter().enumerate() {
-                let y = c.y - 3.4 + i as f32 * 3.4;
-                let r = Rect::from_center_size(egui::pos2(c.x, y), vec2(*w, 1.9));
-                p.rect_filled(r, CornerRadius::same(1), color);
+            // 三层堆叠（按用户给的那张 23×31 参考图重画）。
+            //
+            // 参考图的真实几何（逐像素测量）：菱形半宽 7 / 半高 4，
+            // 层与层的中线间距 4 —— 正好是半个菱形高，于是上层菱形的
+            // **下顶点**恰好落在下层 V 的两个**左右顶点**连线上，看着才像
+            // 一摞叠起来的平面。最上面一层画完整菱形，下面两层只画下半截
+            // 的 V（上半截被上一层挡住，画出来会变成一团糊）。
+            //
+            // 这里把宽高比从实测的 7:4 收到 2:1：12px 下 1.75 的斜率会被
+            // 抗锯齿糊成一条斜线，2:1 的顶点更利落。整体缩到 13×13 塞进
+            // 26px 高的 chip —— 和左边"机架"图标 10.4×12 一个量级，
+            // 两个 chip 的图标看起来一样大。
+            let h = 3.25f32; // 菱形半高
+            let w = h * 2.0; // 半宽（参考图 8:4）
+            let y0 = c.y - h; // 最上层菱形中线
+            p.add(egui::Shape::closed_line(
+                vec![
+                    egui::pos2(c.x, y0 - h),
+                    egui::pos2(c.x + w, y0),
+                    egui::pos2(c.x, y0 + h),
+                    egui::pos2(c.x - w, y0),
+                ],
+                stroke,
+            ));
+            for i in 1..3 {
+                let y = y0 + h * i as f32;
+                p.add(egui::Shape::line(
+                    vec![
+                        egui::pos2(c.x - w, y),
+                        egui::pos2(c.x, y + h),
+                        egui::pos2(c.x + w, y),
+                    ],
+                    stroke,
+                ));
             }
         }
     }
@@ -426,7 +481,7 @@ fn chip_impl(
             .circle_filled(egui::pos2(tx + 3.0, rect.center().y), 3.2, c);
         tx += lead_w;
     } else if let Some(ic) = icon {
-        paint_chip_icon(ui, egui::pos2(tx + 6.0, rect.center().y), ic, color);
+        paint_chip_icon(ui, egui::pos2(tx + 6.6, rect.center().y), ic, color);
         tx += lead_w;
     }
     ui.painter().galley(
@@ -498,6 +553,8 @@ pub fn segmented<T: PartialEq + Copy>(ui: &mut Ui, current: T, items: &[(T, &str
 ///
 /// 只负责画格子与 5 档配色；日期与统计由调用方算好传进来 ——
 /// 这样周/月/年三种视图都能复用同一个控件。
+///
+/// 格子整体**水平居中**：周视图只有 7 格，靠左放会显得整张卡片空得莫名其妙。
 pub fn heatmap(ui: &mut Ui, cells: &[(usize, usize, u8)], cols: usize, rows: usize) {
     let th = Theme::from_ui(ui);
     let p = &th.palette;
@@ -507,7 +564,12 @@ pub fn heatmap(ui: &mut Ui, cells: &[(usize, usize, u8)], cols: usize, rows: usi
         .clamp(6.0, 18.0);
     let h = rows as f32 * cell + gap * (rows as f32 - 1.0);
     let w = cols as f32 * cell + gap * (cols as f32 - 1.0);
-    let (rect, _) = ui.allocate_exact_size(vec2(w, h), Sense::hover());
+    let full_w = ui.available_width();
+    let (slot, _) = ui.allocate_exact_size(vec2(full_w, h), Sense::hover());
+    let rect = Rect::from_min_size(
+        egui::pos2(slot.left() + ((full_w - w) * 0.5).max(0.0), slot.top()),
+        vec2(w, h),
+    );
 
     let levels = [
         p.hover_bg,
@@ -548,8 +610,12 @@ pub fn stat_card(ui: &mut Ui, value: &str, label: &str, tone: Color32) {
     });
 }
 
-/// 侧边栏折叠按钮（画一个"面板"图标：方框 + 一条竖线表示侧栏）。
-pub fn sidebar_toggle(ui: &mut Ui, rect: Rect, collapsed: bool) -> bool {
+/// 侧栏显隐按钮。
+///
+/// 图标画的是"点下去会变成什么"，不是"现在是什么"（用户要求）：
+/// - 侧栏正显示 → 画一个带分隔条的方框（点了会收起来）
+/// - 侧栏已隐藏 → 画三条横线（汉堡，点了会展开）
+pub fn sidebar_toggle(ui: &mut Ui, rect: Rect, will_expand: bool) -> bool {
     let th = Theme::from_ui(ui);
     let p = &th.palette;
     let resp = ui.interact(
@@ -564,27 +630,34 @@ pub fn sidebar_toggle(ui: &mut Ui, rect: Rect, collapsed: bool) -> bool {
     let fg = if resp.hovered() { p.ink } else { p.muted };
     let stroke = egui::Stroke::new(1.2, fg);
     let c = rect.center();
-    let s = 7.0;
-    let outer = Rect::from_center_size(c, vec2(s * 2.0, s * 1.6));
-    ui.painter().rect_stroke(
-        outer,
-        CornerRadius::same(2),
-        stroke,
-        egui::StrokeKind::Inside,
-    );
-    // 左边那条竖线表示"侧栏"；收起时画得更靠左，暗示状态
-    let x = if collapsed {
-        outer.left() + 4.0
+
+    if will_expand {
+        // 汉堡：三条横线
+        for i in -1..=1 {
+            let y = c.y + i as f32 * 3.6;
+            ui.painter().line_segment(
+                [egui::pos2(c.x - 6.0, y), egui::pos2(c.x + 6.0, y)],
+                stroke,
+            );
+        }
     } else {
-        outer.left() + 7.0
-    };
-    ui.painter().line_segment(
-        [
-            egui::pos2(x, outer.top() + 2.0),
-            egui::pos2(x, outer.bottom() - 2.0),
-        ],
-        stroke,
-    );
+        // 带分隔线的方框（左边那块 = 侧栏）
+        let outer = Rect::from_center_size(c, vec2(14.0, 11.2));
+        ui.painter().rect_stroke(
+            outer,
+            CornerRadius::same(2),
+            stroke,
+            egui::StrokeKind::Inside,
+        );
+        let x = outer.left() + 4.6;
+        ui.painter().line_segment(
+            [
+                egui::pos2(x, outer.top() + 1.0),
+                egui::pos2(x, outer.bottom() - 1.0),
+            ],
+            stroke,
+        );
+    }
     resp.clicked()
 }
 

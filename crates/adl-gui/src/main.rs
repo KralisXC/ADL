@@ -502,17 +502,19 @@ impl eframe::App for App {
             .frame(titlebar_frame())
             .show(ui, |ui| self.titlebar(ui));
 
-        let sw = if self.sidebar_collapsed {
-            theme().spacing.sidebar_w_collapsed
-        } else {
-            sidebar_w()
-        };
-        egui::Panel::left("adl_sidebar")
-            .exact_size(sw)
-            .resizable(false)
-            .show_separator_line(false)
-            .frame(sidebar_frame())
-            .show(ui, |ui| self.sidebar(ui));
+        // 侧栏：收起时**整个隐藏**，不保留一条窄轨。
+        //
+        // 一开始做成"收窄到 56px 只剩首字"，实测那样很怪（首字导航既认不出
+        // 也不好看）。现在收起 = 真的不要侧栏，重新展开靠标题栏最左上角那个
+        // 汉堡键。
+        if !self.sidebar_collapsed {
+            egui::Panel::left("adl_sidebar")
+                .exact_size(sidebar_w())
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(sidebar_frame())
+                .show(ui, |ui| self.sidebar(ui));
+        }
 
         // 状态提示条（6 秒后消失）——放在外壳正上方，不参与圆角
         if let Some((msg, err, at)) = &self.status {
@@ -546,7 +548,14 @@ impl eframe::App for App {
             .frame(shell_frame())
             .show(ui, |ui| {
                 self.topbar(ui);
-                ui.add_space(2.0);
+                // 标题行与内容区之间一条浅黑细线。
+                //
+                // 全站别处都不用线分区（靠底色差），但这里内容会从上往下滚，
+                // 需要一条看得见的边界提示"上面这一行是固定的"。用低透明度
+                // 黑而不是主题灰绿 —— 灰绿在这层浅底上几乎看不见。
+                ui.add_space(4.0);
+                adl_ui::widgets::rule(ui);
+                ui.add_space(4.0);
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
@@ -587,69 +596,23 @@ impl App {
 
     /// 左侧整高边栏。
     ///
-    /// 布局参考 DSH 的侧栏：最上面是 ADL 图标块，接着是主操作按钮（新建下载），
+    /// 布局参考 DSH 的侧栏：最上面是 `ADL` 品牌字，接着是主操作按钮（新建下载），
     /// 然后是主导航 + 插件分组，最后把"设置"钉在左下角。
-    /// 品牌字（ADL / 下载器）已在自绘标题栏里，这里不再重复 ——
-    /// 否则窗口顶部会出现两次"ADL 下载器"。
-    ///
-    /// 收起时只留首字（中文字体没有图标字形，用单字当"图标"最稳）。
+    /// 收起时整个侧栏不渲染（`Panel::left` 外面那层 `if` 决定），
+    /// 品牌字由 `titlebar()` 在折叠键右侧补画，所以这里不处理收起态。
     fn sidebar(&mut self, ui: &mut egui::Ui) {
-        let collapsed = self.sidebar_collapsed;
-
-        // ── 图标块 ──
-        ui.add_space(4.0);
-        let (icon_rect, _) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), if collapsed { 34.0 } else { 46.0 }),
-            egui::Sense::hover(),
-        );
-        if collapsed {
-            let r = egui::Rect::from_center_size(icon_rect.center(), egui::vec2(28.0, 28.0));
-            ui.painter()
-                .rect_filled(r, egui::CornerRadius::same(8), teal());
-            ui.painter().text(
-                r.center(),
-                egui::Align2::CENTER_CENTER,
-                "A",
-                egui::FontId::proportional(15.0),
-                egui::Color32::WHITE,
-            );
-        } else {
-            let r = egui::Rect::from_min_size(
-                egui::pos2(icon_rect.left(), icon_rect.top() + 6.0),
-                egui::vec2(34.0, 34.0),
-            );
-            ui.painter()
-                .rect_filled(r, egui::CornerRadius::same(9), teal());
-            ui.painter().text(
-                r.center(),
-                egui::Align2::CENTER_CENTER,
-                "A",
-                egui::FontId::proportional(18.0),
-                egui::Color32::WHITE,
-            );
-            ui.painter().text(
-                egui::pos2(r.right() + 10.0, r.center().y - 7.0),
-                egui::Align2::LEFT_CENTER,
-                "ADL",
-                egui::FontId::proportional(14.0),
-                ink(),
-            );
-            ui.painter().text(
-                egui::pos2(r.right() + 10.0, r.center().y + 9.0),
-                egui::Align2::LEFT_CENTER,
-                "下载器",
-                egui::FontId::proportional(11.0),
-                muted(),
-            );
-        }
+        // ── 品牌：只写 ADL ──
+        // 早先是个青绿方块加一个字母 A，再配 "ADL / 下载器" 两行小字；
+        // 用户觉得那个假图标不好看，改成纯文字。
         ui.add_space(8.0);
+        ui.label(egui::RichText::new("ADL").size(19.0).strong().color(teal()));
+        ui.add_space(10.0);
 
         // ── 主操作：新建下载（取代原来的"添加下载"导航项）──
         let btn_h = 34.0;
         let (btn_rect, _) =
             ui.allocate_exact_size(egui::vec2(ui.available_width(), btn_h), egui::Sense::hover());
-        let label = if collapsed { "+" } else { "+ 新建下载" };
-        if adl_ui::widgets::small_button(ui, btn_rect, label, true) {
+        if adl_ui::widgets::small_button(ui, btn_rect, "+ 新建下载", true) {
             self.f_url.clear();
             self.f_out.clear();
             self.add_open = true;
@@ -657,13 +620,11 @@ impl App {
         ui.add_space(12.0);
 
         // ── 主导航 ──
-        let home_label = if collapsed { "主" } else { "主页" };
-        if self.nav_item(ui, self.tab == Tab::Home, home_label) {
+        if self.nav_item(ui, self.tab == Tab::Home, "主页") {
             self.tab = Tab::Home;
         }
         ui.add_space(2.0);
-        let tasks_label = if collapsed { "列" } else { "任务列表" };
-        if self.nav_item(ui, self.tab == Tab::Tasks, tasks_label) {
+        if self.nav_item(ui, self.tab == Tab::Tasks, "任务列表") {
             self.tab = Tab::Tasks;
         }
 
@@ -692,10 +653,8 @@ impl App {
 
         if !pages.is_empty() || !setting_plugins.is_empty() {
             ui.add_space(14.0);
-            if !collapsed {
-                ui.label(egui::RichText::new("插件").size(11.5).color(muted()));
-                ui.add_space(6.0);
-            }
+            ui.label(egui::RichText::new("插件").size(11.5).color(muted()));
+            ui.add_space(6.0);
             for p in pages {
                 let plugin = p
                     .get("plugin")
@@ -710,12 +669,7 @@ impl App {
                     .to_string();
                 let selected =
                     matches!(&self.tab, Tab::Plugin(pl, pg) if pl == &plugin && pg == &id);
-                let label = if collapsed {
-                    title.chars().next().unwrap_or('·').to_string()
-                } else {
-                    title.clone()
-                };
-                if self.nav_item(ui, selected, &label) {
+                if self.nav_item(ui, selected, &title) {
                     self.tab = Tab::Plugin(plugin.clone(), id.clone());
                     self.plugin_view = None;
                     self.reload_plugin_view();
@@ -726,19 +680,14 @@ impl App {
                 let tab_id = format!("settings:{plugin}");
                 let selected =
                     matches!(&self.tab, Tab::Plugin(pl, pg) if pl == "adl" && pg == &tab_id);
-                let label = if collapsed {
-                    name.chars().next().unwrap_or('·').to_string()
-                } else {
-                    format!("{name} 设置")
-                };
+                let label = format!("{name} 设置");
                 if self.nav_item(ui, selected, &label) {
                     self.tab = Tab::Plugin("adl".to_string(), tab_id);
                 }
                 ui.add_space(2.0);
             }
             if has_more {
-                let label = if collapsed { "…" } else { "更多设置…" };
-                if self.nav_item(ui, false, label) {
+                if self.nav_item(ui, false, "更多设置…") {
                     self.tab = Tab::Settings;
                 }
                 ui.add_space(2.0);
@@ -752,15 +701,13 @@ impl App {
             .and_then(|x| x.as_bool())
             .unwrap_or(false);
         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-            if !collapsed {
-                ui.add_space(2.0);
-                ui.label(
-                    egui::RichText::new("Ctrl+K 命令面板")
-                        .size(11.0)
-                        .color(muted()),
-                );
-                ui.add_space(6.0);
-            }
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new("Ctrl+K 命令面板")
+                    .size(11.0)
+                    .color(muted()),
+            );
+            ui.add_space(6.0);
             let (txt, fg, bg) = if trusted {
                 (
                     "信任模式",
@@ -770,21 +717,19 @@ impl App {
             } else {
                 ("安全模式", teal(), egui::Color32::from_rgb(0xDD, 0xEE, 0xE9))
             };
-            let w = if collapsed { 34.0 } else { 76.0 };
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 22.0), egui::Sense::hover());
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(76.0, 22.0), egui::Sense::hover());
             ui.painter()
                 .rect_filled(rect, egui::CornerRadius::same(11), bg);
             ui.painter().text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                if collapsed { "安" } else { txt },
+                txt,
                 egui::FontId::proportional(12.0),
                 fg,
             );
             ui.add_space(8.0);
             // 设置钉在左下角
-            let settings_label = if collapsed { "设" } else { "设置" };
-            if self.nav_item(ui, self.tab == Tab::Settings, settings_label) {
+            if self.nav_item(ui, self.tab == Tab::Settings, "设置") {
                 self.tab = Tab::Settings;
             }
             ui.add_space(4.0);
@@ -828,16 +773,14 @@ impl App {
         }
     }
 
-    /// 自绘标题栏：折叠键 + 可拖动空白区 + 最小化/最大化/关闭。
+    /// 自绘标题栏：侧栏显隐键 + 可拖动空白区 + 最小化/最大化/关闭。
     ///
     /// 窗口用 `.with_decorations(false)` 关掉了系统标题栏，所以这里的拖动与
     /// 双击最大化必须自己实现（`ViewportCommand::StartDrag` / `Maximized`）。
     /// 拖动区只覆盖标题栏里除按钮外的部分，否则点按钮会变成拖窗口。
     ///
-    /// 折叠键放最左上角（与用户要的第 5 张参考图一致）：这一栏与窗口三键
+    /// 显隐键放最左上角（与用户要的第 5 张参考图一致）：这一栏与窗口三键
     /// 本该是同一个横条，而不是让侧栏顶部再单独占一行。
-    /// 品牌字不在这里画 —— 侧栏图标块已经有"ADL / 下载器"，
-    /// 标题栏再写一遍就成了窗口顶部左右各一个。
     fn titlebar(&mut self, ui: &mut egui::Ui) {
         // 跟随系统状态（用户用快捷键 Win+↑ 时也要同步）
         if let Some(m) = ui.ctx().input(|i| i.viewport().maximized) {
@@ -858,6 +801,18 @@ impl App {
             let mut cfg = self.gui.cfg.lock().unwrap();
             cfg.sidebar_collapsed = self.sidebar_collapsed;
             let _ = cfg.save();
+        }
+
+        // 侧栏隐藏时品牌字会跟着消失，所以在标题栏里补一个 "ADL"。
+        // 侧栏显示时不画 —— 否则顶部会出现两个 ADL。
+        if self.sidebar_collapsed {
+            ui.painter().text(
+                egui::pos2(toggle_rect.right() + 10.0, cy),
+                egui::Align2::LEFT_CENTER,
+                "ADL",
+                egui::FontId::proportional(14.0),
+                teal(),
+            );
         }
 
         // 右侧三个窗口按钮，从右缘往左排
@@ -887,8 +842,7 @@ impl App {
             self.toggle_maximize(ui.ctx());
         }
 
-        // 品牌字在侧栏图标块里（标题栏只留折叠键 + 拖动区 + 窗口三键），
-        // 这里不再重复画一遍 —— 否则窗口顶部左右各一个"ADL 下载器"。
+        // 品牌字：侧栏显示时在侧栏里，隐藏时在标题栏补一个（见上）
         let _ = drag_rect;
 
         if adl_ui::widgets::window_button(ui, min_rect, adl_ui::WindowButton::Minimize) {
