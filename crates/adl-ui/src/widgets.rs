@@ -308,12 +308,87 @@ pub fn window_button(ui: &mut Ui, rect: Rect, kind: WindowButton) -> bool {
 // 顶栏 chip / 分段选择 / 热力图 / 统计卡 / 侧栏折叠
 // ═══════════════════════════════════════════════════════════════════════
 
+/// 胶囊块的左侧图标。
+///
+/// 全部用线段/圆弧手画，**不依赖字体符号** —— 中文字体（simhei）里没有
+/// 这些几何字形，`⌘ ⚡ ⋮` 之类会渲染成空方块。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ChipIcon {
+    /// 限速：小表盘 + 指针
+    Gauge,
+    /// 并行线路：一个人形（和 DSH 那排 chip 同构，读作"几条线在跑"）
+    Lines,
+    /// 后台任务：三层堆叠
+    Stack,
+}
+
+fn paint_chip_icon(ui: &Ui, c: egui::Pos2, icon: ChipIcon, color: Color32) {
+    let p = ui.painter();
+    let stroke = egui::Stroke::new(1.15, color);
+    match icon {
+        ChipIcon::Gauge => {
+            // 表盘：一段开口圆弧 + 一根指针。egui 没有 arc 图元，
+            // 用 12 段短折线拼（这个尺寸下肉眼看不出棱角）。
+            let r = 5.0f32;
+            let (a0, a1) = (0.85f32, 0.85 + 4.4); // 留出右下缺口
+            let mut pts = Vec::with_capacity(13);
+            for i in 0..=12 {
+                let a = a0 + (a1 - a0) * (i as f32 / 12.0);
+                pts.push(c + vec2(a.cos(), a.sin()) * r);
+            }
+            p.add(egui::Shape::line(pts, stroke));
+            let a = -1.15f32; // 指针指向左上
+            p.line_segment(
+                [c, c + vec2(a.cos(), a.sin()) * (r - 1.2)],
+                egui::Stroke::new(1.3, color),
+            );
+            p.circle_filled(c, 1.15, color);
+        }
+        ChipIcon::Lines => {
+            // 人形：圆头 + 肩部弧线。比"分叉拓扑"好认 —— 那个在 12px 下
+            // 会和"小于号"混淆（实测过）。
+            p.circle_filled(egui::pos2(c.x, c.y - 2.7), 2.15, color);
+            let ry = c.y + 1.0;
+            let mut pts = Vec::with_capacity(12);
+            for i in 0..=11 {
+                // 半椭圆：从左上到右上，只取上半
+                let a = std::f32::consts::PI * (i as f32 / 11.0);
+                pts.push(egui::pos2(c.x - a.cos() * 4.0, ry + a.sin() * 3.2));
+            }
+            p.add(egui::Shape::line(pts, stroke));
+        }
+        ChipIcon::Stack => {
+            // 三条逐渐收窄的横条，读作"一摞任务"
+            for (i, w) in [11.0f32, 9.0, 7.0].iter().enumerate() {
+                let y = c.y - 3.4 + i as f32 * 3.4;
+                let r = Rect::from_center_size(egui::pos2(c.x, y), vec2(*w, 1.9));
+                p.rect_filled(r, CornerRadius::same(1), color);
+            }
+        }
+    }
+}
+
 /// 顶栏那种"胶囊信息块"（左边可带一个状态圆点）。
 ///
 /// 返回值是 `Response`：调用方拿它去 `Popup::menu(&resp)` 弹卡片，
 /// 或者直接判 `clicked()`。宽度按文字自适应，所以几个 chip 排在一起
 /// 不会像固定宽度那样留下大片空白。
 pub fn chip(ui: &mut Ui, label: &str, dot: Option<Color32>, active: bool) -> Response {
+    chip_impl(ui, label, dot, None, active)
+}
+
+/// 带图标的胶囊块（顶栏那排用它）。
+pub fn icon_chip(ui: &mut Ui, label: &str, icon: ChipIcon, active: bool) -> Response {
+    chip_impl(ui, label, None, Some(icon), active)
+}
+
+fn chip_impl(
+    ui: &mut Ui,
+    label: &str,
+    dot: Option<Color32>,
+    icon: Option<ChipIcon>,
+    active: bool,
+) -> Response {
     let th = Theme::from_ui(ui);
     let p = &th.palette;
 
@@ -321,8 +396,13 @@ pub fn chip(ui: &mut Ui, label: &str, dot: Option<Color32>, active: bool) -> Res
     let galley = ui.painter().layout_no_wrap(label.to_owned(), font, p.ink);
 
     let pad_x = 10.0;
-    let dot_w = if dot.is_some() { 12.0 } else { 0.0 };
-    let w = pad_x * 2.0 + dot_w + galley.size().x;
+    // 圆点占 10px；图标占 16px（含右侧 4px 空隙）
+    let lead_w = match (dot.is_some(), icon.is_some()) {
+        (true, _) => 12.0,
+        (_, true) => 17.0,
+        _ => 0.0,
+    };
+    let w = pad_x * 2.0 + lead_w + galley.size().x;
     let h = 26.0;
 
     let (rect, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
@@ -339,13 +419,16 @@ pub fn chip(ui: &mut Ui, label: &str, dot: Option<Color32>, active: bool) -> Res
             .rect_filled(rect, CornerRadius::same(th.radius.pill), bg);
     }
 
+    let color = if active { p.accent } else { p.muted };
     let mut tx = rect.left() + pad_x;
     if let Some(c) = dot {
         ui.painter()
             .circle_filled(egui::pos2(tx + 3.0, rect.center().y), 3.2, c);
-        tx += dot_w;
+        tx += lead_w;
+    } else if let Some(ic) = icon {
+        paint_chip_icon(ui, egui::pos2(tx + 6.0, rect.center().y), ic, color);
+        tx += lead_w;
     }
-    let color = if active { p.accent } else { p.muted };
     ui.painter().galley(
         egui::pos2(tx, rect.center().y - galley.size().y / 2.0),
         galley,

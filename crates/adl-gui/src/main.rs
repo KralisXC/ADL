@@ -22,6 +22,7 @@ use adl_app::config::Config;
 use adl_core::hooks::Hooks;
 use adl_core::{download, DownloadOptions, Progress};
 use adl_plugin::{Mode, PluginHooks};
+use adl_ui::ChipIcon;
 
 // ───────────────────────── 共享状态 ─────────────────────────
 
@@ -932,7 +933,8 @@ impl App {
             (cfg.limit, cfg.limit_unit.clone())
         };
         let limit_label = if limit == 0 {
-            "不限速".to_string()
+            // 不限速时叫"标准模式"，读起来比"不限速"更像一个档位名
+            "标准模式".to_string()
         } else {
             format!("限速 {}", format_speed_unit(limit, &unit))
         };
@@ -957,12 +959,14 @@ impl App {
             ui.add_space(2.0);
             ui.label(egui::RichText::new(title).size(16.0).color(ink()));
 
-            // chip 靠右：右到左布局会把第一个 add 放到最右边
+            // chip 靠右：`right_to_left` 里第一个 add 落在最右边，
+            // 所以视觉顺序"限速 → 线路 → 总计"要**倒着 add**。
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(2.0);
 
-                // 后台任务（点开是任务卡片列表）
-                let pr = adl_ui::widgets::chip(ui, &progress_label, None, false);
+                // 总计 / 后台任务（点开是任务卡片列表）
+                let pr =
+                    adl_ui::widgets::icon_chip(ui, &progress_label, ChipIcon::Stack, false);
                 pr.clone()
                     .on_hover_text(format!("进行中 {running}，已完成 {done}"));
                 egui::Popup::menu(&pr).show(|ui| {
@@ -1003,12 +1007,12 @@ impl App {
                 });
 
                 // 并行线路
-                let dot = if conns > 0 { Some(teal()) } else { Some(muted()) };
-                adl_ui::widgets::chip(ui, &format!("{conns} 条线路"), dot, false)
+                let lines_label = format!("{conns} 条线路");
+                adl_ui::widgets::icon_chip(ui, &lines_label, ChipIcon::Lines, false)
                     .on_hover_text("当前所有下载任务加起来的活跃连接数（服务器会限流）");
 
                 // 限速档位 + 菜单
-                let lr = adl_ui::widgets::chip(ui, &limit_label, None, false);
+                let lr = adl_ui::widgets::icon_chip(ui, &limit_label, ChipIcon::Gauge, false);
                 lr.clone()
                     .on_hover_text("点这里切换限速档位（也可以去设置里改精确值）");
                 egui::Popup::menu(&lr).show(|ui| {
@@ -1026,11 +1030,6 @@ impl App {
                         }
                     }
                 });
-
-                // 任务列表（最左）
-                if adl_ui::widgets::chip(ui, "任务列表", None, self.tab == Tab::Tasks).clicked() {
-                    go_tasks = true;
-                }
             });
         });
 
@@ -1556,43 +1555,40 @@ impl App {
         adl_ui::form(ui, "插件", &mut plug_fields);
 
         // ── 关闭行为 ──
+        // 只有两个选项：问过一次之后就定下来了，"每次询问"不再是可选状态
+        // （用户明确要求：选了就不能调回询问）。
         ui.add_space(10.0);
         adl_ui::widgets::card(ui, |ui| {
             adl_ui::widgets::section_title(ui, "关闭窗口时");
             ui.add_space(6.0);
             let cur = self.gui.cfg.lock().unwrap().close_action.clone();
-            let opts: [(&str, &str); 3] = [
-                ("ask", "每次询问"),
-                ("tray", "最小化到托盘"),
-                ("close", "退出程序"),
-            ];
-            let mut cur_s = if cur.is_empty() { "ask".to_string() } else { cur.clone() };
-            if ui
-                .horizontal(|ui| {
-                    let mut changed = false;
-                    for (v, l) in opts {
-                        if ui.selectable_label(cur_s == v, l).clicked() {
-                            cur_s = v.to_string();
-                            changed = true;
-                        }
+            let known = matches!(cur.as_str(), "tray" | "close");
+            let cur_s = if known { cur.clone() } else { "tray".to_string() };
+            let opts: [(&str, &str); 2] = [("tray", "最小化到托盘"), ("close", "退出程序")];
+            let mut picked: Option<String> = None;
+            ui.horizontal(|ui| {
+                for (v, l) in opts {
+                    if ui.selectable_label(cur_s == v, l).clicked() {
+                        picked = Some(v.to_string());
                     }
-                    changed
-                })
-                .inner
-            {
-                let mut cfg = self.gui.cfg.lock().unwrap();
-                cfg.close_action = if cur_s == "ask" {
-                    String::new()
-                } else {
-                    cur_s.clone()
-                };
-                let _ = cfg.save();
+                }
+            });
+            if let Some(v) = picked {
+                if !known || v != cur_s {
+                    let mut cfg = self.gui.cfg.lock().unwrap();
+                    cfg.close_action = v;
+                    let _ = cfg.save();
+                }
             }
             ui.add_space(6.0);
             adl_ui::widgets::hint(
                 ui,
-                "第一次点关闭会问一次并可以记住。选「最小化到托盘」下载继续跑；\
-                 选「退出程序」会先存进度，下次可续传。",
+                if known {
+                    "第一次点关闭时问过一次，之后按这里的设置走。选「最小化到托盘」下载继续跑；\
+                     选「退出程序」会先存进度，下次可续传。"
+                } else {
+                    "第一次点关闭时会让你选一次并记住；在那之前这里先显示默认值「最小化到托盘」。"
+                },
             );
         });
 
