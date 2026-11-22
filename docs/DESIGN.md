@@ -1498,8 +1498,12 @@ fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
 - 最左上角是**折叠键**，与窗口三键同一条横条（`Panel::top` 里先画折叠键，
   再画右侧三个 `window_button`），不再让侧栏顶部单独占一行。
 - 侧栏内部顺序：品牌行（只有 `ADL` 三个字，青绿 19px）→ **`+ 新建下载`** →
-  主页 / 任务列表 / 插件 / 消息 / 终端 → 插件页面（`hairline` 分隔后紧接，**不再有
-  "插件页面"小字分组标题**）→ 底部 `Layout::bottom_up`（Ctrl+K 提示 / 模式胶囊 / **设置**）。
+  主页 / 任务列表 / 插件 / 终端 → 插件页面（`hairline` 分隔后紧接，**不再有
+  "插件页面"小字分组标题**）→ 底部 `Layout::bottom_up`（模式胶囊 / **消息** / **设置**）。
+- **「消息」移到「设置」正上方**（用户 m11341）。`bottom_up` 里后 `add` 的在上，
+  所以代码顺序是 `设置` 先、`消息` 后，视觉上才对。
+- **底部的 `Ctrl+K 终端` 提示删了**（用户 m11341）。快捷键本身还在，只是不再占一行；
+  侧栏底部本来就很挤，提示和模式胶囊叠在一起会压到窗口边。
 - **品牌不再用方块图标**。第一版是"`A` 方块 + ADL / 下载器"两行，用户要求
   "直接写 ADL 就行了" —— 手画的方块字母和字体渲染的正文放一起永远对不齐，
   而且侧栏本来就是自己画的，不需要 logo 撑门面。
@@ -1508,6 +1512,15 @@ fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
   令牌一起删除（中文字体没有图标字形，用单字当图标本来就只是妥协）。
   收起时**品牌字跟着一起消失**（用户："收起之后这个 adl 可以不用显示"），
   `titlebar()` 不再补画。
+- **收起/展开有动画**（用户："这个收起/展开侧边栏没动画"）：`Panel::left` 一直存在，
+  只把 `exact_size` 从 `sidebar_w` 动画到 0（`const SIDEBAR_SECS: f32 = 0.22`，
+  `ctx.animate_value_with_time`，`|w - target| < 0.5` 时吸附）。`w <= 0.5` 就整块不渲染。
+  ⚠️ 面板内部必须 `ui.set_clip_rect(ui.max_rect())` + 固定排版宽度，否则窄到一半时
+  文字会换行、按钮被压扁。
+  🔴 **排版宽度要用 `sidebar_w() - SIDEBAR_PAD * 2.0`**（`const SIDEBAR_PAD: f32 = 12.0`，
+  与 `sidebar_frame()` 的 `Margin::symmetric(12, 14)` 对应）。写 `ui.set_width(sidebar_w())`
+  会让内容比可用宽度宽 24px，**导航项右侧圆角正好落在裁剪矩形之外被切平** ——
+  这就是用户报的"圆角给截断了"，靠 `map.ps1` 逐像素转 ASCII 才定位到。
 - **折叠键图标固定成同一个**：`sidebar_toggle(ui, rect, _will_expand)` 永远画
   **带竖向分隔线的圆角矩形**。第一版按"点了会变成什么"画了两种图标（展开时方框+竖线、
   收起时汉堡），用户的反馈是收起后"图像变不一样了"，看着像换了颗按钮。
@@ -1763,8 +1776,20 @@ if a > 0 {
 `Tab::Plugin(id, page)` 是**插件自己声明的页面**（由插件返回组件树、宿主负责画），
 而 `Tab::Plugins` 是宿主的管理页，**一个插件都没装也能进**。
 
-页面布局照着 DSH 的插件页做：顶部「安装、启用和配置插件」+ 右侧「刷新 / + 添加插件」，
-下面三个 tab（已安装 / 插件市场 / 发现），列表项**名称在左、开关在右**。
+页面布局照着 DSH 的插件页做：顶部「安装、启用和配置插件」+ 右侧「刷新」，
+下面两个 tab（已安装 / 插件市场），列表项**名称在左、开关在右**。
+
+- **「+ 添加插件」和「发现」都删掉了**（用户 m11341：添加插件用不上、发现也用不上）。
+  顶部只留「刷新」；`PluginsTab` 从三个变体减到 `{ Installed, Market }`。
+  少一个按钮就少一处"点了没反应"的猜疑 —— 装的唯一途径本来就是往插件目录放文件夹。
+- **插件分成「内置插件」/「已安装插件」两组**：`is_builtin(v)` 按 id 前缀
+  `com.adl.` 判定（内置的五个都是 `com.adl.*`）。内置组**不给开关**，右侧显示
+  「内置」badge；已安装组才有 `switch`。用户原话："软件内置插件（这个可以显示一些
+  自带的功能（不可在插件页面调整）），已安装插件（就是用户自己安装的）"。
+- **safe 模式下内置插件已经调好，不给用户调**：`adl_plugin::ui::collect()` 里
+  `"editable": trusted` 本来就实现了这一点，界面侧只要把 `!editable` 的控件
+  `add_enabled(false, ...)` 并标「（只读）/（信任模式下才可改）」。开 `--trusted` 后
+  同一份界面自动变成可编辑 —— 不需要另写一套。
 
 - **数据源**：`adl_plugin::ui::collect()` 新增的 `"all"` 键。原有的 `"plugins"`
   只收"有 UI 的"插件（`pages/actions/settings/commands` 任一非空），而真正干活的
@@ -1780,10 +1805,10 @@ if a > 0 {
   `*gui.hooks.lock() = build_hooks(&new_cfg)` → 快照立即失效。
   卡片闭包里已经借了 `self.gui` 的锁，**在闭包里写配置会死锁** —— 点击结果先收到
   `let mut toggle: Option<(String, bool)>`，全部卡片画完再落盘。
-- **插件市场 / 发现是空壳，而且故意是空壳**：源地址还没定（用户计划接自己的 GitHub
-  仓库），所以两页只把"将来会有什么"说清楚。**不做假列表** —— 假数据会让人以为已经
-  能装了。「来源配置」按钮和「+ 添加插件」都落到"打开本地插件目录"，因为现在唯一的
-  "来源"就是它；留一个点了没反应的按钮比没有按钮更糟。
+- **插件市场是空壳，而且故意是空壳**：源地址还没定（用户计划接自己的 GitHub
+  仓库），所以这一页只把"将来会有什么"说清楚。**不做假列表** —— 假数据会让人以为已经
+  能装了。「来源配置」按钮落到"打开本地插件目录"，因为现在唯一的"来源"就是它；
+  留一个点了没反应的按钮比没有按钮更糟。
 - **新控件 `switch(ui, on) -> Response`**（`crates/adl-ui/src/widgets.rs`）：38×21
   圆角 11 的轨道 + r=8 白圆点，`animate_bool_responsive` 驱动平移。配一个
   `mix_color(a, b, t)` 做逐通道插值（`Color32` 没有 `lerp`）。
@@ -1797,6 +1822,15 @@ if a > 0 {
 - **上限 200 条**：这是下载器不是日志系统，留太多只会让「消息」页变成负担。
 - **未读用实心圆点、已读用空心圆**，不改整行底色（克制，也省得和 accent_soft 撞）。
 - 侧栏入口写 `消息 (N)`，N 是未读数；全部已读后回到纯"消息"。
+- **消息卡就是 alert 组件**（用户 m11341：「下载的提示可以使用图一这种去显示出来，
+  就很好分辨」）：`Frame::new().fill(level_bg).corner_radius(same(8)).inner_margin(Margin::symmetric(14, 9))`
+  + 左侧 3px 色条，与 `render_node` 的 `"alert"` 分支同一套结构，只是把 tone 换成
+  `notice::Level`。四级配色：Info→`accent`/`accent_soft`、Ok→`#2E7D6B`/`ok_bg`、
+  Warn→`warn`/`warn_bg`、Error→`danger`/`err_bg`。
+- 🔴 **"已读压淡"只压标题和色条，不压正文与底色**。第一版把整条卡统一乘
+  `alpha = 0.5`，结果旧记录正文灰到读不出来 —— 目的是"扫一眼分出读没读"，不是"藏起来"。
+- **色条画在 `Frame` 之外**（`Rect::from_min_size(pos2(r.left()+5.0, r.top()+8.0), vec2(3.0, r.height()-16.0))`）：
+  放进 `Frame` 里会和内容抢布局，左侧就多出一段内边距。
 
 **toast 弹窗**
 
@@ -1846,8 +1880,18 @@ if a > 0 {
 - 高度要先把 `Frame` 的内边距扣掉（`symmetric(14,10)` → 上下各 10），否则内容比框高
   20px，输入行画到框外看不见。`full_h = ui.available_height()`、`inner_h = (full_h - 20).max(160)`。
 - **深色不跟主题**：这是浅色界面里的一个"深色控制台孤岛"，配色写死
-  （`bg #1B2120` / `border #2E3735` / `out #D6DCDA` / `info #869592` / `echo #7AC8B4` / `err #E38686`）。
+  （`bg #17,0x1D,0x1C` / `out #DC,E3,E1` / `info #77,86,83` / `echo #8F,D3,C1` /
+  `path #6F,A8,E8` / `err #E38686`）。
   要是跟着主题走，浅色下就成了"白底终端"，那种观感是错的。
+- **没有描边**：第一版有 `.stroke(Stroke::new(1.0, border))`，用户的评价是
+  "看着没那么分界感" —— 有描边就像另贴上去的一块黑板。去掉描边 + 底色压深之后，
+  终端是"从页面里挖下去的一块"，不是"页面上贴的一张卡片"。
+- **提示符抄 PowerShell 的形态**：`PS <目录>>`，`PS` 用青绿、路径用蓝。历史回显也
+  带 `PS` 前缀（不是第一版那个光秃秃的 `>`）。
+- **输入框与面板同底色、无边框**：
+  `.frame(Frame::new().fill(bg).stroke(Stroke::NONE).corner_radius(CornerRadius::ZERO))`。
+  ⚠️ 不能只设 `.background_color(bg)` —— 聚焦时 `TextEdit` 仍会自己画一圈圆角描边，
+  终端里冒出一个表单输入框非常出戏。要给 `.frame(..)` 才能彻底接管。
 - 命令：`help` / `clear` / `tasks|ls` / `add <url> [文件名]` / `pause <id>|all` /
   `resume <id>` / `rm <id>`（不删文件）/ `open <id>` / `settings` /
   `set dir|connections|limit` / `mode safe|trusted` / `plugin list` / `plugin run <p> <cmd>`。
@@ -1862,6 +1906,11 @@ if a > 0 {
    所以在 `ui.horizontal` 之前先把 `enter/up/down/esc` 一次读出来。
 2. 判断"输入框是活动的"要用 `te.has_focus() || te.lost_focus()`：回车那一帧焦点已经
    交还了，只看 `has_focus()` 会漏掉这一下。
+
+🔴 **另一个坑不在 egui，在自动化验证**：`WScript.Shell.SendKeys('help{ENTER}')` 里的
+`{ENTER}` 与 `keybd_event(0x0D)` **不是等价路径**。实测把 `help` 和 `{ENTER}` 一起
+SendKeys 时文字进去了、回车丢了（截图上输入框里躺着 `help` 但没有任何回显）；改用
+`keybd_event` 发真键盘事件才提交。用合成键验证"输入框能不能用"时，先确认回车送得进去。
 
 ### 13.15 待续
 - Linux/macOS 需在 `eframe` features 补 `x11`/`wayland`；`platform.rs` 的 Win32 部分已用 `#[cfg(windows)]` 隔离。

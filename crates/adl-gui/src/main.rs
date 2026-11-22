@@ -109,15 +109,15 @@ enum Tab {
     Plugin(String, String),
 }
 
-/// 插件页的三个分段（对应 DSH 的"已安装 / 插件市场 / 发现"）。
+/// 插件页的两个分段（对应 DSH 的"已安装 / 插件市场"）。
 ///
-/// "插件市场"和"发现"目前只有骨架：用户说以后要接自己的 GitHub 插件源，
+/// "插件市场"目前只有骨架：用户说以后要接自己的 GitHub 插件源，
 /// 先把入口和文案占住，免得以后加进来时整页要重排。
+/// （原先还有"发现"，用户 m11341 说用不上，已删除。）
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PluginsTab {
     Installed,
     Market,
-    Discover,
 }
 
 /// 终端里一行输出的级别（只影响颜色）。
@@ -598,6 +598,10 @@ fn muted() -> egui::Color32 {
 fn ink() -> egui::Color32 {
     pal().ink
 }
+/// 侧栏左右内边距，必须与 `sidebar_frame()` 的 `Margin::symmetric(12, 14)`
+/// 保持一致：面板内的可用宽度已经是 `sidebar_w - 2*PAD`，内容再按
+/// `sidebar_w` 定宽就会溢出 24px，导航项的右侧圆角正好被面板裁平。
+const SIDEBAR_PAD: f32 = 12.0;
 fn sidebar_w() -> f32 {
     theme().spacing.sidebar_w
 }
@@ -773,7 +777,10 @@ impl eframe::App for App {
                     // 裁剪 + 定宽：内容始终按完整侧栏宽排版，多出来的部分被
                     // 面板边缘切掉，于是看起来像"侧栏被推出去/拉进来"。
                     ui.set_clip_rect(ui.max_rect());
-                    ui.set_width(sidebar_w());
+                    // 必须减掉两侧内边距（sidebar_frame 是 symmetric(12,_)）：
+                    // 直接写 sidebar_w() 会让内容比可用宽度宽 24px，导航项
+                    // 右侧圆角正好被面板裁掉，看着像"高亮条被切平了"。
+                    ui.set_width(sidebar_w() - SIDEBAR_PAD * 2.0);
                     // 宽度只剩一半时内容还完整，只用透明度跟着收，避免
                     // 出现"半截文字卡在边上"。
                     ui.set_opacity((reveal * 1.6).clamp(0.0, 1.0));
@@ -961,17 +968,6 @@ impl App {
             self.tab = Tab::Plugins;
         }
         ui.add_space(2.0);
-        // 消息中心：入口带未读数，红了才让人想起来去点。
-        let unread = self.notices.unread();
-        let label = if unread > 0 {
-            format!("消息 ({unread})")
-        } else {
-            "消息".to_string()
-        };
-        if track(ui, self.tab == Tab::Notices, &label) {
-            self.tab = Tab::Notices;
-        }
-        ui.add_space(2.0);
         // 终端：原 Ctrl+K 命令面板改成的独立页面，有滚动历史。
         if track(ui, self.tab == Tab::Terminal, "终端") {
             self.tab = Tab::Terminal;
@@ -1056,14 +1052,9 @@ impl App {
             .and_then(|x| x.as_bool())
             .unwrap_or(false);
         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-            ui.add_space(2.0);
-            // 提示里别再写"命令面板"：那已经是终端页了，键位还是 Ctrl+K。
-            ui.label(
-                egui::RichText::new("Ctrl+K 终端")
-                    .size(11.0)
-                    .color(muted()),
-            );
-            ui.add_space(6.0);
+            // bottom_up 从下往上排，这里加的就是"距离窗口底边"的留白。
+            // 只给 2 会贴底：模式胶囊的下半圈圆角正好压在窗口边缘上。
+            ui.add_space(10.0);
             let (txt, fg, bg) = if trusted {
                 (
                     "信任模式",
@@ -1087,6 +1078,18 @@ impl App {
             // 设置钉在左下角
             if track(ui, self.tab == Tab::Settings, "设置") {
                 self.tab = Tab::Settings;
+            }
+            ui.add_space(2.0);
+            // 消息紧挨在设置上方：`bottom_up` 里后加的在上，所以放在设置之后。
+            // 未读数直接写进标题，不然用户永远不会想到点进来。
+            let unread = self.notices.unread();
+            let label = if unread > 0 {
+                format!("消息 ({unread})")
+            } else {
+                "消息".to_string()
+            };
+            if track(ui, self.tab == Tab::Notices, &label) {
+                self.tab = Tab::Notices;
             }
             ui.add_space(4.0);
         });
@@ -2117,10 +2120,10 @@ impl App {
         }
         let mut open_dir = false;
         let mut refresh = false;
-        let mut add_clicked = false;
         let mut open_market_cfg = false;
 
-        // ── 顶部：说明 + 右侧动作（DSH 那种排布）──
+        // ── 顶部：说明 + 右侧刷新（"添加插件"已去掉：添加就是往目录里放
+        // 文件夹，按钮只能把目录打开，插件目录卡片里已经有同一个按钮了）──
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new("安装、启用和配置插件")
@@ -2128,9 +2131,6 @@ impl App {
                     .color(muted()),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("+ 添加插件").clicked() {
-                    add_clicked = true;
-                }
                 if ui.button("刷新").clicked() {
                     refresh = true;
                 }
@@ -2138,11 +2138,10 @@ impl App {
         });
         ui.add_space(10.0);
 
-        // ── 三段切换 ──
+        // ── 两段切换 ──
         let tabs = [
             (PluginsTab::Installed, "已安装"),
             (PluginsTab::Market, "插件市场"),
-            (PluginsTab::Discover, "发现"),
         ];
         if let Some(t) = adl_ui::widgets::segmented(ui, self.plugins_tab, &tabs) {
             self.plugins_tab = t;
@@ -2213,109 +2212,139 @@ impl App {
         // 在闭包里写配置容易死锁（同一把 Mutex 重复 lock）。
         let mut toggle: Option<(String, bool)> = None;
 
-        for p in &all {
-            let id = p.get("id").and_then(|x| x.as_str()).unwrap_or("");
-            if id.is_empty() {
+        // 分两组显示：内置插件是软件自带的功能（id 都以 com.adl. 开头），
+        // 在插件页里只能看、不能关 —— 关掉 ua-fixer 之类的没有意义，
+        // 只会让人以为程序坏了。用户自己装的才给开关。
+        let builtin: Vec<Value> = all.iter().filter(|p| is_builtin(p)).cloned().collect();
+        let external: Vec<Value> = all.iter().filter(|p| !is_builtin(p)).cloned().collect();
+
+        for (group, list, can_toggle) in [
+            ("内置插件", &builtin, false),
+            ("已安装插件", &external, true),
+        ] {
+            if list.is_empty() {
                 continue;
             }
-            let name = p.get("name").and_then(|x| x.as_str()).unwrap_or(id);
-            let version = p.get("version").and_then(|x| x.as_str()).unwrap_or("");
-            let desc = p.get("description").and_then(|x| x.as_str()).unwrap_or("");
-            let has_ui = p.get("has_ui").and_then(|x| x.as_bool()).unwrap_or(false);
-            let trusted = p.get("trusted").and_then(|x| x.as_bool()).unwrap_or(false);
-            let enabled = self.gui.cfg.lock().unwrap().plugin_enabled(id);
-            let hooks = str_list(p.get("hooks"));
-            let active = str_list(p.get("active_hooks"));
-            // 权限是"声明"，不等于授权：safe 模式下 Transform 类 hook 不生效，
-            // 所以同时显示"声明了几个"和"当前生效几个"。
-            let perms = permission_labels(p.get("permissions"));
+            adl_ui::widgets::section_title(ui, group);
+            ui.add_space(2.0);
+            adl_ui::widgets::hint(
+                ui,
+                if can_toggle {
+                    "你自己放进插件目录的插件，可以随时启用或停用。"
+                } else {
+                    "程序自带的功能，已经按默认调好，这里只做展示。"
+                },
+            );
+            ui.add_space(8.0);
+            for p in list {
+                let id = p.get("id").and_then(|x| x.as_str()).unwrap_or("");
+                if id.is_empty() {
+                    continue;
+                }
+                let name = p.get("name").and_then(|x| x.as_str()).unwrap_or(id);
+                let version = p.get("version").and_then(|x| x.as_str()).unwrap_or("");
+                let desc = p.get("description").and_then(|x| x.as_str()).unwrap_or("");
+                let has_ui = p.get("has_ui").and_then(|x| x.as_bool()).unwrap_or(false);
+                let trusted = p.get("trusted").and_then(|x| x.as_bool()).unwrap_or(false);
+                let enabled = self.gui.cfg.lock().unwrap().plugin_enabled(id);
+                let hooks = str_list(p.get("hooks"));
+                let active = str_list(p.get("active_hooks"));
+                // 权限是"声明"，不等于授权：safe 模式下 Transform 类 hook 不生效，
+                // 所以同时显示"声明了几个"和"当前生效几个"。
+                let perms = permission_labels(p.get("permissions"));
 
-            adl_ui::widgets::card(ui, |ui| {
-                ui.horizontal(|ui| {
-                    // 必须显式给色：`.strong()` 走 `visuals.strong_text_color()`，
-                    // 也就是 `widgets.active.text_color()` —— 我们的主题把 active 设为
-                    // 白色（青绿按钮上要白字），于是不带 `.color()` 的 strong 文本
-                    // 会画成白字，在白卡上整行消失。
-                    let title_color = if enabled { ink() } else { muted() };
-                    ui.label(
-                        egui::RichText::new(name)
-                            .size(14.5)
-                            .strong()
-                            .color(title_color),
-                    );
-                    if !version.is_empty() {
+                adl_ui::widgets::card(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        // 必须显式给色：`.strong()` 走 `visuals.strong_text_color()`，
+                        // 也就是 `widgets.active.text_color()` —— 我们的主题把 active 设为
+                        // 白色（青绿按钮上要白字），于是不带 `.color()` 的 strong 文本
+                        // 会画成白字，在白卡上整行消失。
+                        let title_color = if enabled { ink() } else { muted() };
                         ui.label(
-                            egui::RichText::new(format!("v{version}"))
-                                .small()
-                                .color(muted()),
+                            egui::RichText::new(name)
+                                .size(14.5)
+                                .strong()
+                                .color(title_color),
+                        );
+                        if !version.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!("v{version}"))
+                                    .small()
+                                    .color(muted()),
+                            );
+                        }
+                        ui.add_space(6.0);
+                        if !enabled {
+                            adl_ui::widgets::badge(ui, "已停用", pal().muted);
+                        } else if trusted {
+                            adl_ui::widgets::badge(ui, "信任模式", pal().warn);
+                        } else {
+                            adl_ui::widgets::badge(ui, "安全模式", pal().accent);
+                        }
+                        if has_ui {
+                            adl_ui::widgets::badge(ui, "有界面", pal().accent);
+                        }
+                        // 开关放最右：和 DSH 的插件页一致（名称在左、开关在右），
+                        // 一排扫下去就能看出哪些开着。内置插件不给开关。
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if can_toggle {
+                                    if adl_ui::widgets::switch(ui, enabled).clicked() {
+                                        toggle = Some((id.to_string(), !enabled));
+                                    }
+                                } else {
+                                    adl_ui::widgets::badge(ui, "内置", pal().accent);
+                                }
+                            },
+                        );
+                    });
+
+                    if !desc.is_empty() {
+                        ui.add_space(3.0);
+                        ui.label(
+                            egui::RichText::new(desc)
+                                .size(12.5)
+                                .color(if enabled { pal().ink } else { muted() }),
                         );
                     }
+
                     ui.add_space(6.0);
-                    if !enabled {
-                        adl_ui::widgets::badge(ui, "已停用", pal().muted);
-                    } else if trusted {
-                        adl_ui::widgets::badge(ui, "信任模式", pal().warn);
-                    } else {
-                        adl_ui::widgets::badge(ui, "安全模式", pal().accent);
-                    }
-                    if has_ui {
-                        adl_ui::widgets::badge(ui, "有界面", pal().accent);
-                    }
-                    // 开关放最右：和 DSH 的插件页一致（名称在左、开关在右），
-                    // 一排扫下去就能看出哪些开着。
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            if adl_ui::widgets::switch(ui, enabled).clicked() {
-                                toggle = Some((id.to_string(), !enabled));
+                    // hook 行：生效的用主色，被安全模式挡住的用灰色并标注。
+                    if !hooks.is_empty() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            ui.label(egui::RichText::new("hook").small().color(muted()));
+                            for h in &hooks {
+                                let on = active.iter().any(|a| a == h);
+                                let short = h.trim_start_matches("on");
+                                if on {
+                                    adl_ui::widgets::badge(ui, short, pal().accent);
+                                } else {
+                                    adl_ui::widgets::badge(ui, short, pal().muted);
+                                }
                             }
-                        },
-                    );
+                        });
+                    }
+                    if !perms.is_empty() {
+                        ui.add_space(4.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            ui.label(egui::RichText::new("权限").small().color(muted()));
+                            for (label, on) in &perms {
+                                if *on {
+                                    adl_ui::widgets::badge(ui, label, pal().warn);
+                                } else {
+                                    adl_ui::widgets::badge(ui, label, pal().muted);
+                                }
+                            }
+                        });
+                    }
+
                 });
-
-                if !desc.is_empty() {
-                    ui.add_space(3.0);
-                    ui.label(
-                        egui::RichText::new(desc)
-                            .size(12.5)
-                            .color(if enabled { pal().ink } else { muted() }),
-                    );
-                }
-
-                ui.add_space(6.0);
-                // hook 行：生效的用主色，被安全模式挡住的用灰色并标注。
-                if !hooks.is_empty() {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        ui.label(egui::RichText::new("hook").small().color(muted()));
-                        for h in &hooks {
-                            let on = active.iter().any(|a| a == h);
-                            let short = h.trim_start_matches("on");
-                            if on {
-                                adl_ui::widgets::badge(ui, short, pal().accent);
-                            } else {
-                                adl_ui::widgets::badge(ui, short, pal().muted);
-                            }
-                        }
-                    });
-                }
-                if !perms.is_empty() {
-                    ui.add_space(4.0);
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        ui.label(egui::RichText::new("权限").small().color(muted()));
-                        for (label, on) in &perms {
-                            if *on {
-                                adl_ui::widgets::badge(ui, label, pal().warn);
-                            } else {
-                                adl_ui::widgets::badge(ui, label, pal().muted);
-                            }
-                        }
-                    });
-                }
-
-            });
-            ui.add_space(8.0);
+                ui.add_space(8.0);
+            }
+            ui.add_space(4.0);
         }
 
         if let Some((id, want)) = toggle {
@@ -2371,22 +2400,6 @@ impl App {
                     );
                 });
             }
-            PluginsTab::Discover => {
-                adl_ui::widgets::card(ui, |ui| {
-                    adl_ui::widgets::section_title(ui, "发现");
-                    ui.add_space(6.0);
-                    ui.label(
-                        egui::RichText::new(
-                            "这里以后会放编辑推荐和社区热门插件。\n\
-                             现在插件都是本地目录里的，没有在线榜单可看。",
-                        )
-                        .size(12.5)
-                        .color(muted()),
-                    );
-                    ui.add_space(10.0);
-                    adl_ui::widgets::hint(ui, "打开「已安装」可以管理本地插件。");
-                });
-            }
         }
 
         if open_market_cfg {
@@ -2395,21 +2408,6 @@ impl App {
                 if let Err(e) = platform::open_path(dir) {
                     self.set_status(format!("打开目录失败: {e}"), true);
                 }
-            }
-        }
-        if add_clicked {
-            // 没有在线安装源，所以"添加插件"的实际含义就是：把插件文件夹拷进
-            // 目录里。这里直接把目录打开，并说清楚要拷什么。
-            if let Some(dir) = root.as_ref() {
-                match platform::open_path(dir) {
-                    Ok(()) => self.set_status(
-                        "已打开插件目录：把含 plugin.toml 的文件夹放进去，再点「刷新」",
-                        false,
-                    ),
-                    Err(e) => self.set_status(format!("打开目录失败: {e}"), true),
-                }
-            } else {
-                self.set_status("还没配置插件目录，先去设置里填一个", true);
             }
         }
     }
@@ -2475,50 +2473,58 @@ impl App {
         ui.add_space(10.0);
         let items: Vec<notice::Notice> = self.notices.items.iter().rev().cloned().collect();
         for n in &items {
-            let (dot, tone) = match n.level {
-                notice::Level::Info => (pal().accent, pal().accent),
-                notice::Level::Ok => (egui::Color32::from_rgb(0x2E, 0x7D, 0x6B), pal().accent),
-                notice::Level::Warn => (pal().warn, pal().warn),
-                notice::Level::Error => (pal().danger, pal().danger),
+            // 用 alert 组件的样式（底色块 + 左侧色条）而不是白卡 + 圆点：
+            // 一屏十几条时，底色比一个小圆点更快区分"完成/注意/失败"。
+            let (bar, bg) = match n.level {
+                notice::Level::Info => (pal().accent, pal().accent_soft),
+                notice::Level::Ok => (egui::Color32::from_rgb(0x2E, 0x7D, 0x6B), pal().ok_bg),
+                notice::Level::Warn => (pal().warn, pal().warn_bg),
+                notice::Level::Error => (pal().danger, pal().err_bg),
             };
-            adl_ui::widgets::card(ui, |ui| {
-                ui.horizontal(|ui| {
-                    // 未读用实心点，已读用空心 —— 比改整行底色克制得多。
-                    let dot_at = egui::pos2(ui.cursor().left() + 4.0, ui.cursor().top() + 9.0);
-                    if n.read {
-                        ui.painter().circle_stroke(dot_at, 3.2, egui::Stroke::new(1.2, dot));
-                    } else {
-                        ui.painter().circle_filled(dot_at, 3.4, dot);
-                    }
-                    ui.add_space(14.0);
-                    ui.label(
-                        egui::RichText::new(&n.title)
-                            .size(13.5)
-                            .strong()
-                            .color(if n.read { muted() } else { ink() }),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            egui::RichText::new(notice::ago(n.at))
-                                .small()
-                                .color(muted()),
-                        );
-                        ui.add_space(8.0);
-                        adl_ui::widgets::badge(ui, n.level.label(), tone);
-                    });
-                });
-                if !n.body.is_empty() {
-                    ui.add_space(4.0);
+            // 已读的只把标题压淡，底色和正文保持原样：整条一起乘 alpha
+            // 会让旧记录彻底看不清（实测 0.5 时正文灰到读不出来），
+            // 而这里的目的是"扫一眼能分出读没读"，不是"藏起来"。
+            let resp = egui::Frame::new()
+                .fill(bg)
+                .corner_radius(egui::CornerRadius::same(8))
+                .inner_margin(egui::Margin::symmetric(14, 9))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        ui.add_space(14.0);
                         ui.label(
-                            egui::RichText::new(&n.body)
-                                .size(12.5)
-                                .color(if n.read { muted() } else { pal().ink }),
+                            egui::RichText::new(&n.title)
+                                .size(13.5)
+                                .strong()
+                                .color(if n.read { muted() } else { ink() }),
+                        );
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.label(
+                                    egui::RichText::new(notice::ago(n.at))
+                                        .small()
+                                        .color(muted()),
+                                );
+                                ui.add_space(8.0);
+                                adl_ui::widgets::badge(ui, n.level.label(), bar);
+                            },
                         );
                     });
-                }
-            });
+                    if !n.body.is_empty() {
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new(&n.body).size(12.5).color(pal().ink));
+                    }
+                });
+            // 左侧色条画在 Frame 之外，避免和内容抢布局（同 alert 组件）。
+            let r = resp.response.rect;
+            ui.painter().rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(r.left() + 5.0, r.top() + 8.0),
+                    egui::vec2(3.0, (r.height() - 16.0).max(0.0)),
+                ),
+                egui::CornerRadius::same(2),
+                if n.read { fade_color(bar, 0.45) } else { bar },
+            );
             ui.add_space(8.0);
         }
     }
@@ -2618,11 +2624,17 @@ impl App {
     /// 重跑；而且用户明确说想要"终端那种（win 的 powershell）"。
     fn page_terminal(&mut self, ui: &mut egui::Ui) {
         // 终端配色不走主题：这是"深色控制台"这一个孤岛，主题是浅色的。
-        let bg = egui::Color32::from_rgb(0x1B, 0x21, 0x20);
-        let border = egui::Color32::from_rgb(0x2E, 0x37, 0x35);
-        let ink_out = egui::Color32::from_rgb(0xD6, 0xDC, 0xDA);
-        let ink_info = egui::Color32::from_rgb(0x86, 0x95, 0x92);
-        let ink_echo = egui::Color32::from_rgb(0x7A, 0xC8, 0xB4);
+        //
+        // 用户说原来的样子"有些简陋、看着有分界感"，所以：
+        // ① 去掉 1px 描边 —— 有描边就像另贴上去的一块黑板；
+        // ② 圆角与卡片一致（10），内边距也调成卡片的量级；
+        // ③ 提示符抄 PowerShell 的样子：`PS <目录>` + 尖括号，目录用强调色，
+        //    一眼能看出"现在在哪个目录下操作"。
+        let bg = egui::Color32::from_rgb(0x17, 0x1D, 0x1C);
+        let ink_out = egui::Color32::from_rgb(0xDC, 0xE3, 0xE1);
+        let ink_info = egui::Color32::from_rgb(0x77, 0x86, 0x83);
+        let ink_echo = egui::Color32::from_rgb(0x8F, 0xD3, 0xC1);
+        let ink_path = egui::Color32::from_rgb(0x6F, 0xA8, 0xE8);
         let ink_err = egui::Color32::from_rgb(0xE3, 0x86, 0x86);
         let color_of = |k: LineKind| match k {
             LineKind::Echo => ink_echo,
@@ -2631,22 +2643,34 @@ impl App {
             LineKind::Err => ink_err,
         };
 
+        // 提示符里的目录：太长就从左边截，保留尾部（尾部的层次才是
+        // 人真正关心的部分，跟 PowerShell 折行时的效果接近）。
+        let cwd = {
+            let dir = self.gui.cfg.lock().unwrap().dir.clone();
+            let n = dir.chars().count();
+            if n > 52 {
+                let tail: String = dir.chars().skip(n - 49).collect();
+                format!("…{tail}")
+            } else {
+                dir
+            }
+        };
+
         // 大框占满可用高度，输入行钉在底部 —— 就像真的终端。
         //
-        // 高度要先把 Frame 的内边距（symmetric(14,10) → 上下各 10）扣掉，
-        // 否则内容比框高 20px，`PS>` 那一行会被裁在框外看不见。
+        // 高度要先把 Frame 的内边距（symmetric(14,12) → 上下各 12）扣掉，
+        // 否则内容比框高 24px，`PS>` 那一行会被裁在框外看不见。
         let full_h = ui.available_height().max(200.0);
-        let inner_h = (full_h - 20.0).max(160.0);
+        let inner_h = (full_h - 24.0).max(160.0);
         let input_h = 30.0;
-        let log_h = (inner_h - input_h - 6.0).max(120.0);
+        let log_h = (inner_h - input_h - 8.0).max(120.0);
 
         let mut submit = false;
 
         egui::Frame::new()
             .fill(bg)
-            .stroke(egui::Stroke::new(1.0, border))
             .corner_radius(egui::CornerRadius::same(10))
-            .inner_margin(egui::Margin::symmetric(14, 10))
+            .inner_margin(egui::Margin::symmetric(14, 12))
             .show(ui, |ui| {
                 ui.set_height(inner_h);
 
@@ -2664,17 +2688,19 @@ impl App {
                                 LineKind::Echo => {
                                     ui.horizontal_wrapped(|ui| {
                                         ui.spacing_mut().item_spacing.x = 6.0;
+                                        // 和下面的提示符同样的形状：老命令也带
+                                        // `PS xxx>`，翻历史时一眼看得出这是输入过的。
                                         ui.label(
-                                            egui::RichText::new(">")
+                                            egui::RichText::new("PS")
                                                 .monospace()
                                                 .size(12.5)
-                                                .color(ink_info),
+                                                .color(ink_echo),
                                         );
                                         ui.label(
                                             egui::RichText::new(text)
                                                 .monospace()
                                                 .size(12.5)
-                                                .color(ink_echo),
+                                                .color(ink_out),
                                         );
                                     });
                                 }
@@ -2689,7 +2715,7 @@ impl App {
                     });
 
                 // ── 输入行 ──
-                ui.add_space(6.0);
+                ui.add_space(8.0);
                 // Enter 必须在建 TextEdit **之前**读：单行 TextEdit 收到回车
                 // 会 `consume_key(Enter)` 并 surrender_focus，等它返回之后
                 // 再 `key_pressed(Enter)` 永远是 false（实测第一次回车丢键）。
@@ -2702,20 +2728,35 @@ impl App {
                     )
                 });
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.spacing_mut().item_spacing.x = 0.0;
                     ui.label(
-                        egui::RichText::new("PS>")
+                        egui::RichText::new("PS ")
                             .monospace()
                             .size(12.5)
                             .color(ink_echo),
                     );
+                    ui.label(
+                        egui::RichText::new(format!("{cwd}>"))
+                            .monospace()
+                            .size(12.5)
+                            .color(ink_path),
+                    );
+                    ui.add_space(6.0);
                     let te = ui.add(
                         egui::TextEdit::singleline(&mut self.term.input)
                             .font(egui::TextStyle::Monospace)
                             .desired_width(f32::INFINITY)
                             .text_color(ink_out)
-                            .background_color(egui::Color32::from_rgb(0x23, 0x2B, 0x29))
-                            .margin(egui::Margin::symmetric(8, 5))
+                            // 输入框和面板同底色、无描边：中间不再有一块深色
+                            // 方块，也没有聚焦时才冒出来的圆角框，光标直接落
+                            // 在面板上 —— 这才是终端，不是表单。
+                            .frame(
+                                egui::Frame::new()
+                                    .fill(bg)
+                                    .stroke(egui::Stroke::NONE)
+                                    .corner_radius(egui::CornerRadius::ZERO),
+                            )
+                            .margin(egui::Margin::symmetric(0, 4))
                             .hint_text(
                                 egui::RichText::new("输入 help 看命令").color(ink_info),
                             ),
@@ -4186,6 +4227,19 @@ fn format_speed_unit(bps: u64, unit: &str) -> String {
 }
 
 // ───────────────────────── 与后端交互（复用原有逻辑） ─────────────────────────
+
+/// 判断一条插件记录是不是"软件自带"的。
+///
+/// 内置插件的 id 统一是 `com.adl.xxx`（见 `plugins/` 下各 plugin.toml）。
+/// 用户自己装的插件就算起名也带 com.adl 前缀，也是他们自己的责任；
+/// 这里只按约定前缀分组，目的是在插件页把"程序自带功能"和"用户安装"
+/// 分开显示 —— 前者不可在插件页调整。
+fn is_builtin(v: &Value) -> bool {
+    v.get("id")
+        .and_then(|x| x.as_str())
+        .map(|id| id.starts_with("com.adl."))
+        .unwrap_or(false)
+}
 
 /// 从 `ui_snapshot["all"][i]["hooks"]` 这类 JSON 数组里取字符串列表。
 fn str_list(v: Option<&Value>) -> Vec<String> {
