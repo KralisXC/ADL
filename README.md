@@ -95,7 +95,7 @@ cargo build --release -p adl-gui
 - **无边框窗口、自绘标题栏**：拖动、双击最大化、八向边缘缩放全部自己实现（`with_decorations(false)` 之后系统不再提供）。三个窗口按钮的图标用线段手画，不依赖字体符号。
 - **关闭行为可选**：首次点关闭会问「最小化到托盘 / 退出程序」，可勾选记住；之后在设置里只能在这两项之间切换（问过就没有"每次询问"这个状态了）。
 - **自研 UI 组件库 `crates/adl-ui`**：主题令牌化（换肤只改 `theme.rs`）、`Field`/`form()` 声明式表单、`Column`/`table()` 定宽表格（一列吃剩余、自带虚拟化）、`chip`/`segmented`/`heatmap`/`stat_card`/`window_button`/`hairline`/`nav_item`/`card` 等基础控件。新增一页设置只需几行 `Field`。
-- 支持插件声明式 UI 页面（**23 个组件**：text/heading/badge/status/grid/stat/kv/table/progress/toggle/select/button…）、动作按钮、插件设置、命令面板（Ctrl+K）；插件组件树与本体的界面共用同一套视觉语言与主题令牌。
+- 支持插件声明式 UI 页面（**29 个组件**：text/heading/badge/status/grid/stat/kv/table/progress/toggle/select/button/alert/collapse/scroll/steps/spinner/copy…）、动作按钮、插件设置、命令面板（Ctrl+K）；插件组件树与本体的界面共用同一套视觉语言与主题令牌。
 - 单实例（再次启动会唤醒已有窗口）、托盘（点托盘「显示主界面」恢复）、系统休眠自动暂停。
 - 与 CLI 共用 `adl-core` 引擎、`adl-plugin` 插件、`adl-app` 配置/历史；浏览器接管 API 同进程运行。
 - **设置项只给档位**：并发 7 档（1/2/4/8/16/32/64，本质仍是自适应）；限速 = 数值 + 单位（自动 / B/s / KB/s / MB/s / GB/s，用英文单位）。HTTP/1.1 不再由用户选（引擎自动）。
@@ -219,7 +219,7 @@ adl.onAction((req) => ({ message: "动作：" + req.action }));
 adl.onCommand(() => ({ message: "命令响应" }));
 ```
 
-- 组件白名单：`text/label/heading/badge/status/divider/spacer/row/col/card/button/input/select/toggle/progress/list/kv/stat/grid/table/link/code/timestamp`（共 23 种，未知类型画成 `[xxx]` 不报错）。
+- 组件白名单：`text/label/heading/badge/status/divider/spacer/row/col/card/button/input/select/toggle/progress/list/kv/stat/grid/table/link/code/timestamp/alert/collapse/scroll/steps/spinner/copy`（共 29 种，未知类型画成 `[xxx]` 不报错）。
 - **分级**：`safe` 只给页面（只读）与设置项；`trusted` 才给动作、Ctrl+K 命令、可编辑设置，以及"替换内置页面"（`replaces = "tasks|add|settings"`）。
 - 设置存储分两处：主 `config.toml` 只存每插件 `enabled` 开关；详细设置在各插件自己的 `plugin-settings/<id>.json`。
 - 颜色只能用语义名（`accent`/`warn`/`danger`/`muted` 及别名 `primary`/`ok`/`completed`/`paused`/`error`/`failed`），**不能写 RGB** —— 否则换主题时插件就成了硬编码补丁。
@@ -241,7 +241,7 @@ adl.onCommand(() => ({ message: "命令响应" }));
 - ✅ UI 左右式布局（侧边栏 + 顶栏 + 内容区，Motrix 浅色主题）
 - ✅ 自研 UI 组件库 `crates/adl-ui`（主题令牌 + 声明式表单 + 定宽表格，三页已迁移）
 - ✅ 无边框窗口 + 自绘标题栏（拖动 / 双击最大化 / 八向缩放全部自实现，不依赖字体图标）
-- ✅ 插件渲染器 23 个组件（grid/stat/kv/table/status…，语义 tone，未知类型降级不崩）
+- ✅ 插件渲染器 29 个组件（grid/stat/kv/table/status/alert/collapse/steps…，语义 tone，未知类型降级不崩）
 - ✅ 外壳重构（顶栏 chips + 主页热力图 + 添加下载弹窗 + 侧栏可完全收起 + 关闭行为可记忆）
 - ✅ 顶栏三 chip 全部手画图标（表盘 / 服务器机架 / 菱形堆叠），不依赖字体符号
 

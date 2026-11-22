@@ -1384,14 +1384,15 @@ winit 的 `WM_NCCALCSIZE` 会把客户区扩到整个非客户区（`event_loop.
   每行一条线在浅底上像一道道沟
 - `card_frame()` 描边从 `line` 降到 `hair`：卡片靠白底 + 圆角 + 极淡描边浮起来
 
-#### 13.10.3 渲染器词汇表（23 个 type）
+#### 13.10.3 渲染器词汇表（29 个 type）
 
-`render_node` 从 9 个 type 扩到 23 个，且**宿主只用 `adl_ui` 的令牌与控件**，观感
-与本体界面完全一致：
+`render_node` 从 9 个 type 扩到 23 个，再到 29 个，且**宿主只用 `adl_ui` 的令牌与
+控件**，观感与本体界面完全一致：
 
 `text` / `label` / `heading` / `badge` / `status` / `divider` / `spacer` / `row` /
 `col` / `card` / `grid` / `stat` / `kv` / `table` / `list` / `link` / `code` /
-`timestamp` / `button` / `input` / `select` / `toggle` / `progress`
+`timestamp` / `button` / `input` / `select` / `toggle` / `progress` /
+`alert` / `collapse` / `scroll` / `steps` / `spinner` / `copy`
 
 三条设计约束：
 
@@ -1405,6 +1406,28 @@ winit 的 `WM_NCCALCSIZE` 会把客户区扩到整个非客户区（`event_loop.
 **`grid` 必须用 `ui.horizontal_top`**：用 `ui.horizontal` 时各行是独立布局，
 某一行卡片高一点就会把后面的行往下推，三张 stat 卡片会呈现"阶梯错开"。实测
 第一版就是这个样子，改 `horizontal_top` 后立刻对齐。
+
+#### 13.10.4 第二轮扩充：补"信息密度"类组件
+
+第一批 23 个 type 覆盖了"展示数据"和"绑定设置"，但插件想写**日志面板、
+多步流程、错误提示**时缺零件 —— 只能用 `code` 一行行堆，页面立刻失去层次。
+补的 6 个都是"把已有信息重新组织"而不是新能力：
+
+| type | 解决的问题 | 关键实现 |
+|---|---|---|
+| `alert` | 一段话的提示没法用 `badge` 承载 | `Frame::new().fill(底色).corner_radius(8).inner_margin(symmetric(14,9))`，底色按 `tone` 取 `err_bg`/`warn_bg`/`accent_soft`；左侧色条在 `Frame` **之外**用 `painter().rect_filled` 画，否则会和内容抢布局 |
+| `collapse` | 长页面的次要信息占满首屏 | `CollapsingHeader::new(...).default_open(open).show_background(false).id_salt(format!("{plugin}.collapse.{title}"))` —— **`id_salt` 必须带插件名**，否则两个插件同名的折叠面板会互相串状态 |
+| `scroll` | 插件塞长列表把整页顶出屏幕 | `ScrollArea::vertical().max_height(h).auto_shrink([false,false])`，可选 `id_salt` |
+| `steps` | 下载流程这类"第几步"没法表达 | 手画：`circle_filled` 圆点 + `Align2::CENTER_CENTER` 序号 + `hline` 连接线；`i < current` 实心 accent，`i == current` 用 `tone`，`i > current` 用 `hair` 底 + `muted` 字 |
+| `spinner` | 插件等异步结果时页面像卡死 | `egui::Spinner::new().size(s).color(pal().accent)` |
+| `copy` | 哈希/路径只能靠用户手选 | `ui.ctx().copy_text(v.clone())` —— **剪贴板 API 只在 `Context` 上**，`Ui` 没有；插件本身拿不到剪贴板，必须由宿主代劳 |
+
+顺带修掉一个旧 bug：**`table` 单元格的 `tone` 以前被解析后丢弃**（只取 `value`），
+现在单元格可写 `{value, tone}` 真的上色了 —— 插件表格里"已完成/失败"那一列
+终于和本体任务列表一样有颜色。
+
+`copy` 的 `label` 为空时按钮文案是「复制」，非空则当按钮文字用；值本身用
+`.monospace().small().color(muted)` 展示，方便核对哈希。
 
 ### 13.11 外壳重构：顶栏并入主区、添加下载弹窗化、主页与关闭询问
 

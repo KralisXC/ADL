@@ -2235,7 +2235,10 @@ fn render_node(ui: &mut egui::Ui, plugin: &str, node: &Value, out: &mut Vec<Disp
             if titles.is_empty() {
                 return;
             }
-            let rows: Vec<Vec<String>> = node
+            // rows 的单元格可以是纯字符串，也可以是 {value, tone}。
+            // tone 以前被解析后丢弃，现在真的上色 —— 插件表格里
+            // "已完成/失败"这类列终于能和本体一样有颜色。
+            let rows: Vec<Vec<(String, String)>> = node
                 .get("rows")
                 .and_then(|x| x.as_array())
                 .map(|a| {
@@ -2246,9 +2249,11 @@ fn render_node(ui: &mut egui::Ui, plugin: &str, node: &Value, out: &mut Vec<Disp
                                     cells
                                         .iter()
                                         .map(|c| match c {
-                                            // 单元格可以是纯字符串，也可以是 {value,tone}
-                                            Value::String(s) => s.clone(),
-                                            other => s_of(other, "value").to_string(),
+                                            Value::String(s) => (s.clone(), String::new()),
+                                            other => (
+                                                s_of(other, "value").to_string(),
+                                                s_of(other, "tone").to_string(),
+                                            ),
                                         })
                                         .collect()
                                 })
@@ -2278,9 +2283,17 @@ fn render_node(ui: &mut egui::Ui, plugin: &str, node: &Value, out: &mut Vec<Disp
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = gap;
                     for (i, cw) in widths.iter().enumerate() {
-                        let v = row.get(i).cloned().unwrap_or_default();
+                        let (v, tone) = row
+                            .get(i)
+                            .cloned()
+                            .unwrap_or_else(|| (String::new(), String::new()));
                         adl_ui::widgets::cell(ui, *cw, |ui| {
-                            adl_ui::truncated(ui, &v, &v);
+                            if tone.is_empty() {
+                                adl_ui::truncated(ui, &v, &v);
+                            } else {
+                                let r = egui::RichText::new(&v).color(tone_color(&tone));
+                                ui.add(egui::Label::new(r).truncate()).on_hover_text(&v);
+                            }
                         });
                     }
                 });
@@ -2361,6 +2374,182 @@ fn render_node(ui: &mut egui::Ui, plugin: &str, node: &Value, out: &mut Vec<Disp
         "timestamp" => {
             let v = s_of(node, "value");
             ui.label(egui::RichText::new(v).small().color(pal().muted));
+        }
+        "copy" => {
+            // 一键复制：值本身只读展示（等宽，方便核对哈希/路径），
+            // 真正写剪贴板的是宿主 —— 插件拿不到剪贴板 API。
+            let v = s_of(node, "value").to_string();
+            let label = s_of(node, "label");
+            let btn = if label.is_empty() { "复制" } else { label };
+            ui.horizontal(|ui| {
+                if !v.is_empty() {
+                    ui.label(
+                        egui::RichText::new(&v)
+                            .monospace()
+                            .small()
+                            .color(pal().muted),
+                    );
+                }
+                if ui
+                    .add(egui::Button::new(egui::RichText::new(btn).small()).frame(false))
+                    .on_hover_text("复制到剪贴板")
+                    .clicked()
+                {
+                    ui.ctx().copy_text(v.clone());
+                }
+            });
+        }
+        "spinner" => {
+            // 加载中：插件页在等异步结果时给个活物，别让用户以为卡死
+            let size = f_of(node, "size").unwrap_or(16.0).clamp(8.0, 48.0) as f32;
+            let label = s_of(node, "label");
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(size).color(pal().accent));
+                if !label.is_empty() {
+                    ui.label(egui::RichText::new(label).color(pal().muted));
+                }
+            });
+        }
+        "alert" => {
+            // 提示条：底色块 + 左侧细色条，比 badge 更能承载一段话
+            let p = pal();
+            let tone = s_of(node, "tone");
+            let c = tone_color(tone);
+            let bg = match tone {
+                "danger" | "error" | "failed" => p.err_bg,
+                "warn" | "paused" => p.warn_bg,
+                _ => p.accent_soft,
+            };
+            let title = s_of(node, "title");
+            let text = s_of(node, "value");
+            let resp = egui::Frame::new()
+                .fill(bg)
+                .corner_radius(egui::CornerRadius::same(8))
+                .inner_margin(egui::Margin::symmetric(14, 9))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.vertical(|ui| {
+                        if !title.is_empty() {
+                            ui.label(egui::RichText::new(title).strong().color(c));
+                        }
+                        if !text.is_empty() {
+                            ui.label(egui::RichText::new(text).color(p.ink));
+                        }
+                    });
+                });
+            // 左侧色条画在 Frame 之外，避免和内容抢布局
+            let r = resp.response.rect;
+            ui.painter().rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(r.left() + 5.0, r.top() + 8.0),
+                    egui::vec2(3.0, (r.height() - 16.0).max(0.0)),
+                ),
+                egui::CornerRadius::same(2),
+                c,
+            );
+        }
+        "collapse" => {
+            // 折叠面板：长页面把次要信息收起来
+            let t = s_of(node, "title");
+            let title = if t.is_empty() { s_of(node, "label") } else { t };
+            let open = b_of(node, "open", true);
+            let hdr = egui::CollapsingHeader::new(
+                egui::RichText::new(title).strong().color(pal().ink),
+            )
+            .default_open(open)
+            .show_background(false)
+            .id_salt(format!("{plugin}.collapse.{title}"));
+            hdr.show(ui, |ui| {
+                if let Some(ch) = node.get("children").and_then(|x| x.as_array()) {
+                    for c in ch {
+                        render_node(ui, plugin, c, out);
+                    }
+                }
+            });
+        }
+        "scroll" => {
+            // 限高滚动：插件塞长列表时不把整页顶出屏幕
+            let h = f_of(node, "maxHeight").unwrap_or(240.0).clamp(40.0, 2000.0) as f32;
+            let id = s_of(node, "id");
+            let mut sa = egui::ScrollArea::vertical()
+                .max_height(h)
+                .auto_shrink([false, false]);
+            if !id.is_empty() {
+                sa = sa.id_salt(format!("{plugin}.scroll.{id}"));
+            }
+            sa.show(ui, |ui| {
+                if let Some(ch) = node.get("children").and_then(|x| x.as_array()) {
+                    for c in ch {
+                        render_node(ui, plugin, c, out);
+                    }
+                }
+            });
+        }
+        "steps" => {
+            // 步骤条：current 之前的算已完成（实心），当前步用 tone，之后是灰
+            let cur = f_of(node, "current").unwrap_or(0.0).max(0.0) as usize;
+            let items: Vec<Value> = node
+                .get("items")
+                .and_then(|x| x.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let p = pal();
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                for (i, it) in items.iter().enumerate() {
+                    let (label, tone) = if it.is_string() {
+                        (it.as_str().unwrap_or("").to_string(), String::new())
+                    } else {
+                        (
+                            s_of(it, "label").to_string(),
+                            s_of(it, "tone").to_string(),
+                        )
+                    };
+                    let c = if i == cur {
+                        tone_color(if tone.is_empty() { "accent" } else { tone.as_str() })
+                    } else if i < cur {
+                        p.accent
+                    } else {
+                        p.muted
+                    };
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+                    ui.painter().circle_filled(
+                        rect.center(),
+                        9.0,
+                        if i <= cur { c } else { p.hair },
+                    );
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        format!("{}", i + 1),
+                        egui::FontId::proportional(10.0),
+                        if i <= cur {
+                            egui::Color32::WHITE
+                        } else {
+                            p.muted
+                        },
+                    );
+                    if !label.is_empty() {
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(label)
+                                .small()
+                                .color(if i <= cur { p.ink } else { p.muted }),
+                        );
+                        ui.add_space(6.0);
+                    }
+                    if i + 1 < items.len() {
+                        let (lr, _) = ui
+                            .allocate_exact_size(egui::vec2(24.0, 18.0), egui::Sense::hover());
+                        ui.painter().hline(
+                            lr.x_range(),
+                            lr.center().y,
+                            egui::Stroke::new(1.0, p.hair),
+                        );
+                    }
+                }
+            });
         }
         other => {
             // 未知类型：画占位而不是 panic —— 新版插件在旧版宿主上要能降级
