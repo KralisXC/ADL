@@ -3062,8 +3062,19 @@ impl App {
                                 };
                             let te = ui.add(
                                 egui::TextEdit::singleline(&mut self.term.input)
-                                    .font(egui::TextStyle::Monospace)
+                                    // 必须显式给字号，不能用 `TextStyle::Monospace`：
+                                    // 主题里只覆盖了 Body/Button/Heading/Small，
+                                    // Monospace 还是 egui 默认的 14.0，而提示符标签
+                                    // 是 12.5。两边 galley 高度不同，TextEdit 在
+                                    // `ui.horizontal` 的 Align::Center 里居中后，
+                                    // 它的字整体比提示符高出一截（实测差 25 逻辑像素）。
+                                    .font(egui::FontId::monospace(12.5))
                                     .desired_width(f32::INFINITY)
+                                    // TextEdit 的默认对齐是 LEFT_TOP，而 `interact_size.y`
+                                    // 把它的框撑到 30；文字因此贴在自己的框顶，而同排的
+                                    // 提示符标签是在框里居中 —— 实测输入的字比 `PS 路径>`
+                                    // 高 7.3 逻辑像素。显式给 LEFT_CENTER 让两边同基线。
+                                    .align(egui::Align2::LEFT_CENTER)
                                     .text_color(ink_out)
                                     // 输入框和面板同底色、无描边：中间不再有一块深色
                                     // 方块，也没有聚焦时才冒出来的圆角框，光标直接落

@@ -2013,6 +2013,17 @@ if a > 0 {
 - **提示符里的目录必须是绝对路径**：`Config::default()` 的 `dir` 是 `"."`，
   直接显示就成了光秃秃的 `PS .>`。现在显示前先 `Path::canonicalize()`，失败才回退原文，
   再按 52 字符截成 `…{尾部 49}`。PowerShell 的提示符永远是绝对路径，这里跟着做。
+- **正在输入的那一行还要竖向对齐**（用户 m13562「输入的时候还在这上边呢」）：水平方向
+  对齐之后，输入的文字仍然比左边 `PS 路径>` 高出 11 物理像素（144dpi，约 7.3 逻辑像素）。
+  两个原因叠加：
+  1. `TextEdit::font(TextStyle::Monospace)` 取的是 `style.text_styles` 里的 Monospace，
+     而主题只覆盖了 Body/Button/Heading/Small 四项，**Monospace 仍是 egui 默认的 14.0**，
+     提示符标签却是 12.5 —— 两边 galley 高度不同。
+  2. `TextEdit` 的默认对齐是 `Align2::LEFT_TOP`，而 `interact_size.y = 30` 把它的框撑到
+     30 高；文字贴在自己框的顶部，同排标签却在框里垂直居中。
+  修法：`.font(egui::FontId::monospace(12.5))` 显式给字号 + **`.align(egui::Align2::LEFT_CENTER)`**。
+  验证：像素扫描两行的白字顶部，回显行 `y 256`、输入行 `y 347`（各自与前一行蓝路径带
+  同高），修前输入行白字顶部是 `y 336`。
 - **实时语法着色走 `TextEdit::layouter`**：`PSReadLine` 也是这条路人肉上色的
   （它把 token 染好再写 console buffer），egui 侧对应的是
   `TextEdit::layouter(&mut dyn FnMut(&Ui, &dyn TextBuffer, f32) -> Arc<Galley>)`
