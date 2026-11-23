@@ -1862,6 +1862,17 @@ if a > 0 {
 
 ### 13.13 常驻插件页与消息中心
 
+**插件的代码在独立文件 `crates/adl-gui/src/plugins.rs`**（用户 m14683：「我们的插件页面
+也可以从 main 里面单独拎出来变成一个 rs」），和 `terminal.rs` 同一个路数：
+
+| 位置 | 内容 |
+|---|---|
+| `plugins.rs` 上半（自由函数） | `PluginsTab` / `is_builtin` / `str_list` / `permission_labels` / `plugins_root` / `disabled_plugin_entries` |
+| `impl App { … }` 块 | `page_plugins` / `page_plugin` / `page_plugin_settings` / `save_plugin_setting` |
+
+`plugins_root` 被 `main.rs` 的 `build_hooks` 用到，所以它是 `pub(crate)` 并在
+`main.rs` 顶部 `use plugins::{plugins_root, PluginsTab};` 引进来。
+
 **常驻「插件」页**（`Tab::Plugins`，`ADL_TAB=plugins`）
 
 用户要的是"安装插件和管理插件的地方"。它和侧栏下面那些插件页是两件事：
@@ -2089,8 +2100,16 @@ if a > 0 {
 
   **最终换思路：这两样东西本来不需要同时出现。** 真 PowerShell 的空行也不显示提示。
   没焦点时画灰字告诉用户能敲什么，一有焦点就只剩光标，谁也不跟谁比 —— 想留提示可以看
-  上面两行 banner（那里已经写全了 `help` / `Tab` / `↑↓`）。实现就是
+  启动那一行 banner（那里已经写全了 `help` / `Tab` / `↑↓`）。实现就是
   `if self.term.input.is_empty() && !te.has_focus() { ui.painter().text(..) }`。
+
+  🔴 不过真正的根因是**空串的 galley 高度为 0**（不是灰字画得偏）：`LayoutJob` 没有
+  section 时 `layout_section` 一次都不跑，`paragraph.empty_paragraph_height` 停在
+  初始值 0（`text_layout.rs:81`），而光标位置是 `cursor_rect()` 用
+  `cursor_pos.max.y.at_least(cursor_pos.min.y + row_height)` 算的
+  （`text_cursor_state.rs:497`）——拿 0 高度的 galley 居中，左上角正好落在行中线上，
+  再往下画满一个 `row_height`，光标就低了半行。修法是给空串补一个零宽 section 并把
+  `line_height` 钉成 `row_height`，让空 galley 也有行高。
 
   🔴 顺带记一条排查结论：**光标在 `PrintWindow(PW_RENDERFULLCONTENT)` 抓的帧里根本
   不出现**（每次强制重绘把闪烁相位重置回同一位，连拍 8 帧逐列统计完全一致），
@@ -2110,9 +2129,11 @@ if a > 0 {
   `set dir|connections|limit` / `mode safe|trusted` / `plugin list` / `plugin run <p> <cmd>` /
   `cd [目录]`（不带参数 = 打印当前下载目录）/ `history`（列历史命令）/ `ver`。
   输出一律走 `self.term.push`，**不弹 toast、不写状态条** —— 终端页自己就是输出面板。
-- **两行启动横幅**（`LineKind::Banner`，比正文亮一档 `#E8,EE,EC`，**不用彩色**）：
-  `ADL 终端 <版本>` + 一行用法提示。对照真 PowerShell 的 `Windows PowerShell 5.1` +
-  `Copyright (C) ...` —— banner 和正文同色系，只是稍亮，`clear` 只截到 2 行（保留 banner）。
+- **启动横幅只剩一行提示**（`LineKind::Info`）：`输入 help 看可用命令 · Tab 补全 · ↑/↓ 翻历史`。
+  最早是照 PowerShell 的 `Windows PowerShell 5.1` + `Copyright (C) ...` 摆了两行，
+  第一行写 `ADL 终端 <版本>`；用户 m14683 说「终端的最顶上的哪个 adl终端版本0.1.0可以删了」——
+  版本在设置页和 `ver` 命令里都能看到，开机第一屏更希望直接看到「能敲什么」。
+  `clear` 现在只保留这一行（`truncate(1)`），`LineKind::Banner` 仍留给 `help` 的小节标题用。
 - **`help` 抄的是 `Get-Help` 的形状**：`主题` / `简短说明` / `详细说明` / `参数` /
   `联机帮助` 五个小节标题，正文两空格缩进、同色系，**没有色块、badge、圆角卡**。
   这是照用户 m12534 的实测截图改的：真 PowerShell 的 help 输出里，正文和小节标题几乎同色，

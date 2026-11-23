@@ -228,11 +228,9 @@ fn term_layouter(
 impl Default for TerminalState {
     fn default() -> Self {
         let mut lines = Vec::new();
-        // 两行 banner，形状照 PowerShell 的启动横幅来：
-        //   Windows PowerShell 5.1
-        //   Copyright (C) Microsoft Corporation. All rights reserved.
-        // 我们没版权行可写，第二行改成快捷键提示（同样两行、同样长短）。
-        lines.push((LineKind::Banner, format!("ADL 终端 {}", env!("CARGO_PKG_VERSION"))));
+        // 只留一行提示。原来照 PowerShell 的样子放了"ADL 终端 0.1.0" +
+        // 版权位两行，用户 m14683 说版本那行没必要 —— 版本在设置页和
+        // `ver` 命令里都有，开机第一屏反而更希望看到"能敲什么"。
         lines.push((
             LineKind::Info,
             "输入 help 看可用命令 · Tab 补全 · ↑/↓ 翻历史".to_string(),
