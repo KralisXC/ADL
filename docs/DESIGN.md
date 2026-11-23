@@ -1885,6 +1885,29 @@ if a > 0 {
   `add_enabled(false, ...)` 并标「（只读）/（信任模式下才可改）」。开 `--trusted` 后
   同一份界面自动变成可编辑 —— 不需要另写一套。
 
+- **「内置插件」组里混着不是插件的东西**：终端没有 `plugin.toml`、不走 QuickJS、
+  也没有 hook，但它是程序自带的能力。用户 m14525 的原话是「假装是插件就行了，
+  实际上不一定是要插件的，这些内置插件的意思就是我们自己换的」——所以
+  `page_plugins` 在读完快照的 `all` 之后手工 push 一条：
+
+  ```rust
+  all.push(json!({
+      "id": "com.adl.terminal", "name": "终端",
+      "version": env!("CARGO_PKG_VERSION"),
+      "has_ui": true, "trusted": false,
+      "hooks": Vec::<String>::new(), "active_hooks": Vec::<String>::new(),
+      "permissions": json!({ "net": false, "exec": false, "notify": false,
+                             "fs_read": Vec::<String>::new(), "fs_write": Vec::<String>::new() }),
+      "enabled_by_default": true,
+  }));
+  ```
+
+  id 用 `com.adl.` 前缀，于是 `is_builtin()` 自然把它分进内置组，**也就自动没有右侧
+  开关**（内置组的 `can_toggle = false`）——终端是页面，不是能启停的东西，正好对上。
+  ⚠️ `"trusted"` 必须给 `false`：给 `true` 会多挂一个「信任模式」badge，而"信任模式"
+  在 ADL 里专指 QuickJS 插件能改写请求，放在终端身上是误导（第一版就写错了）。
+  这条不是从 `ui::collect()` 出来的，所以也不受"停用插件从目录补回"那套逻辑影响。
+
 - **数据源**：`adl_plugin::ui::collect()` 新增的 `"all"` 键。原有的 `"plugins"`
   只收"有 UI 的"插件（`pages/actions/settings/commands` 任一非空），而真正干活的
   `ua-fixer`、`block-html` 恰好没有 UI —— 只列 `"plugins"` 的话管理页会空掉一半。
@@ -1974,6 +1997,20 @@ if a > 0 {
 ### 13.14 终端页（替代 Ctrl+K 命令面板）
 
 用户原话：「这个命令面板可以变成终端那种（win的powershell）单独页面。」
+
+**实现在独立文件 `crates/adl-gui/src/terminal.rs`**（用户 m14518 要求拆分：
+"现在可以吧这些做成单独的terminal.rs就行了"）。里面的分工是：
+
+| 位置 | 内容 |
+|---|---|
+| `terminal.rs` 上半 | `LineKind` / `TerminalState` / `Completion` / `TERM_INPUT_ID` / `term_caret_to_end` / `TERM_COMMANDS` / `term_candidates` / `term_layouter` / `impl Default` |
+| `impl App { … }` 块 | `page_terminal` / `term_complete` / `term_exec`（都是 `App` 的方法，搬走时用**独立的 `impl App` 块**，`main.rs` 只留 `mod terminal;`） |
+
+拆的时候有两个必须处理的点：①`Tab::Terminal` 这个**枚举变体**和结构体 `Terminal`
+同名，`use terminal::Terminal;` 会和它打架 → 结构体改名 `TerminalState`；
+②跨模块用的东西（`LineKind`、`Completion` 及其字段、`TerminalState` 的六个字段、
+`push`、`page_terminal`）都得标 `pub(crate)`，否则报 `E0603` / `E0616` /
+`E0624`（方法默认私有）。搬错一行就是十几个编译错误，所以先编译再往下改。
 
 原来的命令面板是个 `Window` 浮层：按 Ctrl+K 弹出、选一条就跑、关掉就没了。问题不在
 交互而在**输出** —— 命令跑完的提示飘在状态条上 6 秒就消失，想翻上一条只能重跑。
