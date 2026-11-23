@@ -362,6 +362,23 @@ struct PieceState {
 | 单分片最大抢占次数 | 2 | `--dynamic-slicing-max-preempts` 默认 |
 | 抢占冷却 | 5s | 防毫秒级乒乓 |
 
+#### 3.3.1 四层"粒度"别混为一谈（实测口径）
+
+同一句"分片"在我们这里有四个不同的量，经常被混着问。以代码为准：
+
+| 名称 | 实际值 | 代码位置 | 作用 |
+|---|---|---|---|
+| **续传位图粒度** | **1 MiB** | `control.rs:17` `DEFAULT_PIECE_LENGTH = 1024 * 1024` | 控制文件里 1 bit 对应 1 MiB，决定"最多重下多少" |
+| **单次 Range 请求** | 默认 **1–8 MiB**，随总片数放大 | `engine.rs:539-545` | 网络层一个 HTTP 请求搬多少；`chunk_size=0` 时 `piece 数 = clamp(总片数/(并发×4), 1, 8)` |
+| **进度上报 / UI 刷新** | **64 KB** | `engine.rs:37` `PROGRESS_BATCH = 64 * 1024` | 写满这么多才发一次 `Progress` 事件，避免刷屏 |
+| **SHA256 校验读缓冲** | **256 KB** | `engine.rs:1341` `vec![0u8; 256 * 1024]` | `hash_file` 流式读的缓冲大小，跟下载切分无关 |
+
+> **"256 KB" 的来历**：`hooks.rs:11` 与本文 §7 里那句"每 256 KB 都停下来等插件会慢十倍"，是**举例说明为什么要走异步队列**，不是配置值。真实进度粒度是 64 KB。
+>
+> 换算一下：16 MiB 文件 / 并发 8 → 1 MiB 一请求；1 GiB 文件 / 并发 8 → 8 MiB 一请求。所以"续传最少亏 1 MiB"始终成立（位图粒度），而"网络请求多大"是自适应的。
+>
+> 显式给 `--chunk-size N` 时，请求大小向上取整到 piece 的整数倍（`engine.rs:544`），但**位图粒度不会跟着变** —— 位图精度必须与控制文件里的 `piece_length` 绑定，改了直接拒绝续传。GUI 侧完全不暴露 `chunk_size`（`crates/adl-gui/src/main.rs` 里零引用），走的是自适应默认值。
+
 ### 3.4 调度器：单写者 + 时效 token
 
 **唯一能改分片状态的只有调度协程**。worker 只通过事件通道上报，事件带 `(worker_id, token)`。
@@ -1985,6 +2002,17 @@ if a > 0 {
   .id_salt("adl_term_log")` 内部、紧跟日志循环之后，`max_height` 从原来的
   `log_h`（扣掉输入行高度）改成 `inner_h`（整个内部高度都给滚动区），靠
   `stick_to_bottom(true)` 保证它永远停在看得见的最底下。
+- **敲过的行要连提示符一起留在屏幕上**（用户 m13399 第②条）：真 PowerShell 里
+  敲完一边，那行 `PS C:\Users\33079> 123` 是原样留在日志里的。所以回显不是只存
+  命令文本，而是 `format!("{cwd}>\t{line}")` —— 用 `\t` 把"当时在哪个目录"和
+  "敲了什么"分开存，渲染时再 `split_once('\t')` 拆成 `"PS "` + `cwd>` + `\t` 三段。
+  🔴 **两处间距必须完全一致才有左对齐**：回显行与正在输入的那一行都要用
+  `item_spacing.x = 0.0` + `"PS "`（**带尾随空格**）+ `目录>` + `add_space(6.0)` + 内容。
+  最初回显行写成 `item_spacing.x = 6.0` 且 `PS` 不带空格，就差一个空格宽，
+  输入的字和上面所有回显行差 6px 对不齐 —— 像素级验证过（三行的首字符都在 x=340）。
+- **提示符里的目录必须是绝对路径**：`Config::default()` 的 `dir` 是 `"."`，
+  直接显示就成了光秃秃的 `PS .>`。现在显示前先 `Path::canonicalize()`，失败才回退原文，
+  再按 52 字符截成 `…{尾部 49}`。PowerShell 的提示符永远是绝对路径，这里跟着做。
 - **实时语法着色走 `TextEdit::layouter`**：`PSReadLine` 也是这条路人肉上色的
   （它把 token 染好再写 console buffer），egui 侧对应的是
   `TextEdit::layouter(&mut dyn FnMut(&Ui, &dyn TextBuffer, f32) -> Arc<Galley>)`

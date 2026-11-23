@@ -2926,14 +2926,21 @@ impl App {
 
         // 提示符里的目录：太长就从左边截，保留尾部（尾部的层次才是
         // 人真正关心的部分，跟 PowerShell 折行时的效果接近）。
+        //
+        // 默认配置里 `dir = "."`，直接显示就是个光秃秃的 `.`，看着像坏了；
+        // PowerShell 的提示符永远是绝对路径，所以这里也换算成绝对路径再截。
         let cwd = {
-            let dir = self.gui.cfg.lock().unwrap().dir.clone();
-            let n = dir.chars().count();
+            let raw = self.gui.cfg.lock().unwrap().dir.clone();
+            let abs = std::path::Path::new(&raw)
+                .canonicalize()
+                .map(|p| p.display().to_string().replace('\\', "/"))
+                .unwrap_or_else(|_| raw.clone());
+            let n = abs.chars().count();
             if n > 52 {
-                let tail: String = dir.chars().skip(n - 49).collect();
+                let tail: String = abs.chars().skip(n - 49).collect();
                 format!("…{tail}")
             } else {
-                dir
+                abs
             }
         };
 
@@ -2971,18 +2978,37 @@ impl App {
                         for (kind, text) in &self.term.lines {
                             match kind {
                                 LineKind::Echo => {
+                                    // 回显要把整条提示符留住，不能只剩命令名 ——
+                                    // 真 PowerShell 里敲过的行是原样留在屏幕上的，
+                                    // 只有 "PS 命令" 没有目录和 `>` 会看着像丢了东西。
+                                    // 用 `\t` 把"当时的目录"和"命令"分开存：
+                                    // 目录用路径色、命令用正文色，两者还对得上。
+                                    let (where_at, cmd) = text
+                                        .split_once('\t')
+                                        .unwrap_or(("", text.as_str()));
                                     ui.horizontal_wrapped(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 6.0;
-                                        // 和下面的提示符同样的形状：老命令也带
-                                        // `PS xxx>`，翻历史时一眼看得出这是输入过的。
+                                        // 和下面正在输入的那一行用完全相同的
+                                        // 间距：`PS ` + `目录>` + 6px + 内容。
+                                        // 两处只要差一个空格，输入的字就不会
+                                        // 和上面那些回显行左边对起来。
+                                        ui.spacing_mut().item_spacing.x = 0.0;
                                         ui.label(
-                                            egui::RichText::new("PS")
+                                            egui::RichText::new("PS ")
                                                 .monospace()
                                                 .size(12.5)
                                                 .color(ink_echo),
                                         );
+                                        if !where_at.is_empty() {
+                                            ui.label(
+                                                egui::RichText::new(where_at)
+                                                    .monospace()
+                                                    .size(12.5)
+                                                    .color(ink_path),
+                                            );
+                                        }
+                                        ui.add_space(6.0);
                                         ui.label(
-                                            egui::RichText::new(text)
+                                            egui::RichText::new(cmd)
                                                 .monospace()
                                                 .size(12.5)
                                                 .color(ink_out),
@@ -3119,7 +3145,11 @@ impl App {
             self.term.hist_pos = None;
             if !line.is_empty() {
                 self.term.history.push(line.clone());
-                self.term.push(LineKind::Echo, line.clone());
+                // 回显要把"当时在哪个目录下敲的"一起留下：真 PowerShell
+                // 里敲过的行是整条 `PS C:\xxx> 命令` 原样留在屏幕上的。
+                // 用 `\t` 分隔目录与命令，渲染时各用各的颜色。
+                self.term
+                    .push(LineKind::Echo, format!("{cwd}>\t{line}"));
                 self.term_exec(&line);
             }
             // 执行完把光标留在输入框，连敲才顺手
