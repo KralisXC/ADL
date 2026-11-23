@@ -19,7 +19,19 @@ adl-ui = { path = "../adl-ui" }
 #   - glow (OpenGL)  —— 默认，兼容性最好（虚拟机/远程桌面/老核显都能开）
 #   - wgpu           —— 走 Vulkan / DX12 / Metal，设 ADL_RENDERER=wgpu
 #                       （想强制 Vulkan 再加 WGPU_BACKEND=vulkan）
-eframe = { version = "0.37", default-features = false, features = ["glow", "wgpu", "default_fonts"] }
+#
+# 🔴 `clipboard` 必须显式开：它本来在 eframe 的 default 里
+# （eframe-0.37.0/Cargo.toml 的 default = ["accesskit", "clipboard", ...]），
+# 而我们 `default-features = false` 把这整组关掉了 —— 结果 Ctrl+V 粘不进
+# 下载地址、Ctrl+C 也拷不走文件路径，界面上完全没反应，看着像"输入框坏了"。
+# `links` 顺带开：插件页里将来会有文档链接。
+eframe = { version = "0.37", default-features = false, features = [
+    "clipboard",
+    "glow",
+    "wgpu",
+    "default_fonts",
+    "links",
+] }
 # 托盘菜单（跨平台，Windows 上只需默认后端）。
 tray-icon = { version = "0.25.1", default-features = false }
 muda = { version = "0.20", default-features = false }

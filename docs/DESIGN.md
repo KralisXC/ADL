@@ -1234,7 +1234,14 @@ M5 的界面是 tao + wry + WebView2 + Vue。WebView2 缺失或"残缺版 Window
 
 ### 13.4 双渲染后端：默认 glow，可选 wgpu(Vulkan/DX12/Metal)
 
-`eframe` 同时编入两套后端：`eframe = { version="0.37", default-features=false, features=["glow","wgpu","default_fonts"] }`，运行时用环境变量 `ADL_RENDERER` 选择：
+`eframe` 同时编入两套后端：`eframe = { version="0.37", default-features=false, features=["clipboard","glow","wgpu","default_fonts","links"] }`，运行时用环境变量 `ADL_RENDERER` 选择：
+
+> 🔴 **`clipboard` 必须手动写进 features**。`eframe` 的 default 里有 `clipboard`，
+> 一旦写 `default-features = false`，整组默认 feature 全部关掉 —— 包括剪贴板。
+> 症状极其隐蔽：Ctrl+V 粘不进去、Ctrl+C 拷不出来，界面**没有任何报错**，
+> 只是"按了没反应"（用户 m14849 报的"下载链接复制不上去"就是这个）。
+> 打开后构建日志里会多出 `Compiling arboard v3.x`，这是最可靠的确认方式。
+> 同一坑还适用于 `links`（点链接打开浏览器）。
 
 | `ADL_RENDERER` | 后端 | 说明 |
 |---|---|---|
@@ -1735,6 +1742,28 @@ if let Some(action) = choice {
 排序用 `(rank, id)`：`downloading`(0) → `paused|failed`(1) → 其他(2)，
 所以失败任务浮在最上面，已完成沉底。
 
+#### 13.11.12 任务列表的操作列与「复制」
+
+用户 m14849 报「下载链接复制不上去」，追下来是**两层问题**，缺一不可：
+
+1. **没有可复制的入口**：任务行只有「暂停」「删除」，URL 只挂在文件名列的
+   `on_hover_text` 上 —— 那是悬停提示，选不中也复制不了。加了第三个
+   `small_button("复制")` → `copy_url = Some(t.url.clone())`，循环外统一
+   `ui.ctx().copy_text(url)` + `set_status("已复制下载地址", false)`。
+   （`copy_text` 是 `egui::Context::copy_text`，把字符串推给 `PlatformOutput`，
+   由 winit 的剪贴板后端落地 —— 所以它**依赖 `eframe` 的 `clipboard` feature**，
+   见 §13.4 的 🔴。）
+2. **剪贴板后端根本没编进来**：`eframe` 写的是 `default-features = false`，
+   而 `clipboard` 恰好在 default 里 → `copy_text` 把内容塞进 `PlatformOutput`，
+   却没有任何后端去接，**界面上完全没反应、也没有报错**。
+
+- **操作列从 104 加宽到 152**：三个两字按钮（暂停/删除/复制）+ 两段
+  `item_spacing.x = 6.0` 正好放下；104 时「删除」会被表格右缘裁掉
+  （`virtual_table` 没有横向滚动，宽度是硬切）。
+- 复制的是 `t.url` 原串（不是 `display_name`）：任务从浏览器接管进来常是
+  带 token 的临时直链，要能原样拿到别处去用。
+
+
 #### 13.11.11 淡入淡出与文本选择范围
 
 用户原话：「可以加一些淡入淡出的动画，而且有些就是怎么说可以直接像浏览器文本框选
@@ -2219,13 +2248,14 @@ SendKeys 时文字进去了、回车丢了（截图上输入框里躺着 `help` 
 
 ### 13.16 待续
 - Linux/macOS 需在 `eframe` features 补 `x11`/`wayland`；`platform.rs` 的 Win32 部分已用 `#[cfg(windows)]` 隔离。
+- **剪贴板与 `links` 靠 `eframe` feature 编入**（见 §13.4 的 🔴 警告）：现在是显式写在
+  features 列表里的，以后谁再动这行，构建日志里没有 `Compiling arboard` 就说明又关掉了。
 - 旧的 `web/`（Vue）与 `static_server.rs` 已不再编入（保留仅作历史），后续可清理。
 - `render_node` 已改用 `adl_ui` 的 `badge`/`card`/`hairline`，但 `table`/`kv`/`grid`
   仍是自己算列宽（插件表格要支持任意列数与单元格节点，与 `adl_ui::table` 的
   `FnMut(ui, i, widths)` 签名不同构）；后续可抽公共的"均分列宽"函数。
 - 顶栏"完成 N 总计 M"chip 已能点开任务卡片列表；下一步可给每行加"暂停/删除"
-  小按钮（目前要跳任务列表操作）。
-- 关闭询问弹窗只在"还没有记忆选择"（`cfg.close_action == ""`）时出现；
+  小按钮（目前要跳任务列表操作）。- 关闭询问弹窗只在"还没有记忆选择"（`cfg.close_action == ""`）时出现；
   之后只能在「最小化到托盘 / 退出程序」之间切换，**没有"改回每次询问"这个状态**
   （用户明确要求）。
 - 自绘标题栏的**边缘缩放热区**（`resize_borders`，8 个 `G = 5.0` 的条）只在

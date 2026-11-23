@@ -1454,11 +1454,14 @@ impl App {
             adl_ui::Column::new("进度", 150.0),
             adl_ui::Column::new("速度", 92.0),
             adl_ui::Column::new("大小", 82.0),
-            adl_ui::Column::new("操作", 104.0),
+            // 152 而不是 104：多了一个「复制」。三个两字按钮 + 间距刚好放下，
+            // 挤到 104 的时候「删除」会被表右边裁掉（虚拟表格不给横向滚动）。
+            adl_ui::Column::new("操作", 152.0),
         ];
 
         let mut pause_id: Option<u64> = None;
         let mut remove_id: Option<u64> = None;
+        let mut copy_url: Option<String> = None;
 
         // 行数可能上千（重装系统后补历史时就是），整表渲染会让每帧都画全部行。
         // virtual_table 自带 ScrollArea + show_rows，只画视口里的那几十行。
@@ -1526,6 +1529,15 @@ impl App {
                     if ui.small_button("删除").clicked() {
                         remove_id = Some(t.id);
                     }
+                    // 复制下载地址。任务从浏览器接管进来时常常是带 token 的临时直链，
+                    // 想拿到别处（或者发给人）只能靠这个 —— 以前只能去网页里再抠一次。
+                    if ui
+                        .small_button("复制")
+                        .on_hover_text("复制这个任务的下载地址")
+                        .clicked()
+                    {
+                        copy_url = Some(t.url.clone());
+                    }
                 });
             });
         });
@@ -1535,6 +1547,10 @@ impl App {
         }
         if let Some(id) = remove_id {
             let _ = remove_task(&self.gui, &json!({"id": id, "files": false}));
+        }
+        if let Some(url) = copy_url {
+            ui.ctx().copy_text(url);
+            self.set_status("已复制下载地址", false);
         }
     }
 

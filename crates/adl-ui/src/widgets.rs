@@ -23,12 +23,13 @@ pub fn label_cell(ui: &mut Ui, w: f32, text: &str) {
 /// `set_min_width` 是关键：`allocate_ui_with_layout` 只提供 max_rect，
 /// 水平布局前进时用的是子 Ui 的"已用宽度"。表头文字很窄，不强制撑满
 /// 就会各列挤在一起、与数据行对不齐（实测过）。
-pub fn cell(ui: &mut Ui, w: f32, add: impl FnOnce(&mut Ui)) {
+pub fn cell<R>(ui: &mut Ui, w: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
     ui.allocate_ui_with_layout(vec2(w, 26.0), Layout::left_to_right(Align::Center), |ui| {
         ui.set_min_width(w);
         ui.set_max_width(w);
-        add(ui);
-    });
+        add(ui)
+    })
+    .inner
 }
 
 /// 侧边栏导航项：整行可点，选中态浅青底 + 左侧 3px 竖条。
