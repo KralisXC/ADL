@@ -261,6 +261,37 @@ fn term_layouter(
     let mut job = egui::text::LayoutJob::default();
     job.wrap.max_width = wrap_width;
 
+    // 🔴 空串必须补一个零宽 section，否则光标会掉半行。
+    //
+    // `LayoutJob::sections` 为空时 epaint 的 `layout()` 里 `layout_section`
+    // 一次都不会跑，于是 `paragraph.empty_paragraph_height` 停在初始值 0
+    // （`text_layout.rs:81`），galley 高度就是 0。而光标的位置是
+    // `cursor_rect()` 算的：`cursor_pos.max.y = cursor_pos.max.y.at_least(
+    // cursor_pos.min.y + row_height)`（`text_cursor_state.rs:497`）——
+    // 拿 0 高度的 galley 在 `inner_rect` 里居中，左上角正好落在**行中线**上，
+    // 然后往下画满一个 `row_height`，于是空输入时的光标比同一行的提示符
+    // 低了半行（用户 m14409 的截图就是这么来的；有字时 galley 有高度、
+    // 居中后顶部对齐，所以看着正常）。
+    //
+    // 补一个空字符串的 section，`layout_section` 就会被调用一次，
+    // 那里会执行 `paragraph.empty_paragraph_height = line_height`
+    // （`text_layout.rs:541`），空 galley 于是也有了一行的高度。
+    // `line_height` 显式钉成 `row_height`，和光标用的那个值完全一致。
+    if text.is_empty() {
+        let row_h = ui.painter().fonts_mut(|f| f.row_height(&font));
+        job.append(
+            "",
+            0.0,
+            egui::TextFormat {
+                font_id: font.clone(),
+                color: ink_out,
+                line_height: Some(row_h),
+                ..Default::default()
+            },
+        );
+        return ui.painter().layout_job(job);
+    }
+
     // 第二级子命令：`plugin list`、`set dir`、`mode safe` 这类。
     // 和 Tab 补全用的是同一套词，两处一起改才不会补得出命令却染不上色。
     const SUB: &[&str] = &[
