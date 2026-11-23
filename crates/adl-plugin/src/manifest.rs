@@ -213,6 +213,17 @@ pub struct Manifest {
     pub limits: Limits,
     #[serde(default)]
     pub ui: UiDecl,
+    /// 首次加载时是否默认启用（缺省 true，保持老 manifest 行为不变）。
+    ///
+    /// 示例插件（`plugins/` 下那几个）都写 false：它们和本体功能重叠
+    /// —— 最典型的是 `notify-on-complete` 和本体的"下载完成"通知，
+    /// 两个都开就会给同一个文件发两条提醒（用户 m12538 报的就是这个）。
+    #[serde(default = "default_true")]
+    pub enabled_by_default: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_kind() -> String {

@@ -9,6 +9,14 @@ api_version = 1
 entry = "main.js"
 kind = "quickjs"
 
+# 默认不启用：本体自己在下载完成/失败时已经会发一条通知，
+# 这个插件再发一条，同一个文件就会出现两条"下载完成"（用户 m12538）。
+# 想要"完成时发到系统通知/别处"的话，去插件页把它打开。
+#
+# 注意必须写在 `[permissions]` 之前：TOML 里表头之后的所有裸键都归那张表，
+# 写到最后会被解析成 permissions.enabled_by_default，顶层就永远拿不到它。
+enabled_by_default = false
+
 [[hooks]]
 point = "onComplete"
 priority = 10

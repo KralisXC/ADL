@@ -76,6 +76,9 @@ pub fn collect(plugins: &[LoadedPlugin], values: &SettingsValues, trusted: bool)
             "dir": p.dir.display().to_string(),
             "trusted": p.mode.trusted(),
             "has_ui": has_ui,
+            // 宿主算"启用没有"时要用的缺省值：没写过配置的插件按它决定
+            // 开还是关（示例插件是 false，用户自装的是 true）。
+            "enabled_by_default": p.manifest.enabled_by_default,
             "hooks": hook_names(p),
             "active_hooks": active_hook_names(p),
             "pages": ui.pages.len(),

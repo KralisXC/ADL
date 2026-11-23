@@ -1612,6 +1612,15 @@ for i in 1..3 {
   `format_speed_unit(bps, unit)` 负责显示，`auto` 时退化为自适应。
 - **HTTP/1.1 开关已从界面移除**（用户："自动就行了"）。`Config.http1` 字段保留，
   保存设置时原样带上现值，不会被重置。
+- **User-Agent 两处入口**（用户："有时候又特定的 user-agent 要自己输入的要添加一下，
+  在新建下载，和设置里面"）：
+  - 设置页「其它」卡片第三行 = **默认 UA**（`App.s_ua` ↔ `cfg.user_agent`）。
+  - 新建下载弹窗第三段 = **单次覆盖**（`App.f_ua`，走 `args["user_agent"]`）。
+  后端管道本来就通（`add_task` 先看 `args["user_agent"]`，再看
+  `cfg.user_agent_opt()`，最后落 `http::DEFAULT_UA`），缺的只是这两个输入框。
+  ⚠️ **空串等于"用内置 Chrome 串"**：`user_agent_opt()` 把空当 `None`，所以"清空输入框"
+  不是"发空 UA 给服务器"，而是"回到默认伪装"。提示文案必须写清楚这一点，否则用户会
+  以为自己填了个空 UA 生效了。
 - **关闭行为**：只有两段（最小化到托盘 / 退出程序），对应 `cfg.close_action`
   （`"tray"` / `"close"`）。`""` 只表示"还没问过"，不是可选状态 ——
   **用户明确要求：问过一次之后就定死，不能调回"每次询问"**。
@@ -1628,6 +1637,45 @@ close_requested → CancelClose → 弹窗 → 用户选"退出程序" → 再�
 
 于是永远关不掉。修法是加一个 `closing: bool` 放行闸：确认退出后先置 `closing = true`
 再发 `ViewportCommand::Close`，拦截处看到 `closing` 就放行不再拦。
+
+🔴 **光有闸门还不够，动作本身也必须落在一条路径上**。第二版仍然"点了退出没反应、
+还得再点 X"，根因在 `show_close_modal` 的分支：
+
+```rust
+if remember { self.remember_close_action(action) }   // ← 只写配置，连 Close 都没发
+else { ... }                                          // ← 发了 Close 但没设 closing
+```
+
+勾了"记住"的那条路**根本没有退出**，只是把选择写进了 `config.toml`；没勾的那条路发了
+`Close` 却没设 `closing`，下一帧又被自己的拦截抓住弹一次框。改成无论勾没勾都走同一段
+收尾动作：
+
+```rust
+if let Some(action) = choice {
+    let remember = self.close_ask.as_ref().map(|a| a.remember).unwrap_or(false);
+    if remember { self.remember_close_action(action); } else { self.close_ask = None; }
+    // 不管勾没勾都要立刻做完这一步：拦截逻辑只要 closing==false 就会再弹框
+    if action == "tray" {
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+    } else {
+        self.closing = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+}
+```
+
+⚠️ **托盘菜单的「退出」也要先设 `closing`**。它走的是一条完全独立的路
+（`MenuEvent::receiver()` 里直接发 `Close`），漏设就和弹窗那条路径一样被拦回来 ——
+表现为"从托盘点退出没反应，得再点一次窗口的 X"。
+
+⚠️ **`eframe` 的 `ViewportCommand::Close` 不会直接关窗**：它只是往
+`ViewportEvent::Close` 里塞一个事件（`egui-winit-0.37.0/src/lib.rs:1955`），
+下一帧再由 `viewport().close_requested()` 判定。所以"发了 Close 就以为窗口会关"
+是错的 —— 中间还隔着一整帧的自定义拦截逻辑。
+
+**弹窗内顺序**：标题 → 说明 → **勾选框** → 按钮。用户第一版报"上下位置反了"，
+指的就是勾选框跑到了按钮下面：勾选项是对下面这几个按钮的修饰，读的顺序必须先有它。
 
 #### 13.11.9 插件设置入口
 
@@ -1783,9 +1831,11 @@ if a > 0 {
   顶部只留「刷新」；`PluginsTab` 从三个变体减到 `{ Installed, Market }`。
   少一个按钮就少一处"点了没反应"的猜疑 —— 装的唯一途径本来就是往插件目录放文件夹。
 - **插件分成「内置插件」/「已安装插件」两组**：`is_builtin(v)` 按 id 前缀
-  `com.adl.` 判定（内置的五个都是 `com.adl.*`）。内置组**不给开关**，右侧显示
-  「内置」badge；已安装组才有 `switch`。用户原话："软件内置插件（这个可以显示一些
+  `com.adl.` 判定（内置的五个都是 `com.adl.*`）。用户原话："软件内置插件（这个可以显示一些
   自带的功能（不可在插件页面调整）），已安装插件（就是用户自己安装的）"。
+  ⚠️ 第一版给内置组右侧画了个「内置」badge，用户说要"跟正常的插件一样显示，但是没有
+  右边的开关就行了" —— **那一格直接留空**，不要用 badge 去填。分组标题已经说明了身份，
+  卡片本身不该长得跟别人不一样。
 - **safe 模式下内置插件已经调好，不给用户调**：`adl_plugin::ui::collect()` 里
   `"editable": trusted` 本来就实现了这一点，界面侧只要把 `!editable` 的控件
   `add_enabled(false, ...)` 并标「（只读）/（信任模式下才可改）」。开 `--trusted` 后
@@ -1801,6 +1851,15 @@ if a > 0 {
   扫插件目录、读 `plugin.toml`、跳过已在快照里的，按 `collect()` 同构补一条。
   坏 manifest 直接 `continue`（一个坏插件不该让整页报错）。
 - **排序**：启用的排前面，同组按 id 排。否则开关一次，卡片会跳到列表另一头。
+- **`enabled_by_default`**：manifest 新增字段（`#[serde(default = "default_true")]`，
+  老 manifest 行为不变），配合 `Config::plugin_enabled_or(id, default)` 与
+  `build_hooks` 里 `.filter(|p| cfg.plugin_enabled_or(&p.id, p.manifest.enabled_by_default))`。
+  动机是重复通知：本体自己在下载完成/失败时已经发一条，`notify-on-complete` 再发一条，
+  同一个文件就有两条消息（用户 m12538）。这个插件现在是 `enabled_by_default = false`，
+  想要"完成时另外发一份"的用户自己去插件页打开。
+  🔴 **这个键必须写在 `[permissions]` / `[[hooks]]` 之前**：TOML 里表头之后的所有裸键都
+  归那张表，写到最后会被解析成 `permissions.enabled_by_default`，顶层永远读不到 ——
+  第一版就是这么写的，表现为"改了 manifest 但插件照样默认启用"。
 - **启停落盘**：`cfg.plugins.insert(id, PluginCfg { enabled })` → `cfg.save()` →
   `*gui.hooks.lock() = build_hooks(&new_cfg)` → 快照立即失效。
   卡片闭包里已经借了 `self.gui` 的锁，**在闭包里写配置会死锁** —— 点击结果先收到
@@ -1820,8 +1879,11 @@ if a > 0 {
 - `Level{Info, Ok, Warn, Error}` + `Notice{id, level, title, body, at, read}`，落盘到
   `%LOCALAPPDATA%\ADL\notices.json`（原子写 `.json.tmp`，读的时候剥 BOM，读坏当空库）。
 - **上限 200 条**：这是下载器不是日志系统，留太多只会让「消息」页变成负担。
-- **未读用实心圆点、已读用空心圆**，不改整行底色（克制，也省得和 accent_soft 撞）。
-- 侧栏入口写 `消息 (N)`，N 是未读数；全部已读后回到纯"消息"。
+- 侧栏入口写 `消息 (N)`，N 是未读数；全部已读后回到纯"消息"。位置在「设置」正上方
+  （`bottom_up` 里后 `add` 的在上）。
+- **整页分两段滚动**：顶部统计卡固定，下面列表自己一个 `ScrollArea`
+  （`id_salt("adl_notices_scroll")`）。条数被 200 卡住，不做变高虚拟化；关键是
+  统计卡不该跟着消息一起滚走。
 - **消息卡就是 alert 组件**（用户 m11341：「下载的提示可以使用图一这种去显示出来，
   就很好分辨」）：`Frame::new().fill(level_bg).corner_radius(same(8)).inner_margin(Margin::symmetric(14, 9))`
   + 左侧 3px 色条，与 `render_node` 的 `"alert"` 分支同一套结构，只是把 tone 换成
@@ -1886,17 +1948,35 @@ if a > 0 {
 - **没有描边**：第一版有 `.stroke(Stroke::new(1.0, border))`，用户的评价是
   "看着没那么分界感" —— 有描边就像另贴上去的一块黑板。去掉描边 + 底色压深之后，
   终端是"从页面里挖下去的一块"，不是"页面上贴的一张卡片"。
-- **提示符抄 PowerShell 的形态**：`PS <目录>>`，`PS` 用青绿、路径用蓝。历史回显也
-  带 `PS` 前缀（不是第一版那个光秃秃的 `>`）。
 - **输入框与面板同底色、无边框**：
   `.frame(Frame::new().fill(bg).stroke(Stroke::NONE).corner_radius(CornerRadius::ZERO))`。
   ⚠️ 不能只设 `.background_color(bg)` —— 聚焦时 `TextEdit` 仍会自己画一圈圆角描边，
   终端里冒出一个表单输入框非常出戏。要给 `.frame(..)` 才能彻底接管。
 - 命令：`help` / `clear` / `tasks|ls` / `add <url> [文件名]` / `pause <id>|all` /
   `resume <id>` / `rm <id>`（不删文件）/ `open <id>` / `settings` /
-  `set dir|connections|limit` / `mode safe|trusted` / `plugin list` / `plugin run <p> <cmd>`。
+  `set dir|connections|limit` / `mode safe|trusted` / `plugin list` / `plugin run <p> <cmd>` /
+  `cd [目录]`（不带参数 = 打印当前下载目录）/ `history`（列历史命令）/ `ver`。
   输出一律走 `self.term.push`，**不弹 toast、不写状态条** —— 终端页自己就是输出面板。
+- **两行启动横幅**（`LineKind::Banner`，比正文亮一档 `#E8,EE,EC`，**不用彩色**）：
+  `ADL 终端 <版本>` + 一行用法提示。对照真 PowerShell 的 `Windows PowerShell 5.1` +
+  `Copyright (C) ...` —— banner 和正文同色系，只是稍亮，`clear` 只截到 2 行（保留 banner）。
+- **`help` 抄的是 `Get-Help` 的形状**：`主题` / `简短说明` / `详细说明` / `参数` /
+  `联机帮助` 五个小节标题，正文两空格缩进、同色系，**没有色块、badge、圆角卡**。
+  这是照用户 m12534 的实测截图改的：真 PowerShell 的 help 输出里，正文和小节标题几乎同色，
+  只有小节头略亮一档；我们第一版那种"卡片 + 彩色标题"反而离得更远。
 - 历史上限 500 行，`↑/↓` 翻历史，`Esc` 清空当前输入。
+- **`help` 的命令表从 `TERM_COMMANDS` 常量生成**，与 Tab 补全共用一份 —— 两处各写一遍
+  一定会出现"补得出来但 help 里没有"的命令。`cd`/`history`/`ver` 就是补进这个常量之后
+  才想起来要实现的（补全的候选是死的会很难受）。
+- **输出分级**：`Banner`（横幅/小节标题，最亮）/ `Echo`（回显）/ `Out`（正常）/
+  `Info`（提示）/ `Warn`（警告）/ `Err`（错误）。`Warn` 单独一条是抄 PowerShell 的多流设计：
+  「插件命令被 safe 模式挡住」既不是正常输出也不是错误，用红色会像程序出事了。
+  配色 `warn = #E8,C4,6F`，对应 PowerShell 的 `WarningForegroundColor = Yellow`。
+- **提示符抄 PowerShell 的形态**：`PS <目录>>`，`PS` 用青绿、路径用蓝。历史回显也
+  带 `PS` 前缀（不是第一版那个光秃秃的 `>`）。这个形态不是随手编的，来自
+  `InitialSessionState.cs:4885` 的 `DefaultPromptFunctionText`：
+  `"PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) "`
+  —— 嵌套 prompt 会多一个 `>`，我们暂时没有嵌套层级，固定一个。
 
 🔴 **两个 egui 输入坑（都实测踩过）**：
 
@@ -1912,7 +1992,58 @@ if a > 0 {
 SendKeys 时文字进去了、回车丢了（截图上输入框里躺着 `help` 但没有任何回显）；改用
 `keybd_event` 发真键盘事件才提交。用合成键验证"输入框能不能用"时，先确认回车送得进去。
 
-### 13.15 待续
+### 13.14.1 Tab 补全
+
+用户要的是"抄 PowerShell"，而 PowerShell 最核心的交互其实不是配色，是 **Tab 补全**。
+
+- **单行 `TextEdit` 默认把 Tab 当"切焦点"用**（`EventFilter.tab = false` 是默认值，
+  `builder.rs:148` 的注释就写着 `// tab is used to change focus, not to insert a tab
+  character`）。所以必须 `.lock_focus(true)`（= `event_filter.tab = true`）把这个键抢过来，
+  否则一按 Tab 就跳到窗口右上角的按钮上去了。
+- ⚠️ `EventFilter` 里 `true` 的语义是**"这个键归我，别拿去移动焦点"**，不是"插入字符"。
+  设成 `true` 之后 Tab 事件仍然照常出现在 `ui.input()` 里（`memory/mod.rs:582` 的
+  `if !event_filter.matches(event)` 才是焦点切换的判断入口），所以拿得到。
+- **Tab 仍然要在建 `TextEdit` 之前读**，和 Enter 同一个理由。
+- **候选存整行、不存片段**：`term_candidates(input)` 返回 `vec![整行候选]`，所以
+  `plugin l` 一次补成 `plugin list`，而不是把 `plugin` 吃掉只剩 `list`。
+- **循环补全**：第一次按 Tab 时把候选算好存进 `Terminal::comp: Option<Completion>`，
+  后面每次只推进 `idx`（`(idx + 1) % cands.len()`）。不能每次重新算 —— 第二次算的时候
+  输入框里已经是补完的结果，候选集会变，越补越乱。
+- **打字要作废候选**：`if te.changed() { self.term.comp = None; }`。否则打完字再按 Tab
+  会拿上一次的旧候选把新输入整个顶掉。`↑/↓` 翻历史、`Esc` 清空同样要作废。
+- 补全范围只到第二级（`plugin list|run`、`set dir|connections|limit`、`mode safe|trusted`、
+  `pause all`、`tasks ls`）。再往下是插件 id、任务 id，都是动态的，硬补没意义。
+
+🔴 **验证 Tab 补全时别被"旧帧"骗**：第一次截图拍到的输入框里还躺着 `plug`，看着像
+补全没生效；实际上补全已经改了 `input`（加临时 `ADL_DEBUG_TERM` 打印能看到
+`input="plug"` → `input="plugin"`），只是那一帧截图早于重绘。**先打一个诊断输出确认
+事件到没到，再看画面**，比反复调截图时机快得多。
+
+🔴 **`keybd_event` 发 Tab 之前要 `AppActivate`**：窗口没在前台时键事件会送给别的窗口，
+表现为"Tab 完全没反应"。同一个坑在 `[Scr]::Wheel` 上已经踩过一次。
+
+### 13.15 长列表虚拟滚动
+
+用户原话：「还有就是性能优化，比如虚拟滚动那些的。」
+
+任务列表是唯一会长到几百行的列表（历史任务一直累积），一帧一帧全画出来在滚动时明显卡。
+`adl_ui::table::virtual_table(ui, cols, row_count, |ui, i, widths| ...)`
+（`crates/adl-ui/src/table.rs`）内部用 `ScrollArea::vertical().auto_shrink([false, false])
+.show_rows(ui, pitch, row_count, ...)`，只画视口内的行；`pitch = row_h + 4.0`，
+`header()` 仍画在滚动区上方。
+
+- **三层"跳过页面级 ScrollArea"**：`fn ui()` 里 `Terminal | Tasks | Notices` 三个页签
+  **不走**外部那层 `ScrollArea`，各自 `return`。理由不同：
+  - 终端：输入行不能被两层滚动切掉（见 §13.14）；
+  - 任务列表 / 消息：`show_rows` 必须自己拿到滚动区才知道视口在哪，外面再套一层
+    会让内层的 `max_height` 变成无穷大、虚拟化失效。
+- **消息页不做变高虚拟化**：条数被 `MAX_KEEP = 200` 卡住，只是把顶部统计卡移出滚动区
+  （统计卡不该跟着消息滚走）。真要支持几千条再上看固定行高的方案。
+- ⚠️ 虚拟化之后**行内不能放高度可变的东西**（比如会换行的 `label`）：
+  行高靠 `row_h` 算，实际更高就会被裁。任务列表的文件名走 `table::truncated`
+  （单行 + `on_hover_text`），正是这个约束下才站得住。
+
+### 13.16 待续
 - Linux/macOS 需在 `eframe` features 补 `x11`/`wayland`；`platform.rs` 的 Win32 部分已用 `#[cfg(windows)]` 隔离。
 - 旧的 `web/`（Vue）与 `static_server.rs` 已不再编入（保留仅作历史），后续可清理。
 - `render_node` 已改用 `adl_ui` 的 `badge`/`card`/`hairline`，但 `table`/`kv`/`grid`
@@ -1944,7 +2075,8 @@ SendKeys 时文字进去了、回车丢了（截图上输入框里躺着 `help` 
   索引 JSON 的格式（`id/name/version/download_url/sha256/min_api`）、下载与解压策略
   （看到 `plugin.toml` 才认）、**签名校验**（否则等于开放任意代码执行），以及"装到哪"
   （`plugins/<id>/`，重名要确认覆盖）。用户明确说会接自己的 GitHub 源。
-- 终端页的命令是硬编码的 `match`，没有补全、没有 `--help` 子命令、没有把插件命令
-  动态列进 `help`（`plugin list` 只列 id，不带命令）。
+- 终端页的命令是硬编码的 `match`，没有子命令级别的 `--help`、没有把插件命令
+  动态列进 `help`（`plugin list` 只列 id，不带命令）。Tab 补全只到第二级，
+  插件 id / 任务 id 这类动态参数没补。
 
 

@@ -154,6 +154,20 @@ impl Config {
         self.plugins.get(id).map(|p| p.enabled).unwrap_or(true)
     }
 
+    /// 插件是否启用，缺省值由清单给出。
+    ///
+    /// `plugin_enabled` 的 `unwrap_or(true)` 意味着"没写过就是开"，
+    /// 这对用户自己装的插件是对的；但示例插件（和本体功能重叠的那些，
+    /// 比如 notify-on-complete）应该在首次加载时是关的，否则一个文件
+    /// 会收到两条"下载完成"。所以缺省值要从 manifest 的
+    /// `enabled_by_default` 取，不能写死 true。
+    pub fn plugin_enabled_or(&self, id: &str, default: bool) -> bool {
+        self.plugins
+            .get(id)
+            .map(|p| p.enabled)
+            .unwrap_or(default)
+    }
+
     pub fn dir_path(&self) -> PathBuf {
         PathBuf::from(&self.dir)
     }

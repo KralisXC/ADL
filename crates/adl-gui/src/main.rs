@@ -121,14 +121,22 @@ enum PluginsTab {
 }
 
 /// 终端里一行输出的级别（只影响颜色）。
+///
+/// PowerShell 把输出分成几条流（Output / Warning / Error / Verbose …），
+/// 我们只保留四条：警告单独一条流很有用 —— “插件被 safe 模式挡住了”
+/// 既不是正常输出也不是错误，用红色会像出事了。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LineKind {
+    /// 启动横幅（比正文亮一档，和 PowerShell 的 banner 一个地位）
+    Banner,
     /// 用户敲的命令回显
     Echo,
     /// 正常输出
     Out,
     /// 提示 / 帮助
     Info,
+    /// 警告：能继续，但有事要说
+    Warn,
     /// 错误
     Err,
 }
@@ -143,14 +151,76 @@ struct Terminal {
     hist_pos: Option<usize>,
     /// 请求焦点：刚按 Ctrl+K 进来、或者执行完一条命令后，光标要留在输入框
     focus: bool,
+    /// Tab 补全状态。PowerShell 的 Tab 是**循环**的：按住 Tab 依次换下一个
+    /// 候选，所以我们得记住这一轮是从哪一行开始的。
+    comp: Option<Completion>,
+}
+
+/// 一轮 Tab 补全。
+///
+/// PowerShell 的 Tab 是**循环**的：按住不放依次换下一个候选。所以候选在
+/// 第一次按 Tab 时就算好存下来，后面只推进 `idx`。候选存的是**整行**，
+/// 不是片段 —— 这样二级命令（`plugin list`）也能一次替换干净。
+struct Completion {
+    cands: Vec<String>,
+    idx: usize,
+}
+
+/// 终端第一级命令（Tab 补全和 help 共用一份，免得两处对不上）。
+const TERM_COMMANDS: &[&str] = &[
+    "help", "clear", "tasks", "add", "pause", "resume", "rm", "open", "settings", "set", "cd",
+    "mode", "plugin", "history", "ver",
+];
+
+/// 算出 Tab 补全的候选（整行，不是片段）。
+///
+/// 只做"补全当前这个词"这一件事：补出来的都是 `前缀 + 完整候选`，
+/// 所以 `plugin l` 补成 `plugin list` 而不会把 `plugin` 吃掉。
+fn term_candidates(input: &str) -> Vec<String> {
+    let line = input;
+    // 行尾有空格 = 正在敲下一个词，当前词是空串
+    let ends_space = line.ends_with(' ');
+    let mut words: Vec<&str> = line.split_whitespace().collect();
+    let cur = if ends_space {
+        ""
+    } else {
+        words.pop().unwrap_or("")
+    };
+    let prefix = if words.is_empty() {
+        String::new()
+    } else {
+        format!("{} ", words.join(" "))
+    };
+
+    let pool: Vec<&str> = match words.first().copied() {
+        None => TERM_COMMANDS.to_vec(),
+        Some("plugin") if words.len() == 1 => vec!["list", "run"],
+        Some("set") if words.len() == 1 => vec!["dir", "connections", "limit"],
+        Some("mode") if words.len() == 1 => vec!["safe", "trusted"],
+        Some("pause") if words.len() == 1 => vec!["all"],
+        // `tasks ls` 这种别名也补一下，省得记两套
+        Some("tasks") if words.len() == 1 => vec!["ls"],
+        // 第二层之后没什么可补的（插件 id、任务 id 都是动态的）
+        Some(_) => Vec::new(),
+    };
+
+    pool.into_iter()
+        .filter(|c| c.starts_with(cur))
+        .map(|c| format!("{prefix}{c}"))
+        .collect()
 }
 
 impl Default for Terminal {
     fn default() -> Self {
         let mut lines = Vec::new();
+        // 两行 banner，形状照 PowerShell 的启动横幅来：
+        //   Windows PowerShell 5.1
+        //   Copyright (C) Microsoft Corporation. All rights reserved.
+        // 我们没版权行可写，第二行改成快捷键提示（同样两行、同样长短）。
+        lines.push((LineKind::Banner, format!("ADL 终端 {}", env!("CARGO_PKG_VERSION"))));
         lines.push((
             LineKind::Info,
-            "ADL 终端 · 输入 help 看可用命令，↑/↓ 翻历史，Esc 清空输入".to_string(),
+            "输入 help 看可用命令 · Tab 补全 · ↑/↓ 翻历史".to_string(),
         ));
         Self {
             lines,
@@ -158,6 +228,7 @@ impl Default for Terminal {
             history: Vec::new(),
             hist_pos: None,
             focus: false,
+            comp: None,
         }
     }
 }
@@ -195,11 +266,14 @@ struct App {
     add_open: bool,
     f_url: String,
     f_out: String,
+    /// 单次下载的 User-Agent 覆盖；空 = 用设置里的默认值
+    f_ua: String,
     // 设置表单
     s_dir: String,
     s_conn: u64,
     s_limit: u64,
     s_proxy: String,
+    s_ua: String,
     s_mode: String,
     s_plugin_dir: String,
     // 限速显示单位（"auto" 或固定单位）
@@ -396,10 +470,12 @@ impl App {
             add_open,
             f_url: String::new(),
             f_out: String::new(),
+            f_ua: String::new(),
             s_dir: cfg.dir.clone(),
             s_conn: cfg.connections as u64,
             s_limit: cfg.limit,
             s_proxy: cfg.proxy.clone(),
+            s_ua: cfg.user_agent.clone(),
             s_mode: if cfg.mode_trusted() { "trusted".into() } else { "safe".into() },
             s_plugin_dir: cfg.plugin_dir.clone(),
             limit_unit: if cfg.limit_unit.trim().is_empty() {
@@ -488,9 +564,12 @@ impl App {
             return;
         }
         let out = self.f_out.trim();
+        let ua = self.f_ua.trim();
         let args = json!({
             "url": self.f_url.trim(),
             "out": if out.is_empty() { Value::Null } else { json!(out) },
+            // 留空 = Value::Null，引擎会退回设置里的默认 UA
+            "user_agent": if ua.is_empty() { Value::Null } else { json!(ua) },
         });
         match add_task(&self.gui, &args) {
             Ok(v) => {
@@ -498,6 +577,7 @@ impl App {
                 self.set_status(format!("已添加任务 #{id}"), false);
                 self.f_url.clear();
                 self.f_out.clear();
+                self.f_ua.clear();
                 self.add_open = false;
                 self.tab = Tab::Tasks;
             }
@@ -518,6 +598,8 @@ impl App {
             "http1": http1,
             "plugin_dir": self.s_plugin_dir,
             "limit_unit": self.limit_unit,
+            // 空字符串 = 回到内置默认 UA（引擎侧 user_agent_opt() 返回 None）
+            "user_agent": self.s_ua,
         });
         match set_settings(&self.gui, &args) {
             Ok(_) => {
@@ -700,7 +782,14 @@ impl eframe::App for App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
-                "quit" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                "quit" => {
+                    // 托盘「退出」是用户的明确意图，直接放行。
+                    // 不设 closing 的话，Close 会再被上面那段拦截抓住、弹一次询问框
+                    // —— 表现就是"点了退出没反应，还得再点 X"。
+                    self.closing = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+
                 _ => {}
             }
         }
@@ -848,11 +937,20 @@ impl eframe::App for App {
                 }
                 ui.scope(|ui| {
                     ui.set_opacity(pf);
-                    if self.tab == Tab::Terminal {
-                        // 终端自己管滚动、高度钉满视口：外面再套一层页面
-                        // ScrollArea 的话，`PS>` 输入行会被视口边界切掉一半
-                        // （终端的输入框必须永远停在看得见的地方）。
-                        self.page_terminal(ui);
+                    // 这三个页面自己管滚动，外面**不能**再套页面级 ScrollArea：
+                    //  - 终端：输入行必须永远停在看得见的地方，套两层会被视口切掉一半；
+                    //  - 任务列表 / 消息：用 show_rows 只渲染视口内的行，
+                    //    它需要自己拿到滚动区才能知道视口位置（见 adl_ui::virtual_table）。
+                    if matches!(
+                        self.tab,
+                        Tab::Terminal | Tab::Tasks | Tab::Notices
+                    ) {
+                        match self.tab.clone() {
+                            Tab::Terminal => self.page_terminal(ui),
+                            Tab::Tasks => self.page_tasks(ui),
+                            Tab::Notices => self.page_notices(ui),
+                            _ => {}
+                        }
                         return;
                     }
                     egui::ScrollArea::vertical()
@@ -861,12 +959,11 @@ impl eframe::App for App {
                             ui.set_width(ui.available_width());
                             match self.tab.clone() {
                                 Tab::Home => self.page_home(ui),
-                                Tab::Tasks => self.page_tasks(ui),
                                 Tab::Plugins => self.page_plugins(ui),
-                                Tab::Notices => self.page_notices(ui),
-                                Tab::Terminal => self.page_terminal(ui),
                                 Tab::Settings => self.page_settings(ui),
                                 Tab::Plugin(_, _) => self.page_plugin(ui),
+                                // 上面已经 return 了，这里只是让 match 穷尽。
+                                Tab::Tasks | Tab::Notices | Tab::Terminal => {}
                             }
                         });
                 });
@@ -934,6 +1031,7 @@ impl App {
         if adl_ui::widgets::small_button(ui, btn_rect, "+ 新建下载", true) {
             self.f_url.clear();
             self.f_out.clear();
+            self.f_ua.clear();
             self.add_open = true;
         }
         ui.add_space(12.0);
@@ -1460,7 +1558,9 @@ impl App {
         let mut pause_id: Option<u64> = None;
         let mut remove_id: Option<u64> = None;
 
-        adl_ui::table(ui, &cols, tasks.len(), |ui, i, w| {
+        // 行数可能上千（重装系统后补历史时就是），整表渲染会让每帧都画全部行。
+        // virtual_table 自带 ScrollArea + show_rows，只画视口里的那几十行。
+        adl_ui::table::virtual_table(ui, &cols, tasks.len(), |ui, i, w| {
             let t = &tasks[i];
             let (txt, color) = status_style(&t.status);
 
@@ -1577,6 +1677,20 @@ impl App {
                     .desired_width(f32::INFINITY),
             );
 
+            ui.add_space(12.0);
+            ui.label("User-Agent");
+            ui.add_space(4.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.f_ua)
+                    .hint_text("可选，留空用设置里的默认 UA（已伪装成 Chrome）")
+                    .desired_width(f32::INFINITY),
+            );
+            ui.add_space(4.0);
+            adl_ui::widgets::hint(
+                ui,
+                "有些站点只认特定客户端（比如某网盘、某论坛的专用 UA），这里填了这一单就只用它。",
+            );
+
             ui.add_space(16.0);
             ui.horizontal(|ui| {
                 if ui.button("开始下载").clicked() {
@@ -1625,6 +1739,13 @@ impl App {
                 "你现在还有没下完的任务。选「最小化到托盘」下载会继续跑；\
                  选「退出程序」会先保存进度再退出，下次可以接着下。",
             );
+            ui.add_space(12.0);
+
+            // 勾选框在上、按钮在下 —— 和 Windows 自己的确认框一致。
+            // 原来按钮在上、勾选框在下，读起来像"先做决定再看到选项"。
+            if let Some(ask) = self.close_ask.as_mut() {
+                ui.checkbox(&mut ask.remember, "记住我的选择（以后不再询问）");
+            }
             ui.add_space(14.0);
 
             ui.horizontal(|ui| {
@@ -1638,11 +1759,6 @@ impl App {
                     cancel = true;
                 }
             });
-
-            ui.add_space(10.0);
-            if let Some(ask) = self.close_ask.as_mut() {
-                ui.checkbox(&mut ask.remember, "记住我的选择（以后不再询问）");
-            }
         });
 
         if resp.should_close() {
@@ -1658,12 +1774,20 @@ impl App {
                 self.remember_close_action(action);
             } else {
                 self.close_ask = None;
-                if action == "tray" {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                } else {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
+            }
+            // 不管勾没勾"记住"，选完之后都要**立刻把这一步做完**。
+            //
+            // 这里的坑：`ui()` 开头那段关闭拦截看到 `close_requested()` 时，
+            // 只要 `closing` 还是 false 就会再弹一次框（并且 CancelClose）。
+            // 原来"退出程序"只是发了个 Close 就把弹窗关了，于是
+            // 关窗 → 又弹一次 → 再点一次才能真退。用户说的"要点两遍"
+            // 就是这个；勾了"记住"的路径更糟 —— 只写了配置，连 Close 都没发。
+            if action == "tray" {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            } else {
+                self.closing = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
     }
@@ -1897,11 +2021,17 @@ impl App {
 
         ui.add_space(12.0);
 
-        // ── 其它：目录与代理 ──
+        // ── 其它：目录、代理与 UA ──
         let mut fields = vec![
             adl_ui::Field::text("默认下载目录", &mut self.s_dir).hint("留空 = 当前目录"),
             adl_ui::Field::text("HTTP 代理", &mut self.s_proxy)
                 .hint("http://127.0.0.1:7890（留空 = 直连）"),
+            adl_ui::Field::text("User-Agent", &mut self.s_ua)
+                .hint("留空 = 内置的 Chrome 串（推荐）")
+                .note(
+                    "有些站点只认特定客户端，可以在这里填整串 UA；\
+                     单次覆盖在「新建下载」里填",
+                ),
         ];
         adl_ui::form(ui, "其它", &mut fields);
 
@@ -2246,7 +2376,13 @@ impl App {
                 let desc = p.get("description").and_then(|x| x.as_str()).unwrap_or("");
                 let has_ui = p.get("has_ui").and_then(|x| x.as_bool()).unwrap_or(false);
                 let trusted = p.get("trusted").and_then(|x| x.as_bool()).unwrap_or(false);
-                let enabled = self.gui.cfg.lock().unwrap().plugin_enabled(id);
+                let enabled = {
+                    let d = p
+                        .get("enabled_by_default")
+                        .and_then(|x| x.as_bool())
+                        .unwrap_or(true);
+                    self.gui.cfg.lock().unwrap().plugin_enabled_or(id, d)
+                };
                 let hooks = str_list(p.get("hooks"));
                 let active = str_list(p.get("active_hooks"));
                 // 权限是"声明"，不等于授权：safe 模式下 Transform 类 hook 不生效，
@@ -2285,19 +2421,20 @@ impl App {
                             adl_ui::widgets::badge(ui, "有界面", pal().accent);
                         }
                         // 开关放最右：和 DSH 的插件页一致（名称在左、开关在右），
-                        // 一排扫下去就能看出哪些开着。内置插件不给开关。
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                if can_toggle {
+                        // 一排扫下去就能看出哪些开着。
+                        // 内置插件照常显示整张卡片，只是右边**什么都不画** ——
+                        // 原来这里放一个「内置」badge，用户 m11933 说看着像
+                        // 另一种东西，不如让它们和普通插件长一样、单纯没有开关。
+                        if can_toggle {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
                                     if adl_ui::widgets::switch(ui, enabled).clicked() {
                                         toggle = Some((id.to_string(), !enabled));
                                     }
-                                } else {
-                                    adl_ui::widgets::badge(ui, "内置", pal().accent);
-                                }
-                            },
-                        );
+                                },
+                            );
+                        }
                     });
 
                     if !desc.is_empty() {
@@ -2471,7 +2608,15 @@ impl App {
         }
 
         ui.add_space(10.0);
+        // 消息条数被 Store 卡在 200 条以内，量级可控；这里用普通 ScrollArea
+        // 就够了（不为它单独做变高虚拟化）。但滚动区必须在这一层建：
+        // 外层页面级 ScrollArea 对 Tab::Notices 已经关掉了，否则
+        // 表头那张卡会跟着消息一起滚走。
         let items: Vec<notice::Notice> = self.notices.items.iter().rev().cloned().collect();
+        egui::ScrollArea::vertical()
+            .id_salt("adl_notices_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
         for n in &items {
             // 用 alert 组件的样式（底色块 + 左侧色条）而不是白卡 + 圆点：
             // 一屏十几条时，底色比一个小圆点更快区分"完成/注意/失败"。
@@ -2527,6 +2672,7 @@ impl App {
             );
             ui.add_space(8.0);
         }
+            });
     }
 
     /// 右下角 toast：4 秒后淡出。
@@ -2635,11 +2781,17 @@ impl App {
         let ink_info = egui::Color32::from_rgb(0x77, 0x86, 0x83);
         let ink_echo = egui::Color32::from_rgb(0x8F, 0xD3, 0xC1);
         let ink_path = egui::Color32::from_rgb(0x6F, 0xA8, 0xE8);
+        let ink_warn = egui::Color32::from_rgb(0xE8, 0xC4, 0x6F);
         let ink_err = egui::Color32::from_rgb(0xE3, 0x86, 0x86);
+        // 横幅比正文再亮一档，但不是彩色 —— 真 PowerShell 的 banner
+        // 和正文同色系，只是更干净（见 m12534 那张截图）。
+        let ink_banner = egui::Color32::from_rgb(0xE8, 0xEE, 0xEC);
         let color_of = |k: LineKind| match k {
+            LineKind::Banner => ink_banner,
             LineKind::Echo => ink_echo,
             LineKind::Out => ink_out,
             LineKind::Info => ink_info,
+            LineKind::Warn => ink_warn,
             LineKind::Err => ink_err,
         };
 
@@ -2716,12 +2868,13 @@ impl App {
 
                 // ── 输入行 ──
                 ui.add_space(8.0);
-                // Enter 必须在建 TextEdit **之前**读：单行 TextEdit 收到回车
+                // Enter/Tab 必须在建 TextEdit **之前**读：单行 TextEdit 收到回车
                 // 会 `consume_key(Enter)` 并 surrender_focus，等它返回之后
                 // 再 `key_pressed(Enter)` 永远是 false（实测第一次回车丢键）。
-                let (enter, up, down, esc) = ui.input(|i| {
+                let (enter, tab, up, down, esc) = ui.input(|i| {
                     (
                         i.key_pressed(egui::Key::Enter),
+                        i.key_pressed(egui::Key::Tab),
                         i.key_pressed(egui::Key::ArrowUp),
                         i.key_pressed(egui::Key::ArrowDown),
                         i.key_pressed(egui::Key::Escape),
@@ -2757,6 +2910,9 @@ impl App {
                                     .corner_radius(egui::CornerRadius::ZERO),
                             )
                             .margin(egui::Margin::symmetric(0, 4))
+                            // 不放行 Tab：默认单行 TextEdit 会把 Tab 当成"切焦点"，
+                            // 一按就跳到别的控件上去。这里自己接管做补全。
+                            .lock_focus(true)
                             .hint_text(
                                 egui::RichText::new("输入 help 看命令").color(ink_info),
                             ),
@@ -2770,9 +2926,15 @@ impl App {
                     // `lost_focus()` 也要算：回车那一帧焦点已经交还了。
                     let active = te.has_focus() || te.lost_focus();
                     if active {
+                        // 手动改过内容（打字、粘贴）就作废上一轮补全，
+                        // 否则再按 Tab 会拿旧候选把输入顶掉。
+                        if te.changed() {
+                            self.term.comp = None;
+                        }
                         if esc {
                             self.term.input.clear();
                             self.term.hist_pos = None;
+                            self.term.comp = None;
                         }
                         if up && !self.term.history.is_empty() {
                             // 第一次按 ↑ 从最新一条往上翻；翻到头就停在最老那条。
@@ -2783,6 +2945,7 @@ impl App {
                             };
                             self.term.hist_pos = Some(next);
                             self.term.input = self.term.history[next].clone();
+                            self.term.comp = None;
                         }
                         if down {
                             match self.term.hist_pos {
@@ -2797,6 +2960,10 @@ impl App {
                                 }
                                 None => {}
                             }
+                            self.term.comp = None;
+                        }
+                        if tab {
+                            self.term_complete();
                         }
                         if enter {
                             submit = true;
@@ -2819,6 +2986,30 @@ impl App {
         }
     }
 
+    /// Tab 补全：第一次算出候选并套用第一个，之后每次推进到下一个。
+    ///
+    /// 之所以要自己接管：单行 `TextEdit` 默认把 Tab 当"切焦点"用
+    /// （`event_filter.tab == false`），一按就跳到别的控件上去了。
+    fn term_complete(&mut self) {
+        if let Some(c) = self.term.comp.as_mut() {
+            if !c.cands.is_empty() {
+                c.idx = (c.idx + 1) % c.cands.len();
+                self.term.input = c.cands[c.idx].clone();
+                self.term.focus = true;
+                return;
+            }
+        }
+        let cands = term_candidates(&self.term.input);
+        if cands.is_empty() {
+            // 没候选就什么都不做（真终端这时会响一声，我们没有声音）
+            self.term.comp = None;
+            return;
+        }
+        self.term.input = cands[0].clone();
+        self.term.comp = Some(Completion { cands, idx: 0 });
+        self.term.focus = true;
+    }
+
     /// 执行终端里的一行命令。
     ///
     /// 所有输出都写进 `self.term`（不弹 toast、不写状态条）—— 终端页自己
@@ -2830,29 +3021,49 @@ impl App {
 
         match cmd.as_str() {
             "help" | "?" | "" => {
+                // 形状照 PowerShell 的 Get-Help 输出：几个小节标题（主题 /
+                // 简短说明 / 详细说明），正文两空格缩进、同色系、没有色块。
+                // 命令表从 `TERM_COMMANDS` 生成，Tab 补全与 help 共用一份，
+                // 免得两处各写一遍、改一处忘一处。
+                self.term.push(LineKind::Banner, "主题");
+                self.term.push(LineKind::Out, "  ADL 命令行");
+                self.term.push(LineKind::Out, "");
+                self.term.push(LineKind::Banner, "简短说明");
+                self.term
+                    .push(LineKind::Out, "  在这里管理下载任务、改设置、跑插件命令。");
+                self.term.push(LineKind::Out, "");
+                self.term.push(LineKind::Banner, "详细说明");
+                for c in TERM_COMMANDS {
+                    self.term.push(LineKind::Out, format!("  {c}"));
+                }
+                self.term.push(LineKind::Out, "");
+                self.term.push(LineKind::Banner, "参数");
+                for line in [
+                    "  add <url> [文件名]              新建下载",
+                    "  pause <id> | pause all          暂停",
+                    "  resume <id>                     继续（按 URL 从控制文件续传）",
+                    "  rm <id>                         从列表移除（不删文件）",
+                    "  open <id>                       在资源管理器里定位",
+                    "  cd <目录>                       改默认下载目录（不带参数=显示当前）",
+                    "  set dir <路径>                   改默认下载目录",
+                    "  set connections <1-64>          改并发上限",
+                    "  set limit <字节/秒，0=不限>       改限速",
+                    "  mode safe|trusted               切换插件模式",
+                    "  plugin list                     列出已加载插件",
+                    "  plugin run <插件> <命令>         跑插件声明的命令",
+                ] {
+                    self.term.push(LineKind::Out, line);
+                }
+                self.term.push(LineKind::Out, "");
+                self.term.push(LineKind::Banner, "联机帮助");
                 self.term.push(
-                    LineKind::Info,
-                    "可用命令：\n\
-                     \x20 help                      显示这份帮助\n\
-                     \x20 clear                     清空屏幕\n\
-                     \x20 tasks [ls]                列出下载任务\n\
-                     \x20 add <url> [文件名]         新建下载\n\
-                     \x20 pause <id> | pause all    暂停\n\
-                     \x20 resume <id>               继续（按 URL 从控制文件续传）\n\
-                     \x20 rm <id>                   从列表移除（不删文件）\n\
-                     \x20 settings                  显示当前配置\n\
-                     \x20 set dir <路径>             改默认下载目录\n\
-                     \x20 set connections <1-64>    改并发上限\n\
-                     \x20 set limit <字节/秒，0=不限> 改限速\n\
-                     \x20 mode safe|trusted         切换插件模式\n\
-                     \x20 plugin list               列出插件\n\
-                     \x20 plugin run <插件> <命令>   跑插件命令（需 trusted）\n\
-                     \x20 open <id>                 在资源管理器里定位已下完的文件",
+                    LineKind::Out,
+                    "  Tab 补全、↑/↓ 翻历史、Esc 清空当前行。",
                 );
             }
             "clear" | "cls" => {
-                // 把开头的横幅留下，只清后面的输出 —— 清成全黑会让人以为卡死
-                self.term.lines.truncate(1);
+                // 把开头的两行横幅留下，只清后面的输出 —— 清成全黑会让人以为卡死
+                self.term.lines.truncate(2);
             }
             "tasks" | "ls" => {
                 let tasks = snapshot(&self.gui);
@@ -2975,6 +3186,58 @@ impl App {
                         .term
                         .push(LineKind::Err, format!("#{id} 还没落盘")),
                 }
+            }
+            "cd" => {
+                // 只改"默认下载目录"，不改进程工作目录 —— 下载器没有 shell
+                // 意义上的 cwd，这个命令的语义就是"以后文件放这儿"。
+                let Some(p) = args.first() else {
+                    let dir = self.gui.cfg.lock().unwrap().dir.clone();
+                    self.term.push(LineKind::Out, dir);
+                    return;
+                };
+                let dir = p.replace('/', "\\");
+                let pb = std::path::Path::new(&dir);
+                if !pb.is_dir() {
+                    self.term
+                        .push(LineKind::Err, format!("目录不存在：{dir}"));
+                    return;
+                }
+                let mut cfg = self.gui.cfg.lock().unwrap();
+                cfg.dir = dir.clone();
+                let _ = cfg.save();
+                drop(cfg);
+                self.s_dir = dir.clone();
+                self.term.push(LineKind::Out, format!("下载目录 → {dir}"));
+            }
+            "history" => {
+                if self.term.history.is_empty() {
+                    self.term.push(LineKind::Info, "还没有历史命令");
+                } else {
+                    let mut body = String::new();
+                    for (i, h) in self.term.history.iter().enumerate() {
+                        body.push_str(&format!("  {:>3}  {h}\n", i + 1));
+                    }
+                    self.term.push(LineKind::Out, body.trim_end().to_string());
+                }
+            }
+            "ver" => {
+                self.term.push(
+                    LineKind::Out,
+                    format!(
+                        "ADL {} · {} · 插件 {}/{}",
+                        env!("CARGO_PKG_VERSION"),
+                        std::env::consts::OS,
+                        {
+                            let cfg = self.gui.cfg.lock().unwrap().clone();
+                            if cfg.mode_trusted() { "trusted" } else { "safe" }
+                        },
+                        self.plugin_snapshot
+                            .get("all")
+                            .and_then(|x| x.as_array())
+                            .map(|a| a.len())
+                            .unwrap_or(0)
+                    ),
+                );
             }
             "settings" => {
                 let cfg = self.gui.cfg.lock().unwrap().clone();
@@ -3139,7 +3402,9 @@ impl App {
                                 self.term.push(LineKind::Out, msg);
                             }
                             None => self.term.push(
-                                LineKind::Err,
+                                // 警告而不是错误：命令没跑，但程序没坏，
+                                // 只是当前模式不允许 —— 一屏红字会像出事了。
+                                LineKind::Warn,
                                 "命令不可用（要用 trusted 模式，且插件确实声明了该命令）",
                             ),
                         }
@@ -4338,6 +4603,9 @@ fn disabled_plugin_entries(root: Option<&PathBuf>, known: &[String]) -> Vec<Valu
             "dir": dir.display().to_string(),
             "trusted": false,
             "has_ui": has_ui,
+            // 停用的插件也照常带上缺省值：列表里那一行的开关要能算对
+            // "下次清掉配置后该是开还是关"。
+            "enabled_by_default": m.enabled_by_default,
             "hooks": hooks,
             // 停用的插件没被加载，谈不上"生效的 hook"，留空即可。
             "active_hooks": Vec::<String>::new(),
@@ -4364,7 +4632,12 @@ fn build_hooks(cfg: &Config) -> Arc<PluginHooks> {
             let all = adl_plugin::load_dir(&dir, mode);
             let kept: Vec<_> = all
                 .into_iter()
-                .filter(|p| cfg.plugin_enabled(&p.id))
+                // 缺省值取清单里的 enabled_by_default：示例插件写 false，
+                // 免得和一个文件的两条"下载完成"叠在一起（用户 m12538）。
+                .filter(|p| {
+                    let d = p.manifest.enabled_by_default;
+                    cfg.plugin_enabled_or(&p.id, d)
+                })
                 .collect();
             Arc::new(PluginHooks::new(kept))
         }
@@ -4478,6 +4751,11 @@ fn set_settings(gui: &Arc<Gui>, args: &Value) -> Result<Value, String> {
     }
     if let Some(pd) = args.get("plugin_dir").and_then(|x| x.as_str()) {
         cfg.plugin_dir = pd.to_string();
+    }
+    // 空字符串表示"用内置默认 UA"，不是"没有 UA" —— 引擎侧
+    // `user_agent_opt()` 会把空串当 None，再退回默认 Chrome 串。
+    if let Some(ua) = args.get("user_agent").and_then(|x| x.as_str()) {
+        cfg.user_agent = ua.trim().to_string();
     }
     cfg.save().map_err(|e| format!("保存配置失败: {e}"))?;
     let snapshot = settings_json(&cfg);
