@@ -2024,6 +2024,27 @@ if a > 0 {
   修法：`.font(egui::FontId::monospace(12.5))` 显式给字号 + **`.align(egui::Align2::LEFT_CENTER)`**。
   验证：像素扫描两行的白字顶部，回显行 `y 256`、输入行 `y 347`（各自与前一行蓝路径带
   同高），修前输入行白字顶部是 `y 336`。
+- **程序化改内容之后要把光标拎到行尾**（用户 m13765「输入h点tab自动补全后，help
+  但是这个输入还在h这里不是在p后面」）：`term_complete` / 翻历史 / Esc 都是直接
+  替换 `self.term.input` 整个字符串，而 `TextEdit` 的光标状态存在 memory 里、按 id 复用，
+  上一帧光标在字符索引 1 就还在 1 —— `h` 补成 `help` 之后看着像卡在 `h` 后面。
+  修法三步，缺一不可：
+  1. 给输入框钉死 id：`.id(egui::Id::unique(TERM_INPUT_ID))`（`Id::new` 已废弃）。
+  2. 在控件**之外**改光标：`let mut st = TextEdit::load_state(ctx, id)?;`
+     `st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+     egui::text::CCursor::end_of_str(text))));` `st.store(ctx, id);`
+  3. 复位必须在 `TextEdit` 那一帧跑完之后做（它自己最后写入 memory），所以用
+     `let mut caret_to_end = false;` 在闭包里记标记，`ui.horizontal` 结束后统一调。
+  `CCursor.index` 是**字符**下标不是字节下标，中文目录不会切在半个字上。
+- **空输入时的灰字提示自己画，不用 `hint_text`**（用户 m13765「这个光标没有字的时候
+  没对齐」）：hint 会作为 atom 参与同一行布局，它的 galley 高度由**汉字回退字体**的
+  行高决定（比 12.5 号 monospace 高 4~5px），而光标竖线高度取自 `TextEdit` 自己的
+  font（`cursor_rect(galley, cursor, row_height)`，`text_cursor_state.rs:497`）——
+  两者各自在行里居中，于是空输入时光标比灰字高一截。给 hint 加 `.monospace().size(12.5)`
+  也没用（汉字行高仍按回退字体算）。改成
+  `ui.painter().text(pos2(te.rect.left() + 12.0, te.rect.center().y), Align2::LEFT_CENTER, ...)`
+  自己画，只有一个居中基准；+12px 是为了不压住 index 0 处的光标。
+  验证：提示符蓝带 `y 256..274`、灰字 `y 254..274`（同一中心），修前灰字整体低 2~3px。
 - **实时语法着色走 `TextEdit::layouter`**：`PSReadLine` 也是这条路人肉上色的
   （它把 token 染好再写 console buffer），egui 侧对应的是
   `TextEdit::layouter(&mut dyn FnMut(&Ui, &dyn TextBuffer, f32) -> Arc<Galley>)`

@@ -166,6 +166,30 @@ struct Completion {
     idx: usize,
 }
 
+/// 终端输入框的固定 id。
+///
+/// 必须自己钉死：`TextEdit` 默认用"父布局 id + 序号"派生 id，虽然这里
+/// 每帧结果一致，但我们要在**控件之外**（补全、翻历史）改它的光标，
+/// 就得能拿到同一个 id 去 `TextEdit::load_state/store_state`。
+const TERM_INPUT_ID: &str = "adl_term_input";
+
+/// 把终端输入框的光标挪到行尾。
+///
+/// 补全/翻历史都是直接替换 `term.input` 整个字符串，光标状态却还留在
+/// 旧位置：`h` 按 Tab 变成 `help` 之后，光标还卡在字符索引 1
+/// （用户 m13765 报的就是这个）。所以每次程序化改内容都要手工复位。
+fn term_caret_to_end(ctx: &egui::Context, text: &str) {
+    let id = egui::Id::unique(TERM_INPUT_ID);
+    if let Some(mut st) = egui::TextEdit::load_state(ctx, id) {
+        // `CCursor` 的 index 是**字符**下标不是字节下标，
+        // 所以中文目录/命令也不会把光标切在半个字上。
+        st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+            egui::text::CCursor::end_of_str(text),
+        )));
+        st.store(ctx, id);
+    }
+}
+
 /// 终端第一级命令（Tab 补全和 help 共用一份，免得两处对不上）。
 const TERM_COMMANDS: &[&str] = &[
     "help", "clear", "tasks", "add", "pause", "resume", "rm", "open", "settings", "set", "cd",
@@ -3037,6 +3061,10 @@ impl App {
                                 i.key_pressed(egui::Key::Escape),
                             )
                         });
+                        // 补全/翻历史是程序化替换整行内容，替换完要把光标
+                        // 拎到行尾（否则 `h` → `help` 之后光标还卡在索引 1）。
+                        // 这里只记一个标记，等 TextEdit 画完、状态落盘之后再改。
+                        let mut caret_to_end = false;
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 0.0;
                             ui.label(
@@ -3062,6 +3090,9 @@ impl App {
                                 };
                             let te = ui.add(
                                 egui::TextEdit::singleline(&mut self.term.input)
+                                    // 固定 id：补全/翻历史要在控件之外改光标，
+                                    // 必须能拿到同一个 id（见 `term_caret_to_end`）。
+                                    .id(egui::Id::unique(TERM_INPUT_ID))
                                     // 必须显式给字号，不能用 `TextStyle::Monospace`：
                                     // 主题里只覆盖了 Body/Button/Heading/Small，
                                     // Monospace 还是 egui 默认的 14.0，而提示符标签
@@ -3089,11 +3120,26 @@ impl App {
                                     // 不放行 Tab：默认单行 TextEdit 会把 Tab 当成"切焦点"，
                                     // 一按就跳到别的控件上去。这里自己接管做补全。
                                     .lock_focus(true)
-                                    .layouter(&mut layouter)
-                                    .hint_text(
-                                        egui::RichText::new("输入 help 看命令").color(ink_info),
-                                    ),
+                                    .layouter(&mut layouter),
                             );
+                            // 空输入时的灰字提示自己画，不用 `.hint_text(..)`。
+                            //
+                            // 原因：hint 会作为一个 atom 参与这一行的布局，它的
+                            // galley 高度由**汉字回退字体**的行高决定（比 12.5
+                            // 号 monospace 高 4~5px），而光标竖线的高度来自
+                            // TextEdit 自己的 font —— 两者各自在行里居中，于是
+                            // 空输入时光标看着比灰字高一截（用户 m13765）。
+                            // 自己用 `Align2::LEFT_CENTER` 画就只有一个居中基准。
+                            // 往右让 12px 是为了不压住 index 0 处的光标。
+                            if self.term.input.is_empty() {
+                                ui.painter().text(
+                                    egui::pos2(te.rect.left() + 12.0, te.rect.center().y),
+                                    egui::Align2::LEFT_CENTER,
+                                    "输入 help 看命令",
+                                    egui::FontId::monospace(12.5),
+                                    ink_info,
+                                );
+                            }
                             if self.term.focus {
                                 te.request_focus();
                                 self.term.focus = false;
@@ -3112,6 +3158,7 @@ impl App {
                                     self.term.input.clear();
                                     self.term.hist_pos = None;
                                     self.term.comp = None;
+                                    caret_to_end = true;
                                 }
                                 if up && !self.term.history.is_empty() {
                                     // 第一次按 ↑ 从最新一条往上翻；翻到头就停在最老那条。
@@ -3123,6 +3170,7 @@ impl App {
                                     self.term.hist_pos = Some(next);
                                     self.term.input = self.term.history[next].clone();
                                     self.term.comp = None;
+                                    caret_to_end = true;
                                 }
                                 if down {
                                     match self.term.hist_pos {
@@ -3138,15 +3186,24 @@ impl App {
                                         None => {}
                                     }
                                     self.term.comp = None;
+                                    caret_to_end = true;
                                 }
                                 if tab {
                                     self.term_complete();
+                                    // 真 PowerShell 的 Tab 补完，光标跟在词尾，
+                                    // 接着打参数就行。循环换候选也一样。
+                                    caret_to_end = true;
                                 }
                                 if enter {
                                     submit = true;
                                 }
                             }
                         });
+                        // 光标复位必须在 TextEdit 已经跑完（它这一帧的状态是
+                        // 最后写进 memory 的那份）之后再做，否则会被覆盖回去。
+                        if caret_to_end {
+                            term_caret_to_end(ui.ctx(), &self.term.input);
+                        }
                     });
             });
 
