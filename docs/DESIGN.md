@@ -2045,6 +2045,21 @@ if a > 0 {
   `ui.painter().text(pos2(te.rect.left() + 12.0, te.rect.center().y), Align2::LEFT_CENTER, ...)`
   自己画，只有一个居中基准；+12px 是为了不压住 index 0 处的光标。
   验证：提示符蓝带 `y 256..274`、灰字 `y 254..274`（同一中心），修前灰字整体低 2~3px。
+- 🔴 **但"自己画"只解决了 halo，行内位置还得钉**（用户 m14064「还是下移了一点」）：
+  中文走回退字体，`Glyph::line_height` 比 12.5 号 monospace 高，galley 整体偏高，
+  居中之后汉字视觉重心仍低。两步都要做，缺一不行：
+  1. `TextFormat { line_height: Some(row_height), .. }` —— `text_layout_types.rs:486`
+     写明"行高与字体高度不同时，文字在**给定行高内**垂直居中，与 `valign` 无关"，
+     钉死后中英落在同一条行里。`row_height` 取
+     `ui.painter().fonts_mut(|f| f.row_height(&FontId::monospace(12.5)))`
+     （`ui.fonts()` 只有 `&Fonts`，`fonts_mut` 在 `context.rs:1379` / `painter.rs:150`）。
+  2. 手工上抬 `HINT_LIFT = 0.7` 逻辑像素。量出来的差：钉行高前灰字物理 `y 255..274`、
+     `PS` 是 `y 257..270`；钉行高后变 `y 254..273`，再抬 0.7 后两带中心一致。
+  两步之后灰字用 `ui.painter().layout_job(job)` + `painter.galley(pos, galley, ink_info)`
+  画，`pos.y = te.rect.center().y - galley.size().y * 0.5 - HINT_LIFT`。
+  光标本身在 `PrintWindow(PW_RENDERFULLCONTENT)` 抓的帧里**根本不出现**（强制重绘
+  把闪烁相位重置回同一位），所以校准只能用灰字与 `PS` 的字面带做判据 —— 光标高度
+  恒等于 `row_height`，灰字基线对齐了它自然就齐。
 - **实时语法着色走 `TextEdit::layouter`**：`PSReadLine` 也是这条路人肉上色的
   （它把 token 染好再写 console buffer），egui 侧对应的是
   `TextEdit::layouter(&mut dyn FnMut(&Ui, &dyn TextBuffer, f32) -> Arc<Galley>)`

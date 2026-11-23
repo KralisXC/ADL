@@ -3131,14 +3131,39 @@ impl App {
                             // 空输入时光标看着比灰字高一截（用户 m13765）。
                             // 自己用 `Align2::LEFT_CENTER` 画就只有一个居中基准。
                             // 往右让 12px 是为了不压住 index 0 处的光标。
+                            //
+                            // 但仅"自己画"还不够：中文走的是回退字体，行高比
+                            // 12.5 号 monospace 高，galley 整体就偏高一点点，
+                            // 居中对齐之后中文的视觉重心看着仍然偏下（用户
+                            // m14064 "还是下移了一点"）。所以这里把行高写死成
+                            // 光标用的那个 row_height —— `TextFormat::line_height`
+                            // 的语义是"文字在给定行高内垂直居中"，钉死之后中文
+                            // 与 ASCII 就落在同一条行里，光标也就跟着齐了。
                             if self.term.input.is_empty() {
-                                ui.painter().text(
-                                    egui::pos2(te.rect.left() + 12.0, te.rect.center().y),
-                                    egui::Align2::LEFT_CENTER,
+                                let font = egui::FontId::monospace(12.5);                                let row_h = ui.painter().fonts_mut(|f| f.row_height(&font));
+                                let mut job = egui::text::LayoutJob::default();
+                                job.append(
                                     "输入 help 看命令",
-                                    egui::FontId::monospace(12.5),
-                                    ink_info,
+                                    0.0,
+                                    egui::TextFormat {
+                                        font_id: font,
+                                        color: ink_info,
+                                        line_height: Some(row_h),
+                                        ..Default::default()
+                                    },
                                 );
+                                let galley = ui.painter().layout_job(job);
+                                // 再上抬 0.7 逻辑像素。钉住行高之后两边是同一
+                                // 条行，但汉字字面撑满 em 框、ASCII 只到 baseline：
+                                // 实测灰字物理 y=255..274、`PS` 是 257..270，
+                                // 视觉中心差 1 个物理像素（用户 m14064 说"还是
+                                // 下移了一点"就是这个）。这 0.7 是量出来的，不是猜的。
+                                const HINT_LIFT: f32 = 0.7;
+                                let pos = egui::pos2(
+                                    te.rect.left() + 12.0,
+                                    te.rect.center().y - galley.size().y * 0.5 - HINT_LIFT,
+                                );
+                                ui.painter().galley(pos, galley, ink_info);
                             }
                             if self.term.focus {
                                 te.request_focus();
