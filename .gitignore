@@ -20,3 +20,6 @@ history.json
 # 编辑器
 .vscode/
 .idea/
+
+# PowerShell 源码（只作 UI 参考，不参与构建）
+/PowerShell-master

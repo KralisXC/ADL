@@ -19,6 +19,11 @@ pub enum Field<'a> {
         value: &'a mut String,
         hint: &'a str,
         note: &'a str,
+        /// 输入框右边挂的小按钮：(文案, 动作 id)。
+        ///
+        /// 用来放"选择文件夹…"这类一次性动作 —— 它们和字段强相关，
+        /// 单独在 form 外面再画一行反而会跟标签列对不齐。
+        action: Option<(&'a str, &'a str)>,
     },
     /// 整数（拖动 / 键入）
     Number {
@@ -49,6 +54,7 @@ impl<'a> Field<'a> {
             value,
             hint: "",
             note: "",
+            action: None,
         }
     }
 
@@ -89,6 +95,15 @@ impl<'a> Field<'a> {
         self
     }
 
+    /// 在输入框右边挂一个小按钮。点中后动作 id 会出现在 `form` 的返回值里，
+    /// 由调用方决定要做什么（例如弹系统目录选择框）。
+    pub fn action(mut self, text: &'a str, id: &'a str) -> Self {
+        if let Self::Text { action: a, .. } = &mut self {
+            *a = Some((text, id));
+        }
+        self
+    }
+
     pub fn note(mut self, note: &'a str) -> Self {
         match &mut self {
             Self::Text { note: n, .. }
@@ -111,14 +126,16 @@ impl<'a> Field<'a> {
 
 /// 画一个表单卡片。`title` 为空时不画分组标题。
 ///
-/// 返回 `true` 表示本帧有任何字段被改动（调用方可据此决定是否标脏）。
-pub fn form(ui: &mut Ui, title: &str, fields: &mut [Field<'_>]) -> bool {
+/// 返回本帧被点中的"后缀按钮动作 id"（`Field::action`），没有就是 `None`。
+/// 注意**不是**布尔：一个表单里可能挂多个后缀按钮（目录、UA），
+/// 光知道"某个被点了"没法分辨是哪个。
+pub fn form(ui: &mut Ui, title: &str, fields: &mut [Field<'_>]) -> Option<String> {
     let th = Theme::from_ui(ui);
     let label_w = th.spacing.form_label_w;
     let ctrl_w = th.spacing.form_ctrl_w;
     let field_h = th.spacing.field_h;
 
-    let mut changed = false;
+    let mut action_hit: Option<String> = None;
 
     widgets::card(ui, |ui| {
         ui.add_space(2.0);
@@ -142,15 +159,26 @@ pub fn form(ui: &mut Ui, title: &str, fields: &mut [Field<'_>]) -> bool {
                 // 右：控件（固定宽度起，可被内容撑高）
                 match f {
                     Field::Text {
-                        value, hint, note, ..
+                        value,
+                        hint,
+                        note,
+                        action,
+                        ..
                     } => {
                         // `value` 是 `&mut &mut String`（枚举被 &mut 借用后再解构），
                         // egui 的 TextBuffer 要的是 `&mut String`，所以解两层。
                         ui.vertical(|ui| {
-                            ui.add_sized(
-                                [ctrl_w, field_h],
-                                egui::TextEdit::singleline(&mut **value).hint_text(*hint),
-                            );
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [ctrl_w, field_h],
+                                    egui::TextEdit::singleline(&mut **value).hint_text(*hint),
+                                );
+                                if let Some((text, id)) = action {
+                                    if ui.button(*text).clicked() {
+                                        action_hit = Some((*id).to_string());
+                                    }
+                                }
+                            });
                             if !note.is_empty() {
                                 widgets::hint(ui, note);
                             }
@@ -175,9 +203,7 @@ pub fn form(ui: &mut Ui, title: &str, fields: &mut [Field<'_>]) -> bool {
                     Field::Check { value, text, .. } => {
                         ui.vertical(|ui| {
                             ui.add_space(3.0);
-                            if ui.checkbox(&mut **value, *text).changed() {
-                                changed = true;
-                            }
+                            ui.checkbox(&mut **value, *text);
                         });
                     }
                     Field::Select {
@@ -192,7 +218,6 @@ pub fn form(ui: &mut Ui, title: &str, fields: &mut [Field<'_>]) -> bool {
                                 .to_string();
                             // value 是 `&mut &mut String`（枚举被 &mut 借用后又解构），
                             // 所以要解两层；`selectable_value` 要的是 `&mut String`。
-                            let before = (**value).clone();
                             egui::ComboBox::from_id_salt(format!("adl_form_{label}"))
                                 .width(ctrl_w)
                                 .selected_text(cur)
@@ -201,9 +226,6 @@ pub fn form(ui: &mut Ui, title: &str, fields: &mut [Field<'_>]) -> bool {
                                         ui.selectable_value(&mut **value, (*k).to_string(), *v);
                                     }
                                 });
-                            if **value != before {
-                                changed = true;
-                            }
                             if !note.is_empty() {
                                 widgets::hint(ui, note);
                             }
@@ -215,7 +237,7 @@ pub fn form(ui: &mut Ui, title: &str, fields: &mut [Field<'_>]) -> bool {
         }
     });
 
-    changed
+    action_hit
 }
 
 /// 表单 + 底部主按钮的组合（设置页那种"改完点保存"）。
@@ -227,7 +249,7 @@ pub fn form_with_save(
     fields: &mut [Field<'_>],
     save_label: &str,
 ) -> bool {
-    form(ui, title, fields);
+    let _ = form(ui, title, fields);
     ui.add_space(14.0);
     let mut clicked = false;
     widgets::card(ui, |ui| {

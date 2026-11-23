@@ -210,6 +210,75 @@ fn term_candidates(input: &str) -> Vec<String> {
         .collect()
 }
 
+/// 终端输入行的实时着色。
+///
+/// 这就是 PSReadLine 干的事：**不是**等回车之后再去染输出，而是在输入框
+/// 自己还不认识这行字的时候就按词法给它上色。挂到 `TextEdit::layouter`
+/// 上，每敲一个字符都会被调一次。
+///
+/// 着色密度刻意保持很低 —— 真 PowerShell 的 prompt 行里只有命令名是绿的，
+/// 参数和普通文本一个颜色。搞成彩虹反而不像终端了。
+fn term_layouter(
+    ui: &egui::Ui,
+    text: &str,
+    wrap_width: f32,
+    ink_echo: egui::Color32,
+    ink_out: egui::Color32,
+    ink_path: egui::Color32,
+) -> std::sync::Arc<egui::Galley> {
+    let ink_warn = egui::Color32::from_rgb(0xE8, 0xC4, 0x6F);
+    let font = egui::FontId::monospace(12.5);
+    let fmt = |c: egui::Color32| egui::TextFormat {
+        font_id: font.clone(),
+        color: c,
+        ..Default::default()
+    };
+
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = wrap_width;
+
+    // 第二级子命令：`plugin list`、`set dir`、`mode safe` 这类。
+    // 和 Tab 补全用的是同一套词，两处一起改才不会补得出命令却染不上色。
+    const SUB: &[&str] = &[
+        "list", "run", "dir", "connections", "limit", "safe", "trusted", "all", "ls",
+    ];
+
+    let mut idx = 0usize;
+    for (wi, word) in text.split_whitespace().enumerate() {
+        let start = match text[idx..].find(word) {
+            Some(p) => idx + p,
+            None => idx,
+        };
+        // 词与词之间的空白原样保留，否则缩进和多个空格会被着色吃掉
+        if start > idx {
+            job.append(&text[idx..start], 0.0, fmt(ink_out));
+        }
+        let color = if wi == 0 {
+            if TERM_COMMANDS.contains(&word) {
+                ink_echo
+            } else {
+                // 还不认识的命令先按正文画。真 PowerShell 也是执行之后才报红。
+                ink_out
+            }
+        } else if word.starts_with('-') {
+            ink_warn
+        } else if wi == 1 && SUB.contains(&word) {
+            ink_path
+        } else {
+            ink_out
+        };
+        job.append(word, 0.0, fmt(color));
+        idx = start + word.len();
+    }
+    if idx < text.len() {
+        job.append(&text[idx..], 0.0, fmt(ink_out));
+    }
+    // `ui.fonts()` 给的是 `&Fonts`，而 `layout_job` 要 `&mut`（它要写
+    // 字形缓存）。`Painter::layout_job` 内部走 `fonts_mut`，是这里唯一
+    // 能拿到可变引用的入口。
+    ui.painter().layout_job(job)
+}
+
 impl Default for Terminal {
     fn default() -> Self {
         let mut lines = Vec::new();
@@ -320,12 +389,32 @@ struct App {
     notices: notice::Store,
     /// 右下角 toast：当前显示的那条 + 它出现的时间。
     toast: Option<(notice::Notice, Instant)>,
+    /// 正在等系统目录选择框的结果。
+    ///
+    /// `SHBrowseForFolderW` 是模态阻塞调用，不能在有绘制的时候跑，
+    /// 所以丢进独立线程、把结果从这个 channel 收回来。
+    pick_rx: Option<std::sync::mpsc::Receiver<Option<std::path::PathBuf>>>,
 }
 
 /// 首次点关闭时问用户"退出还是最小化"。
 struct CloseAsk {
     /// 勾选"记住我的选择"
     remember: bool,
+}
+
+/// 起一个线程去弹系统的「选择文件夹」对话框，立刻返回收结果的 channel。
+///
+/// `SHBrowseForFolderW` / `osascript choose folder` 都是**模态阻塞**的：
+/// 直接在 `update` 里调用，整个界面会连重绘都停住（用户看到的是一张卡死的
+/// 旧画面，连"取消"都点不了）。所以必须离开主线程，等结果回来再写回字段。
+fn start_pick_folder() -> std::sync::mpsc::Receiver<Option<std::path::PathBuf>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let picked = platform::pick_folder("选择默认下载目录");
+        // 接收端可能已经丢了（用户切换页面把状态清掉），忽略发送失败。
+        let _ = tx.send(picked);
+    });
+    rx
 }
 
 /// 按比例缩放一个颜色的 alpha（保留 RGB）。
@@ -506,6 +595,7 @@ impl App {
             page_fill: 1.0,
             notices: notice::Store::load(),
             toast: None,
+            pick_rx: None,
         }
     }
 
@@ -809,6 +899,23 @@ impl eframe::App for App {
 
         self.refresh_plugin_snapshot();
 
+        // 目录选择框的结果（用户可能还在选，`try_recv` 没东西就是还没选完）。
+        // 选完就回填到设置页的输入框里 —— 这里只改草稿 `s_dir`，
+        // 还得点「保存设置」才真正落盘，跟手打路径一个待遇。
+        if let Some(rx) = &self.pick_rx {
+            if let Ok(picked) = rx.try_recv() {
+                if let Some(p) = picked {
+                    // 存成带正斜杠的路径：TOML 里反斜杠是转义符，
+                    // 用户手改配置文件时最容易在这里踩坑。
+                    self.s_dir = p.display().to_string().replace('\\', "/");
+                }
+                self.pick_rx = None;
+            } else {
+                // 对话框开着的时候界面也得继续呼吸（不然用户以为程序死了）
+                ctx.request_repaint_after(std::time::Duration::from_millis(120));
+            }
+        }
+
         // 无边框窗口：系统不再提供边缘拖拽，八向热区要自己铺。
         resize_borders(ui);
 
@@ -927,20 +1034,22 @@ impl eframe::App for App {
                 adl_ui::widgets::rule(ui);
                 ui.add_space(4.0);
 
-                // 页面内容下刷：换页后淡入 + 从上方 8px 处落下来。
+                // 换页淡入：只做透明度，**不做位移**。
                 //
-                // 只做淡入像"慢慢显影"，加一点位移才有"刷新出来"的方向感。
-                // 幅度故意很小（8px / 0.16s）—— 用户要的是"微微的观感"。
+                // 早先这里还有一句 `ui.add_space((1.0 - pf) * 8.0)` 想让内容
+                // "从上往下落"。结果每帧布局高度都在变，内容整体位置每帧挪
+                // 零点几像素，配合半透明就是满屏抖 —— 用户报的"淡入淡出会
+                // 闪烁"就是它。8px 的方向感换不来这么明显的瑕疵，删掉。
                 let pf = self.page_fill.clamp(0.0, 1.0);
-                if pf < 1.0 {
-                    ui.add_space((1.0 - pf) * 8.0);
-                }
                 ui.scope(|ui| {
-                    ui.set_opacity(pf);
                     // 这三个页面自己管滚动，外面**不能**再套页面级 ScrollArea：
                     //  - 终端：输入行必须永远停在看得见的地方，套两层会被视口切掉一半；
                     //  - 任务列表 / 消息：用 show_rows 只渲染视口内的行，
                     //    它需要自己拿到滚动区才能知道视口位置（见 adl_ui::virtual_table）。
+                    //
+                    // 而且这三页**不参与淡入**：终端是一整块深色底，半透明时
+                    // 会透出下面的浅色页面变成一块灰板；虚拟列表首帧还在
+                    // 量尺寸，跟着一起半透明就会闪。
                     if matches!(
                         self.tab,
                         Tab::Terminal | Tab::Tasks | Tab::Notices
@@ -953,6 +1062,7 @@ impl eframe::App for App {
                         }
                         return;
                     }
+                    ui.set_opacity(pf);
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
@@ -2022,18 +2132,37 @@ impl App {
         ui.add_space(12.0);
 
         // ── 其它：目录、代理与 UA ──
+        // 两个后缀按钮：
+        //  - `pick_dir` 弹系统目录选择框（手打 Windows 路径很容易漏反斜杠）
+        //  - `fill_ua`   一键填入内置 Chrome 串，用户在这个基础上改，
+        //                比"从 blank 开始自己拼一整串 UA"现实得多
         let mut fields = vec![
-            adl_ui::Field::text("默认下载目录", &mut self.s_dir).hint("留空 = 当前目录"),
+            adl_ui::Field::text("默认下载目录", &mut self.s_dir)
+                .hint("留空 = 当前目录")
+                .action("选择…", "pick_dir"),
             adl_ui::Field::text("HTTP 代理", &mut self.s_proxy)
                 .hint("http://127.0.0.1:7890（留空 = 直连）"),
             adl_ui::Field::text("User-Agent", &mut self.s_ua)
                 .hint("留空 = 内置的 Chrome 串（推荐）")
+                .action("填入 Chrome", "fill_ua")
                 .note(
                     "有些站点只认特定客户端，可以在这里填整串 UA；\
                      单次覆盖在「新建下载」里填",
                 ),
         ];
-        adl_ui::form(ui, "其它", &mut fields);
+        if let Some(hit) = adl_ui::form(ui, "其它", &mut fields) {
+            match hit.as_str() {
+                // 目录选择是模态的，会阻塞到用户选完 —— 必须丢线程里，
+                // 否则整个界面（包括"取消"按钮）都没反应。
+                "pick_dir" => {
+                    self.pick_rx = Some(start_pick_folder());
+                }
+                "fill_ua" => {
+                    self.s_ua = adl_core::http::DEFAULT_UA.to_string();
+                }
+                _ => {}
+            }
+        }
 
         ui.add_space(10.0);
         let mode_opts: [(&str, &str); 2] = [
@@ -2808,14 +2937,14 @@ impl App {
             }
         };
 
-        // 大框占满可用高度，输入行钉在底部 —— 就像真的终端。
+        // 大框占满可用高度。输入行**不**钉在底部，而是跟在历史输出的最后
+        // 一行后面，和历史共用一个滚动区 —— 这才是真终端的样子（在 `PS>`
+        // 后面就地打字），而不是底下永远浮着一条输入栏。
         //
         // 高度要先把 Frame 的内边距（symmetric(14,12) → 上下各 12）扣掉，
         // 否则内容比框高 24px，`PS>` 那一行会被裁在框外看不见。
         let full_h = ui.available_height().max(200.0);
         let inner_h = (full_h - 24.0).max(160.0);
-        let input_h = 30.0;
-        let log_h = (inner_h - input_h - 8.0).max(120.0);
 
         let mut submit = false;
 
@@ -2826,10 +2955,14 @@ impl App {
             .show(ui, |ui| {
                 ui.set_height(inner_h);
 
-                // ── 历史输出 ──
+                // ── 历史输出 + 当前输入行（同一个滚动区）──
+                //
+                // 把输入行放进滚动区里，而不是放在框外：真终端就是"在最后
+                // 一行 PS> 后面接着打"，滚历史时输入行跟着一起走。靠
+                // `stick_to_bottom(true)` 保证它永远停在看得见的最底下。
                 egui::ScrollArea::vertical()
                     .id_salt("adl_term_log")
-                    .max_height(log_h)
+                    .max_height(inner_h)
                     .auto_shrink([false, false])
                     // 新输出总是把视图顶到底部，省得每次执行完还要手动滚
                     .stick_to_bottom(true)
@@ -2864,112 +2997,120 @@ impl App {
                                 }
                             }
                         }
-                    });
 
-                // ── 输入行 ──
-                ui.add_space(8.0);
-                // Enter/Tab 必须在建 TextEdit **之前**读：单行 TextEdit 收到回车
-                // 会 `consume_key(Enter)` 并 surrender_focus，等它返回之后
-                // 再 `key_pressed(Enter)` 永远是 false（实测第一次回车丢键）。
-                let (enter, tab, up, down, esc) = ui.input(|i| {
-                    (
-                        i.key_pressed(egui::Key::Enter),
-                        i.key_pressed(egui::Key::Tab),
-                        i.key_pressed(egui::Key::ArrowUp),
-                        i.key_pressed(egui::Key::ArrowDown),
-                        i.key_pressed(egui::Key::Escape),
-                    )
-                });
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    ui.label(
-                        egui::RichText::new("PS ")
-                            .monospace()
-                            .size(12.5)
-                            .color(ink_echo),
-                    );
-                    ui.label(
-                        egui::RichText::new(format!("{cwd}>"))
-                            .monospace()
-                            .size(12.5)
-                            .color(ink_path),
-                    );
-                    ui.add_space(6.0);
-                    let te = ui.add(
-                        egui::TextEdit::singleline(&mut self.term.input)
-                            .font(egui::TextStyle::Monospace)
-                            .desired_width(f32::INFINITY)
-                            .text_color(ink_out)
-                            // 输入框和面板同底色、无描边：中间不再有一块深色
-                            // 方块，也没有聚焦时才冒出来的圆角框，光标直接落
-                            // 在面板上 —— 这才是终端，不是表单。
-                            .frame(
-                                egui::Frame::new()
-                                    .fill(bg)
-                                    .stroke(egui::Stroke::NONE)
-                                    .corner_radius(egui::CornerRadius::ZERO),
+                        // ── 当前输入行（行内）──
+                        // Enter/Tab 必须在建 TextEdit **之前**读：单行 TextEdit 收到回车
+                        // 会 `consume_key(Enter)` 并 surrender_focus，等它返回之后
+                        // 再 `key_pressed(Enter)` 永远是 false（实测第一次回车丢键）。
+                        let (enter, tab, up, down, esc) = ui.input(|i| {
+                            (
+                                i.key_pressed(egui::Key::Enter),
+                                i.key_pressed(egui::Key::Tab),
+                                i.key_pressed(egui::Key::ArrowUp),
+                                i.key_pressed(egui::Key::ArrowDown),
+                                i.key_pressed(egui::Key::Escape),
                             )
-                            .margin(egui::Margin::symmetric(0, 4))
-                            // 不放行 Tab：默认单行 TextEdit 会把 Tab 当成"切焦点"，
-                            // 一按就跳到别的控件上去。这里自己接管做补全。
-                            .lock_focus(true)
-                            .hint_text(
-                                egui::RichText::new("输入 help 看命令").color(ink_info),
-                            ),
-                    );
-                    if self.term.focus {
-                        te.request_focus();
-                        self.term.focus = false;
-                    }
-                    // 只有输入框有焦点时才拦方向键/Esc，否则在别的页面按 ↑
-                    // 也会翻终端历史（虽然看不见，但会莫名其妙改掉输入）。
-                    // `lost_focus()` 也要算：回车那一帧焦点已经交还了。
-                    let active = te.has_focus() || te.lost_focus();
-                    if active {
-                        // 手动改过内容（打字、粘贴）就作废上一轮补全，
-                        // 否则再按 Tab 会拿旧候选把输入顶掉。
-                        if te.changed() {
-                            self.term.comp = None;
-                        }
-                        if esc {
-                            self.term.input.clear();
-                            self.term.hist_pos = None;
-                            self.term.comp = None;
-                        }
-                        if up && !self.term.history.is_empty() {
-                            // 第一次按 ↑ 从最新一条往上翻；翻到头就停在最老那条。
-                            let next = match self.term.hist_pos {
-                                None => self.term.history.len() - 1,
-                                Some(0) => 0,
-                                Some(i) => i - 1,
-                            };
-                            self.term.hist_pos = Some(next);
-                            self.term.input = self.term.history[next].clone();
-                            self.term.comp = None;
-                        }
-                        if down {
-                            match self.term.hist_pos {
-                                // 翻回底部 = 回到正在编辑的空行
-                                Some(i) if i + 1 >= self.term.history.len() => {
-                                    self.term.hist_pos = None;
-                                    self.term.input.clear();
-                                }
-                                Some(i) => {
-                                    self.term.hist_pos = Some(i + 1);
-                                    self.term.input = self.term.history[i + 1].clone();
-                                }
-                                None => {}
+                        });
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            ui.label(
+                                egui::RichText::new("PS ")
+                                    .monospace()
+                                    .size(12.5)
+                                    .color(ink_echo),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!("{cwd}>"))
+                                    .monospace()
+                                    .size(12.5)
+                                    .color(ink_path),
+                            );
+                            ui.add_space(6.0);
+                            // 边打边着色：把当前这行词法过一遍，命令名/子命令
+                            // 用提示符那支绿，参数保持正文色。这是 PSReadLine
+                            // 的做法 —— 它也是在自己接管输入之后边打边给 token
+                            // 上色，而不是等回车之后再染。
+                            let mut layouter =
+                                |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
+                                    term_layouter(ui, buf.as_str(), wrap, ink_echo, ink_out, ink_info)
+                                };
+                            let te = ui.add(
+                                egui::TextEdit::singleline(&mut self.term.input)
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(f32::INFINITY)
+                                    .text_color(ink_out)
+                                    // 输入框和面板同底色、无描边：中间不再有一块深色
+                                    // 方块，也没有聚焦时才冒出来的圆角框，光标直接落
+                                    // 在面板上 —— 这才是终端，不是表单。
+                                    .frame(
+                                        egui::Frame::new()
+                                            .fill(bg)
+                                            .stroke(egui::Stroke::NONE)
+                                            .corner_radius(egui::CornerRadius::ZERO),
+                                    )
+                                    .margin(egui::Margin::symmetric(0, 4))
+                                    // 不放行 Tab：默认单行 TextEdit 会把 Tab 当成"切焦点"，
+                                    // 一按就跳到别的控件上去。这里自己接管做补全。
+                                    .lock_focus(true)
+                                    .layouter(&mut layouter)
+                                    .hint_text(
+                                        egui::RichText::new("输入 help 看命令").color(ink_info),
+                                    ),
+                            );
+                            if self.term.focus {
+                                te.request_focus();
+                                self.term.focus = false;
                             }
-                            self.term.comp = None;
-                        }
-                        if tab {
-                            self.term_complete();
-                        }
-                        if enter {
-                            submit = true;
-                        }
-                    }
-                });
+                            // 只有输入框有焦点时才拦方向键/Esc，否则在别的页面按 ↑
+                            // 也会翻终端历史（虽然看不见，但会莫名其妙改掉输入）。
+                            // `lost_focus()` 也要算：回车那一帧焦点已经交还了。
+                            let active = te.has_focus() || te.lost_focus();
+                            if active {
+                                // 手动改过内容（打字、粘贴）就作废上一轮补全，
+                                // 否则再按 Tab 会拿旧候选把输入顶掉。
+                                if te.changed() {
+                                    self.term.comp = None;
+                                }
+                                if esc {
+                                    self.term.input.clear();
+                                    self.term.hist_pos = None;
+                                    self.term.comp = None;
+                                }
+                                if up && !self.term.history.is_empty() {
+                                    // 第一次按 ↑ 从最新一条往上翻；翻到头就停在最老那条。
+                                    let next = match self.term.hist_pos {
+                                        None => self.term.history.len() - 1,
+                                        Some(0) => 0,
+                                        Some(i) => i - 1,
+                                    };
+                                    self.term.hist_pos = Some(next);
+                                    self.term.input = self.term.history[next].clone();
+                                    self.term.comp = None;
+                                }
+                                if down {
+                                    match self.term.hist_pos {
+                                        // 翻回底部 = 回到正在编辑的空行
+                                        Some(i) if i + 1 >= self.term.history.len() => {
+                                            self.term.hist_pos = None;
+                                            self.term.input.clear();
+                                        }
+                                        Some(i) => {
+                                            self.term.hist_pos = Some(i + 1);
+                                            self.term.input = self.term.history[i + 1].clone();
+                                        }
+                                        None => {}
+                                    }
+                                    self.term.comp = None;
+                                }
+                                if tab {
+                                    self.term_complete();
+                                }
+                                if enter {
+                                    submit = true;
+                                }
+                            }
+                        });
+                    });
             });
 
         if submit {

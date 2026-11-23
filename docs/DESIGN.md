@@ -1621,6 +1621,25 @@ for i in 1..3 {
   ⚠️ **空串等于"用内置 Chrome 串"**：`user_agent_opt()` 把空当 `None`，所以"清空输入框"
   不是"发空 UA 给服务器"，而是"回到默认伪装"。提示文案必须写清楚这一点，否则用户会
   以为自己填了个空 UA 生效了。
+- **两个输入框右侧各挂一个按钮**（用户："默认下载目录可以加一个调用 win/mac 的选择
+  文件夹窗口"、"user-agent 可以添加一个按钮默认添加 chrome 的，让用户在这基础上添加"）：
+  - 「默认下载目录」→「选择…」：调系统文件夹对话框，选完回填（并把 `\` 换成 `/`，
+    TOML 里反斜杠是转义符）。**只改草稿 `s_dir`，仍需点"保存设置"** —— 弹对话框不算
+    用户确认保存。
+  - 「User-Agent」→「填入 Chrome」：把 `adl_core::http::DEFAULT_UA` 抄进输入框，
+    用户在它基础上改。用户要的是"起点"不是"开关"。
+  - 实现：`adl_ui::Field::text(..).action("选择…", "pick_dir")` —— 给 `Field::Text`
+    加了 `action: Option<(&str 文案, &str 动作 id)>`。`form()` 的返回值因此从
+    `bool changed` 改成 **`Option<String>`（被点的动作 id）**：一个表单可能挂多个按钮，
+    光知道"某个被点了"没法分辨是哪个。
+- **目录对话框必须丢到子线程**：`SHBrowseForFolderW` 是**模态阻塞**的，在主线程调
+  会把 egui 主循环整个卡住（窗口变"未响应"）。做法是 `std::thread::spawn` 里跑
+  `platform::pick_folder()`，用 `mpsc` 把结果送回；主循环每帧 `try_recv()`，
+  没结果时 `ctx.request_repaint_after(120ms)` 保活。
+  ⚠️ Windows 侧用 `windows-sys` 的 `SHBrowseForFolderW`（系统自带、**零新依赖**），
+  `CoInitializeEx` 成功后必须 `CoUninitialize`，PIDL 是 COM 分配、必须
+  `CoTaskMemFree`。`BROWSEINFOW.pidlRoot` 要 `null_mut()` 而不是 `null()`（否则
+  `E0308: types differ in mutability`）。
 - **关闭行为**：只有两段（最小化到托盘 / 退出程序），对应 `cfg.close_action`
   （`"tray"` / `"close"`）。`""` 只表示"还没问过"，不是可选状态 ——
   **用户明确要求：问过一次之后就定死，不能调回"每次询问"**。
@@ -1799,9 +1818,17 @@ if a > 0 {
 ⚠️ **只能改 alpha，不能用 `Color32::gamma_multiply`**：它会把 RGB 一起乘下去，
 淡到一半时 `accent_soft` 会变成发暗的脏青色，而不是"同一颜色更透明"。
 
-**③ 页面下刷 = 淡入 + 8px 位移。** 只做淡入像"慢慢显影"，加一点位移才有"刷新
-出来"的方向感。幅度故意很小（8px / 0.16s）—— 用户要的是"微微的观感"，做大了
-就成了花活。实现上先 `ui.add_space((1-pf)*8.0)` 再 `ui.scope(|ui| { ui.set_opacity(pf); ... })`。
+**③ 页面刷新 = 只做淡入，不做位移。** 第一版是"淡入 + 8px 位移"，先
+`ui.add_space((1-pf)*8.0)` 再 `ui.scope(|ui| { ui.set_opacity(pf); ... })`。用户反馈
+「终端和其他页面整个如果是淡入淡出的话会出现闪烁」—— 根因就是那个 `add_space`：
+它**每帧都在改布局高度**，内容每帧往下挪零点几像素，叠加半透明之后，相邻两帧的
+位置差和 alpha 差在浅色底上会被眼睛读成"闪"。位移只有 8px，方向感几乎察觉不到，
+换来的瑕疵却满屏都是，所以**直接删掉位移，只留透明度**。
+
+⚠️ 另外 `Terminal | Tasks | Notices` 三页**不参与淡入**：`ui.set_opacity` 要挪到
+这个 `matches!` 判断之后。终端是一整块深色底，半透明中间态会透出下面的浅色页面，
+变成一块**灰板**；任务/消息是虚拟列表，首帧还在量尺寸，半透明会闪一下。
+「自绘深色块 / 虚拟列表」这两类东西天生不适合整块淡入。
 
 ⚠️ 时钟必须在 `ui()` 里、**侧栏那个 `if` 外面**算（`self.page_fill = self.tick_page(&ctx)`），
 否则侧栏收起时页面不刷新。
@@ -1952,6 +1979,22 @@ if a > 0 {
   `.frame(Frame::new().fill(bg).stroke(Stroke::NONE).corner_radius(CornerRadius::ZERO))`。
   ⚠️ 不能只设 `.background_color(bg)` —— 聚焦时 `TextEdit` 仍会自己画一圈圆角描边，
   终端里冒出一个表单输入框非常出戏。要给 `.frame(..)` 才能彻底接管。
+- **输入行在日志区里面，不在框底固定**：用户原话「他是直接在里面输入的，而不是在
+  底下固定一个输入的那种的」。真终端就是"在最后一行 `PS>` 后面接着打"，滚历史时
+  输入行跟着一起走。所以 `TextEdit` 整段放进 `ScrollArea::vertical()
+  .id_salt("adl_term_log")` 内部、紧跟日志循环之后，`max_height` 从原来的
+  `log_h`（扣掉输入行高度）改成 `inner_h`（整个内部高度都给滚动区），靠
+  `stick_to_bottom(true)` 保证它永远停在看得见的最底下。
+- **实时语法着色走 `TextEdit::layouter`**：`PSReadLine` 也是这条路人肉上色的
+  （它把 token 染好再写 console buffer），egui 侧对应的是
+  `TextEdit::layouter(&mut dyn FnMut(&Ui, &dyn TextBuffer, f32) -> Arc<Galley>)`
+  （`builder.rs:298`）。我们按词切分做 `LayoutJob`：
+  第 0 词命中 `TERM_COMMANDS` → 绿（`ink_echo`）；`-` 开头 → 黄（`ink_warn`）；
+  第 1 词命中子命令表 → 蓝（`ink_path`）；其余正文色。
+  🔴 **`ui.fonts()` 拿不到可变引用**，`Fonts::layout_job` 要 `&mut self`（写字形缓存），
+  必须走 **`ui.painter().layout_job(job)`**（内部 `fonts_mut`），否则
+  `error[E0596]: cannot borrow *f as mutable`。
+  ⚠️ 词间空白要原样 `job.append(&text[idx..start], ..)` 保留，否则多打的空格被吃掉。
 - 命令：`help` / `clear` / `tasks|ls` / `add <url> [文件名]` / `pause <id>|all` /
   `resume <id>` / `rm <id>`（不删文件）/ `open <id>` / `settings` /
   `set dir|connections|limit` / `mode safe|trusted` / `plugin list` / `plugin run <p> <cmd>` /
@@ -2063,8 +2106,9 @@ SendKeys 时文字进去了、回车丢了（截图上输入框里躺着 `help` 
   在中途换行、按钮被压扁。
 - 文本选择已全局关闭，只对 `code`/`copy` 放开。若以后加了"日志"类页面想让整段
   可选，记得用 `Label::new(..).selectable(true)` 逐个放开，别把全局开关又打开。
-- 淡入覆盖三个 overlay（添加下载 / 关闭询问 / 消息 toast）和状态条。页面切换现在走
-  的是 §13.12 的"下刷"通道，不再是硬切。
+- 淡入覆盖三个 overlay（添加下载 / 关闭询问 / 消息 toast）、状态条和换页。换页走 §13.12
+  的通道，但**只有透明度、没有位移**（位移会闪）；`Terminal | Tasks | Notices` 三页
+  主动不参与淡入。
 - 消息中心只有"全部已读 / 清空"两个批量动作，没有单条已读、没有按级别过滤。
   条数上限 200 已经够用，真要翻旧账再补。
 - 插件页只有"启用/停用/打开目录/重新扫描"，**没有卸载**：删目录是不可逆操作，
@@ -2077,6 +2121,7 @@ SendKeys 时文字进去了、回车丢了（截图上输入框里躺着 `help` 
   （`plugins/<id>/`，重名要确认覆盖）。用户明确说会接自己的 GitHub 源。
 - 终端页的命令是硬编码的 `match`，没有子命令级别的 `--help`、没有把插件命令
   动态列进 `help`（`plugin list` 只列 id，不带命令）。Tab 补全只到第二级，
-  插件 id / 任务 id 这类动态参数没补。
+  插件 id / 任务 id 这类动态参数没补。语法着色也是"按词查表"这种最粗糙的实现，
+  没有真正的 token 化（引号里的内容、管道、重定向都没区分）。
 
 

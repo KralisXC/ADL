@@ -268,3 +268,96 @@ pub fn open_path(dir: &std::path::Path) -> std::io::Result<()> {
     }
     Ok(())
 }
+
+/// 弹出系统的「选择文件夹」对话框，返回用户选中的目录。
+///
+/// 🔴 **这个函数会阻塞到用户选完为止**（`SHBrowseForFolderW` 是模态的）。
+/// 调用方必须丢到 `std::thread::spawn` 里再用 channel 收结果，
+/// 直接在 egui 的 `update` 里调会让整个界面冻住（连重绘都停）。
+///
+/// 选的是文件夹不是文件，所以用 `SHBrowseForFolderW` 而不是
+/// `GetOpenFileNameW` —— 后者选不了目录。也没引 `rfd`/`native-dialog`
+/// 这类第三方依赖：系统自带的就够，还省一个编译单元。
+#[cfg(windows)]
+pub fn pick_folder(title: &str) -> Option<std::path::PathBuf> {
+    use windows_sys::Win32::System::Com::{
+        CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_APARTMENTTHREADED,
+        COINIT_DISABLE_OLE1DDE,
+    };
+    use windows_sys::Win32::UI::Shell::{
+        SHBrowseForFolderW, SHGetPathFromIDListW, BROWSEINFOW, BIF_EDITBOX, BIF_NEWDIALOGSTYLE,
+        BIF_RETURNONLYFSDIRS,
+    };
+
+    unsafe {
+        // 这个线程大概率是新建的、还没初始化过 COM。返回 S_FALSE 表示
+        // "已经初始化过"（此时不该由我们 CoUninitialize），失败就放弃。
+        let hr = CoInitializeEx(std::ptr::null(), (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32);
+        if hr < 0 {
+            return None;
+        }
+        let should_uninit = hr == 0;
+
+        let title_w: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+        // 对话框自己往里写选中路径的显示名，得给它一块可写缓冲。
+        let mut display = [0u16; 260];
+        let mut bi: BROWSEINFOW = std::mem::zeroed();
+        // hwndOwner 给 null：对话框会当独立窗口弹出，位置交给系统。
+        bi.hwndOwner = std::ptr::null_mut();
+        bi.pidlRoot = std::ptr::null_mut();
+        bi.pszDisplayName = display.as_mut_ptr();
+        bi.lpszTitle = title_w.as_ptr();
+        // 只要真实目录（不要虚拟文件夹）；带个输入框可以直接粘路径；
+        // NEWDIALOGSTYLE 换成 Vista 之后的现代样式（可拖动、可展开）。
+        bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_EDITBOX | BIF_NEWDIALOGSTYLE;
+        bi.lpfn = None;
+        bi.lParam = 0;
+
+        let pidl = SHBrowseForFolderW(&bi);
+        let mut out: Option<std::path::PathBuf> = None;
+        if !pidl.is_null() {
+            let mut buf = [0u16; 260];
+            if SHGetPathFromIDListW(pidl, buf.as_mut_ptr()) != 0 {
+                let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+                let s = String::from_utf16_lossy(&buf[..len]);
+                if !s.is_empty() {
+                    out = Some(std::path::PathBuf::from(s));
+                }
+            }
+            // PIDL 是 COM 分配的，必须用 CoTaskMemFree 还，不能 drop
+            CoTaskMemFree(pidl as *const c_void);
+        }
+
+        if should_uninit {
+            CoUninitialize();
+        }
+        out
+    }
+}
+
+/// macOS 侧用 `osascript` 调系统的选择目录面板。
+///
+/// 同样会阻塞（等用户点完），调用方照 Windows 那套丢线程里。
+#[cfg(target_os = "macos")]
+pub fn pick_folder(_title: &str) -> Option<std::path::PathBuf> {
+    let out = std::process::Command::new("osascript")
+        .args(["-e", "POSIX path of (choose folder)"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        // 用户点了取消，osascript 会以非 0 退出，这不是错误。
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(std::path::PathBuf::from(s))
+    }
+}
+
+/// 其它平台没有现成实现，返回 `None`，界面上退化成手填路径。
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn pick_folder(_title: &str) -> Option<std::path::PathBuf> {
+    None
+}
