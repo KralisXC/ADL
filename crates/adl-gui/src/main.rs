@@ -3122,52 +3122,32 @@ impl App {
                                     .lock_focus(true)
                                     .layouter(&mut layouter),
                             );
-                            // 空输入时的灰字提示自己画，不用 `.hint_text(..)`。
-                            //
-                            // 原因：hint 会作为一个 atom 参与这一行的布局，它的
-                            // galley 高度由**汉字回退字体**的行高决定（比 12.5
-                            // 号 monospace 高 4~5px），而光标竖线的高度来自
-                            // TextEdit 自己的 font —— 两者各自在行里居中，于是
-                            // 空输入时光标看着比灰字高一截（用户 m13765）。
-                            // 自己用 `Align2::LEFT_CENTER` 画就只有一个居中基准。
-                            // 往右让 12px 是为了不压住 index 0 处的光标。
-                            //
-                            // 但仅"自己画"还不够：中文走的是回退字体，行高比
-                            // 12.5 号 monospace 高，galley 整体就偏高一点点，
-                            // 居中对齐之后中文的视觉重心看着仍然偏下（用户
-                            // m14064 "还是下移了一点"）。所以这里把行高写死成
-                            // 光标用的那个 row_height —— `TextFormat::line_height`
-                            // 的语义是"文字在给定行高内垂直居中"，钉死之后中文
-                            // 与 ASCII 就落在同一条行里，光标也就跟着齐了。
-                            if self.term.input.is_empty() {
-                                let font = egui::FontId::monospace(12.5);                                let row_h = ui.painter().fonts_mut(|f| f.row_height(&font));
-                                let mut job = egui::text::LayoutJob::default();
-                                job.append(
-                                    "输入 help 看命令",
-                                    0.0,
-                                    egui::TextFormat {
-                                        font_id: font,
-                                        color: ink_info,
-                                        line_height: Some(row_h),
-                                        ..Default::default()
-                                    },
-                                );
-                                let galley = ui.painter().layout_job(job);
-                                // 再上抬 0.7 逻辑像素。钉住行高之后两边是同一
-                                // 条行，但汉字字面撑满 em 框、ASCII 只到 baseline：
-                                // 实测灰字物理 y=255..274、`PS` 是 257..270，
-                                // 视觉中心差 1 个物理像素（用户 m14064 说"还是
-                                // 下移了一点"就是这个）。这 0.7 是量出来的，不是猜的。
-                                const HINT_LIFT: f32 = 0.7;
-                                let pos = egui::pos2(
-                                    te.rect.left() + 12.0,
-                                    te.rect.center().y - galley.size().y * 0.5 - HINT_LIFT,
-                                );
-                                ui.painter().galley(pos, galley, ink_info);
-                            }
                             if self.term.focus {
                                 te.request_focus();
                                 self.term.focus = false;
+                            }
+                            // 空输入时的灰字提示：**只在没有焦点时画**。
+                            //
+                            // 之前试过 `.hint_text(..)`、也试过自己 `painter.text`
+                            // 再钉 `TextFormat::line_height` + 手工上抬 0.7px，
+                            // 每次都要跟光标比基线 —— 因为灰字和光标是两套 galley：
+                            // 光标高度取 TextEdit 自己的 `row_height`，灰字高度取
+                            // 汉字回退字体的行高，谁也没法在不改源码的前提下压成
+                            // 一条线（用户 m13765 / m14064 / m14285 连着报了三轮）。
+                            //
+                            // 换个思路：**这两样东西本来就不需要同时出现**。
+                            // 真 PowerShell 里光标所在的空行也不显示任何提示。
+                            // 没焦点时（刚切到终端页、或者点走了）画灰字告诉用户
+                            // 能敲什么；一旦有焦点就只剩光标，谁也不跟谁比。
+                            // 想留提示可以看上面那两行 banner，那里已经写全了。
+                            if self.term.input.is_empty() && !te.has_focus() {
+                                ui.painter().text(
+                                    egui::pos2(te.rect.left() + 2.0, te.rect.center().y),
+                                    egui::Align2::LEFT_CENTER,
+                                    "输入 help 看命令",
+                                    egui::FontId::monospace(12.5),
+                                    ink_info,
+                                );
                             }
                             // 只有输入框有焦点时才拦方向键/Esc，否则在别的页面按 ↑
                             // 也会翻终端历史（虽然看不见，但会莫名其妙改掉输入）。

@@ -2036,30 +2036,28 @@ if a > 0 {
   3. 复位必须在 `TextEdit` 那一帧跑完之后做（它自己最后写入 memory），所以用
      `let mut caret_to_end = false;` 在闭包里记标记，`ui.horizontal` 结束后统一调。
   `CCursor.index` 是**字符**下标不是字节下标，中文目录不会切在半个字上。
-- **空输入时的灰字提示自己画，不用 `hint_text`**（用户 m13765「这个光标没有字的时候
-  没对齐」）：hint 会作为 atom 参与同一行布局，它的 galley 高度由**汉字回退字体**的
-  行高决定（比 12.5 号 monospace 高 4~5px），而光标竖线高度取自 `TextEdit` 自己的
-  font（`cursor_rect(galley, cursor, row_height)`，`text_cursor_state.rs:497`）——
-  两者各自在行里居中，于是空输入时光标比灰字高一截。给 hint 加 `.monospace().size(12.5)`
-  也没用（汉字行高仍按回退字体算）。改成
-  `ui.painter().text(pos2(te.rect.left() + 12.0, te.rect.center().y), Align2::LEFT_CENTER, ...)`
-  自己画，只有一个居中基准；+12px 是为了不压住 index 0 处的光标。
-  验证：提示符蓝带 `y 256..274`、灰字 `y 254..274`（同一中心），修前灰字整体低 2~3px。
-- 🔴 **但"自己画"只解决了 halo，行内位置还得钉**（用户 m14064「还是下移了一点」）：
-  中文走回退字体，`Glyph::line_height` 比 12.5 号 monospace 高，galley 整体偏高，
-  居中之后汉字视觉重心仍低。两步都要做，缺一不行：
-  1. `TextFormat { line_height: Some(row_height), .. }` —— `text_layout_types.rs:486`
-     写明"行高与字体高度不同时，文字在**给定行高内**垂直居中，与 `valign` 无关"，
-     钉死后中英落在同一条行里。`row_height` 取
-     `ui.painter().fonts_mut(|f| f.row_height(&FontId::monospace(12.5)))`
-     （`ui.fonts()` 只有 `&Fonts`，`fonts_mut` 在 `context.rs:1379` / `painter.rs:150`）。
-  2. 手工上抬 `HINT_LIFT = 0.7` 逻辑像素。量出来的差：钉行高前灰字物理 `y 255..274`、
-     `PS` 是 `y 257..270`；钉行高后变 `y 254..273`，再抬 0.7 后两带中心一致。
-  两步之后灰字用 `ui.painter().layout_job(job)` + `painter.galley(pos, galley, ink_info)`
-  画，`pos.y = te.rect.center().y - galley.size().y * 0.5 - HINT_LIFT`。
-  光标本身在 `PrintWindow(PW_RENDERFULLCONTENT)` 抓的帧里**根本不出现**（强制重绘
-  把闪烁相位重置回同一位），所以校准只能用灰字与 `PS` 的字面带做判据 —— 光标高度
-  恒等于 `row_height`，灰字基线对齐了它自然就齐。
+- 🔴 **空输入的灰字提示只在输入框没有焦点时画**（用户 m13765 / m14064 / m14285
+  连着报了三轮「光标比灰字高/低」之后的最终做法，**放弃逐像素对齐**）：
+  灰字和光标是两套 galley，谁也压不到一条线上 ——
+  - 光标：`cursor_rect(galley, cursor, row_height)`（`text_cursor_state.rs:497`），
+    高度取 `TextEdit` 自己的 `row_height`，纵向位置取 galley 的行；
+  - 灰字：高度由**汉字回退字体**的行高决定，比 12.5 号 monospace 高 4~5px。
+
+  试过并**全部失败**的三条路：①`.hint_text(..)`（atom 参与同一行布局，各自居中）；
+  ②`.monospace().size(12.5)` 强制字号（汉字行高仍按回退字体算）；③`LayoutJob` +
+  `TextFormat { line_height: Some(row_height) }` 钉行高再手工上抬 `HINT_LIFT = 0.7`
+  （`text_layout_types.rs:486` 说"行高与字体高度不同时文字在给定行高内垂直居中"，
+  钉完量到灰字 `y 254..273` vs `PS` `y 257..270`，抬 0.7 后带中心勉强对上，
+  但用户肉眼看「还是靠下」，而且每次调字号都要重测）。
+
+  **最终换思路：这两样东西本来不需要同时出现。** 真 PowerShell 的空行也不显示提示。
+  没焦点时画灰字告诉用户能敲什么，一有焦点就只剩光标，谁也不跟谁比 —— 想留提示可以看
+  上面两行 banner（那里已经写全了 `help` / `Tab` / `↑↓`）。实现就是
+  `if self.term.input.is_empty() && !te.has_focus() { ui.painter().text(..) }`。
+
+  🔴 顺带记一条排查结论：**光标在 `PrintWindow(PW_RENDERFULLCONTENT)` 抓的帧里根本
+  不出现**（每次强制重绘把闪烁相位重置回同一位，连拍 8 帧逐列统计完全一致），
+  所以"对比光标和灰字"这种验证方式本身不可靠。
 - **实时语法着色走 `TextEdit::layouter`**：`PSReadLine` 也是这条路人肉上色的
   （它把 token 染好再写 console buffer），egui 侧对应的是
   `TextEdit::layouter(&mut dyn FnMut(&Ui, &dyn TextBuffer, f32) -> Arc<Galley>)`
