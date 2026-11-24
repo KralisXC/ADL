@@ -21,7 +21,8 @@ pub use engine::{clamp_concurrency, download, hash_file, DownloadOptions, Downlo
 pub use error::{AdlError, Result};
 pub use md5::{md5_file, md5_hex};
 pub use hooks::{
-    Candidate, Completed, DownloadPlan, Hooks, NoopHooks, Progress, ResponseVerdict, Verdict,
+    Candidate, Completed, DownloadPlan, Hooks, NoopHooks, Progress, ResponseVerdict, RunInfo,
+    Verdict,
 };
 pub use segment::{SegState, Segment, SegmentTable};
 

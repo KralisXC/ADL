@@ -38,6 +38,8 @@ muda = { version = "0.20", default-features = false }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+# 详情页要解 `.adl` 控制文件里的十六进制位图
+hex = { workspace = true }
 # Windows 平台胶水：单实例（命名互斥量）、唤醒（命名事件）、
 # 休眠/唤醒通知（PowerRegisterSuspendResumeNotification）、
 # 选择文件夹对话框（SHBrowseForFolderW，系统自带，不引第三方依赖）。

@@ -22,7 +22,7 @@ use crate::hooks::{Completed, DownloadPlan, Hooks, Progress, ResponseVerdict, Ve
 use crate::http::DEFAULT_UA;
 use crate::path;
 use crate::probe::{self, Probe};
-use crate::segment::SegmentTable;
+use crate::segment::{SegState, SegmentTable};
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -1176,8 +1176,11 @@ async fn download_unknown_length(
                 total: 0,
                 speed_bps: speed_tracker.bps(),
                 connections: 1,
+                // 单流路径只有一条线路，区间是"从 0 到已经写了多少"。
+                // 拿不到总长（total == 0）时 end 给 0，界面按"未知总长"处理。
+                runs: Vec::new(),
             };
-            hooks.on_progress(p);
+            hooks.on_progress(p.clone());
             if let Some(cb) = &on_progress {
                 cb(p);
             }
@@ -1238,13 +1241,29 @@ fn emit_progress(
     hooks: &Arc<dyn Hooks>,
     cb: &Option<ProgressFn>,
 ) {
+    // 任务详情页要画"哪一段在动"，所以把正在跑的分片区间一并送出去。
+    // 只看 Active / Reclaiming：Missing 没在动，Done 已经不需要看了。
+    // 一条 worker 通常只占一个分片，但抢占期间可能短暂持有两个，
+    // 这里不做合并 —— 详情页本来就是按区间画的。
+    let runs: Vec<crate::hooks::RunInfo> = table
+        .segments
+        .iter()
+        .filter(|s| matches!(s.state, SegState::Active { .. } | SegState::Reclaiming { .. }))
+        .map(|s| crate::hooks::RunInfo {
+            start: s.start,
+            end: s.end,
+            written: s.written,
+        })
+        .collect();
+
     let p = Progress {
         completed: table.completed(),
         total,
         speed_bps: speed.bps(),
         connections: conns as u32,
+        runs,
     };
-    hooks.on_progress(p);
+    hooks.on_progress(p.clone());
     if let Some(f) = cb {
         f(p);
     }

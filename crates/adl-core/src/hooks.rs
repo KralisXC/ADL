@@ -55,14 +55,33 @@ pub enum ResponseVerdict {
     Retry { after: Duration },
 }
 
+/// 一条正在跑的线路此刻的状态（`Progress::runs` 的元素）。
+///
+/// 界面的任务详情页要画"哪一段在动、动了多少"，光有总进度是画不出来的。
+/// 这里给的是**真实**的在跑区间，不是按并发数平分的假数据。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunInfo {
+    /// 起止字节（闭区间）
+    pub start: u64,
+    pub end: u64,
+    /// 这条线路本次已写入的字节数
+    pub written: u64,
+}
+
 /// 进度事件（`onProgress` 的入参）。
-#[derive(Debug, Clone, Copy)]
+///
+/// 早先是 `Copy` 的，加了 `runs` 之后只能 `Clone` —— 引擎在每个上报点
+/// 把它同时交给插件 hook 和 GUI 回调，两处都要一份。
+#[derive(Debug, Clone, Default)]
 pub struct Progress {
     pub completed: u64,
     pub total: u64,
     pub speed_bps: u64,
     /// 当前活跃的连接数（已派发且未结束的分片）。UI 用它显示"并行线路"。
     pub connections: u32,
+    /// 每条活跃线路的区间与已写字节。为空表示没有在跑的线路，
+    /// 插件的 `onProgress` 不消费它（序列化时会跳过）。
+    pub runs: Vec<RunInfo>,
 }
 
 /// 完成事件（`onComplete` 的入参）。
@@ -158,6 +177,7 @@ mod tests {
             total: 2,
             speed_bps: 3,
             connections: 4,
+            runs: Vec::new(),
         });
         assert!(h
             .on_complete(&Completed {

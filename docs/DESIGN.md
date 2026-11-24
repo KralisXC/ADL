@@ -1259,6 +1259,16 @@ M5 的界面是 tao + wry + WebView2 + Vue。WebView2 缺失或"残缺版 Window
 - 依赖 `muda = { default-features=false }`，否则默认 feature 拉入 Linux 的 `libxdo`，离线/跨平台解析失败。
 - 编译开销：wgpu/naga/vello 是重灾区，单次全量 release 构建可达 20~40 分钟；迭代期可用 `CARGO_PROFILE_RELEASE_LTO=false` + `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16` 加速（注意 profile 变化会触发全量重建）。fat LTO + 单 CGU 在本机会病理级慢，正式出包再开。
 - release（`opt-level="z" + lto="fat" + strip`）体积见 §13.7 实测。
+- 🔴 **启动时闪的几个黑框是 conhost，不是 PowerShell**（用户 m15179 问过）。
+  crate 顶部没有 `#![windows_subsystem]` 时，PE 头是 **console 子系统**，Windows
+  会给进程分配一个控制台窗口 —— 双击、`Start-Process`、甚至从资源管理器启动都会看到。
+  修法是加一行（放在文档注释之后、`mod` 之前）：
+  ```rust
+  #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+  ```
+  这是 **exe 自身的 PE 属性，与打包工具无关**，所以打包之后同样生效。
+  用 `cfg_attr(not(debug_assertions))` 而不是无条件加，是为了 debug 构建里还能看到
+  `eprintln!` 与 panic 回溯（GUI 崩溃时唯一的线索）。
 
 ### 13.6 与后端的衔接
 `adl-gui` 只负责"壳"，仍复用 `adl-core`（引擎）、`adl-plugin`（插件 + 声明式 UI）、`adl-app`（config/history）。浏览器接管 API（`api_server`）与 UI 同进程共享 `Arc<Gui>` 状态，功能不变。桌面集成：单实例（命名互斥量 + 命名事件唤醒）、关闭到托盘（`CancelClose` + `Visible(false)`）、托盘菜单（tray-icon + muda，显示主界面/退出）、休眠暂停。
@@ -1319,8 +1329,8 @@ M5 的界面是 tao + wry + WebView2 + Vue。WebView2 缺失或"残缺版 Window
 | 文件 | 行数 | 职责 |
 |---|---|---|
 | `theme.rs` | 285 | 全部主题令牌：`Palette`（颜色）/ `Spacing`（间距）/ `Radius`（圆角）/ `TextSize`（字号），外加 `install_and_apply(ctx)` 一次性装好 `Visuals` 与 `TextStyle`。换肤只改这里 |
-| `widgets.rs` | 176 | egui 表达力不足、需要反复手写的控件：`cell` / `label_cell` / `nav_item` / `small_button` / `mode_pill` / `badge` / `card` / `section_title` / `hint` / `empty_state` |
-| `form.rs` | 229 | `Field` 枚举 + `form()`：一个字段一行，自动画"标签格 + 控件 + 说明" |
+| `widgets.rs` | 176 | egui 表达力不足、需要反复手写的控件：`cell` / `label_cell` / `nav_item` / `small_button` / `mode_pill` / `badge` / `card` / `section_title` / `hint` / `empty_state`，后来又加了 `switch` / `more_button` / `heatmap` / `stat_card` / `sidebar_toggle` / `hairline` / `rule` |
+| `form.rs` | 229 | `Field` 枚举 + `form()`：一个字段一行，自动画"标签格 + 控件 + 说明"；`Field::Text` 还能挂一个后缀按钮（`.action("选择…", "pick_dir")`），`form()` 返回被点的按钮 id |
 | `table.rs` | 149 | `Column` / `table()` / `virtual_table()` / `truncated()`：定宽列 + 一列吃剩余 + 视口虚拟化 |
 
 **收益（实测）**：
@@ -1336,12 +1346,18 @@ M5 的界面是 tao + wry + WebView2 + Vue。WebView2 缺失或"残缺版 Window
 
 ```rust
 let mut fields = vec![
-    adl_ui::Field::text("默认下载目录", &mut self.s_dir).hint("留空 = 当前目录"),
+    // `.action(按钮文案, 动作 id)` 会给这一行右侧挂一个按钮；
+    // `form()` 返回被点按钮的 id，一个表里可以挂多个。
+    adl_ui::Field::text("默认下载目录", &mut self.s_dir)
+        .hint("留空 = 当前目录")
+        .action("选择…", "pick_dir"),
     adl_ui::Field::number("并发数", &mut self.s_conn, 1..=64).note("服务器不给满会自动降"),
     adl_ui::Field::select("插件模式", &mut self.s_mode, &opts),
     adl_ui::Field::checkbox("HTTP/1.1", &mut self.s_http1, "强制使用 HTTP/1.1"),
 ];
-adl_ui::form(ui, "下载", &mut fields);
+if let Some(hit) = adl_ui::form(ui, "下载", &mut fields) {
+    if hit == "pick_dir" { self.pick_rx = Some(start_pick_folder()); }
+}
 ```
 
 ```rust
@@ -1762,7 +1778,66 @@ if let Some(action) = choice {
   （`virtual_table` 没有横向滚动，宽度是硬切）。
 - 复制的是 `t.url` 原串（不是 `display_name`）：任务从浏览器接管进来常是
   带 token 的临时直链，要能原样拿到别处去用。
+- **后来又改回两个格子**（用户 m15179「这些按钮有点挤和奇怪」）：操作列不
+  再加宽，而是「暂停/继续」+ 一个 `⋯` 菜单。菜单项：打开文件所在位置 /
+  查看详情… / 复制下载地址 / ─── / 删除任务…（红字，`ui.add_enabled(has_path, ..)`
+  在还没有落盘路径时置灰）。动作靠六个收集器（`pause_id` / `resume_id` /
+  `remove_id` / `open_dir_id` / `detail_id` / `copy_url`）在行循环外统一处理 ——
+  行内的闭包已经借了 `self`，不能直接调 `self.pause_task` 之类。
+- 🔴 **`⋯` 必须自己画**：`ui.small_button("⋯")` 里的 U+22EF 在 simhei 下没有
+  字形，会渲染成一个空方块（用户截图里操作列那一格就是空白）。`adl_ui::widgets::more_button`
+  用 `allocate_exact_size(vec2(30.0, 24.0), Sense::click())` + 三个
+  `circle_filled(r = 1.5, x 间距 4.6)` 手画，hover 才画 `hover_bg` 圆角底。
+  这也和 §13.10「图标全部手画」是同一条约束。
 
+
+#### 13.11.13 进度条、任务详情页、删除询问、单文件目录
+
+用户 m15179 一次提了九条，其中这四条都在任务相关的界面上。
+
+**① 进度条画成了实心圆。** 只给 `desired_width` 时高度落到
+`ui.spacing().interact_size.y`（主题里是 30），而 `ProgressBar` 的**默认圆角
+就是高度的一半**（`progress_bar.rs:137-138`），于是填充宽度被
+`min_width = 2 * 圆角 = 30`（`:142`）兜住 —— 17% 的进度画出来是个 30×30 的圆。
+
+```rust
+egui::ProgressBar::new(frac)
+    .desired_width((w[2] - 52.0).max(40.0))
+    .desired_height(8.0)                       // ← 关键
+    .corner_radius(egui::CornerRadius::same(3)) // ← 关键
+    .fill(teal())
+```
+
+百分比单独一个 `label`，不再用 `show_percentage()`（那样是画在条上的）。
+
+**② 详情页（`Tab::TaskDetail(u64)`）。** 三张卡：顶部信息 / 分片热力矩阵 /
+活跃线路。数据层要动引擎：
+
+- `hooks.rs` 新增 `RunInfo { start, end, written }`，`Progress` 加
+  `runs: Vec<RunInfo>`（**从 `Copy` 改成 `Clone`** —— 多了 `Vec`；而且引擎要在
+  每个上报点把它同时交给插件 hook 和 GUI 回调，`Copy` 也不够用）。
+- `engine.rs` 的 `emit_progress` 里把 `table.segments` 中
+  `SegState::Active{..} | SegState::Reclaiming{..}` 的区间和 `written` 收集出来。
+  给的是**真实在跑的区间**，不是按并发数平分的假数据。
+- 🔴 **下载过程中 `Task.path` 还是 `None`**（路径要探测完才定），所以详情页
+  一开始读不到 `.adl`、矩阵画不出来。加了 `Task.dir`（`opts.dir`）和
+  `control_of(t)`：先按 `path` 读，失败再扫 `dir` 下的 `*.adl` 按 `cf.url` 比对
+  （同引擎 `find_control_by_url` 的思路）。
+- 🔴 **`runs` 会残留**：引擎在最后一批 worker 退出后不再 `emit_progress`，
+  GUI 侧就停在上一次的值 → 完成的任务详情页挂着几十条 0 B 区间。所以
+  `download(...).await` 返回后要 `t.runs.clear()`，`pause_task`/`pause_all` 也要
+  清 `runs` 并把 `speed` 归零。
+- 矩阵每格 1 MiB（= `DEFAULT_PIECE_LENGTH`），`cell = 12.0`、`gap = 2.0`，
+  颜色 绿=完成 / 橙=正在下载 / 灰=未开始，高度超 `260.0` 就 `set_clip_rect` 裁。
+
+**③ 删除询问 + 记住。** `struct DeleteAsk { id, name, has_file, delete_files, remember }`
++ `cfg.delete_files_choice: Option<bool>`（记住之后不再问）。`fn remove_task` 早就
+支持 `args["files"]`，缺的只是 UI。`has_file == false` 时换成"这个任务还没有落盘
+文件，只会删掉任务记录"，不显示那个复选框。
+
+**④ 单文件目录。** 新建下载弹窗加第三段「保存到目录」（`App.f_dir`），
+`do_add` 传 `"dir"`；`add_task` 本来就读 `args["dir"]`，只缺输入框。目录选择复用
+设置页那套 `pick_rx`，靠 `pick_to_add: bool` 分流回 `f_dir` 还是 `s_dir`。
 
 #### 13.11.11 淡入淡出与文本选择范围
 
@@ -2034,6 +2109,19 @@ if a > 0 {
   `.color()` 的 strong 文本都会画成白字**，在白卡上整行消失。这个 bug 让插件名
   整行空白了一轮，最后靠像素扫描才发现。
 
+**插件卸载：标记 + 下次启动才删**（用户 m15179）
+
+用户原话：「插件卸载的话可以卸载，但是正常还在跑，要等我们整个软件重启后删除
+（怕用户还在使用）。」所以是两段式：
+
+1. 点「卸载…」（只有 `can_toggle`，即用户自装插件的卡片才有）→
+   `cfg.plugins.insert(id, PluginCfg { enabled: false })` + `cfg.pending_uninstall.push(id)`
+   （去重）→ `cfg.save()` → 立刻重建 hooks 让它停用。**目录一个字节都不动** ——
+   这个进程里它的 QuickJS 解释器可能还活着。
+2. 下次 `App::new` 里 `run_pending_uninstall(&gui)`：扫 `plugins_root`，
+   按 **`manifest.id`** 找目录（🔴 目录名不一定等于 id，用户可以把文件夹随便命名）
+   `remove_dir_all`；删不掉就**保留标记下次再试**（宁可多留一轮，也别静默丢标记）。
+
 ### 13.14 终端页（替代 Ctrl+K 命令面板）
 
 用户原话：「这个命令面板可以变成终端那种（win的powershell）单独页面。」
@@ -2081,15 +2169,20 @@ if a > 0 {
   `stick_to_bottom(true)` 保证它永远停在看得见的最底下。
 - **敲过的行要连提示符一起留在屏幕上**（用户 m13399 第②条）：真 PowerShell 里
   敲完一边，那行 `PS C:\Users\33079> 123` 是原样留在日志里的。所以回显不是只存
-  命令文本，而是 `format!("{cwd}>\t{line}")` —— 用 `\t` 把"当时在哪个目录"和
-  "敲了什么"分开存，渲染时再 `split_once('\t')` 拆成 `"PS "` + `cwd>` + `\t` 三段。
+  命令文本，而是 `format!("{PROMPT_DIR}\t{line}")` —— 用 `\t` 把"提示符"和
+  "敲了什么"分开存，渲染时再 `split_once('\t')` 拆成 `"PS "` + `PROMPT_DIR` + `\t` 三段。
   🔴 **两处间距必须完全一致才有左对齐**：回显行与正在输入的那一行都要用
-  `item_spacing.x = 0.0` + `"PS "`（**带尾随空格**）+ `目录>` + `add_space(6.0)` + 内容。
+  `item_spacing.x = 0.0` + `"PS "`（**带尾随空格**）+ 提示符 + `add_space(6.0)` + 内容。
   最初回显行写成 `item_spacing.x = 6.0` 且 `PS` 不带空格，就差一个空格宽，
   输入的字和上面所有回显行差 6px 对不齐 —— 像素级验证过（三行的首字符都在 x=340）。
-- **提示符里的目录必须是绝对路径**：`Config::default()` 的 `dir` 是 `"."`，
-  直接显示就成了光秃秃的 `PS .>`。现在显示前先 `Path::canonicalize()`，失败才回退原文，
-  再按 52 字符截成 `…{尾部 49}`。PowerShell 的提示符永远是绝对路径，这里跟着做。
+- **提示符最终定成 `PS ADL>`**（用户 m15179「这个我觉得可以变成 PS ADL>这样」）。
+  中间一度显示成 `PS <绝对路径>>`，两个问题：
+  1. 路径一长就折行，终端里每行都被占掉一截；
+  2. Windows 的 `Path::canonicalize()` 返回的是 **verbatim 路径** `\\?\E:\...`，
+     屏幕上显示成 `//?/E:/...`（用户 m15179 的截图就是这个）。
+  现在的做法是**不显示路径**：`const PROMPT_DIR: &str = "ADL>";`，目录去 `cd`
+  （不带参数 = 打印当前下载目录）或 `settings` 看。保留 `PS` 前缀是因为人认这个形状。
+  回显行也跟着存 `PROMPT_DIR`，历史记录里看得到当时的提示符。
 - **正在输入的那一行还要竖向对齐**（用户 m13562「输入的时候还在这上边呢」）：水平方向
   对齐之后，输入的文字仍然比左边 `PS 路径>` 高出 11 物理像素（144dpi，约 7.3 逻辑像素）。
   两个原因叠加：
@@ -2113,9 +2206,11 @@ if a > 0 {
   3. 复位必须在 `TextEdit` 那一帧跑完之后做（它自己最后写入 memory），所以用
      `let mut caret_to_end = false;` 在闭包里记标记，`ui.horizontal` 结束后统一调。
   `CCursor.index` 是**字符**下标不是字节下标，中文目录不会切在半个字上。
-- 🔴 **空输入的灰字提示只在输入框没有焦点时画**（用户 m13765 / m14064 / m14285
-  连着报了三轮「光标比灰字高/低」之后的最终做法，**放弃逐像素对齐**）：
-  灰字和光标是两套 galley，谁也压不到一条线上 ——
+- 🔴 **空输入的灰字提示已经整个删掉了**（用户 m15179「后面的这个输入help看命令可以删了，
+  因为上面有提示了」）。在此之前这个提示让用户连着报了四轮「光标比灰字高/低」
+  （m13765 / m14064 / m14285 / m14409），过程值得记下来：
+
+  灰字和光标是**两套 galley**，谁也压不到一条线上 ——
   - 光标：`cursor_rect(galley, cursor, row_height)`（`text_cursor_state.rs:497`），
     高度取 `TextEdit` 自己的 `row_height`，纵向位置取 galley 的行；
   - 灰字：高度由**汉字回退字体**的行高决定，比 12.5 号 monospace 高 4~5px。
@@ -2125,24 +2220,24 @@ if a > 0 {
   `TextFormat { line_height: Some(row_height) }` 钉行高再手工上抬 `HINT_LIFT = 0.7`
   （`text_layout_types.rs:486` 说"行高与字体高度不同时文字在给定行高内垂直居中"，
   钉完量到灰字 `y 254..273` vs `PS` `y 257..270`，抬 0.7 后带中心勉强对上，
-  但用户肉眼看「还是靠下」，而且每次调字号都要重测）。
+  但用户肉眼看「还是靠下」）。
+  中间还试过"只在失焦时画灰字"（避免两者同时出现），用户仍能看出差异。
 
-  **最终换思路：这两样东西本来不需要同时出现。** 真 PowerShell 的空行也不显示提示。
-  没焦点时画灰字告诉用户能敲什么，一有焦点就只剩光标，谁也不跟谁比 —— 想留提示可以看
-  启动那一行 banner（那里已经写全了 `help` / `Tab` / `↑↓`）。实现就是
-  `if self.term.input.is_empty() && !te.has_focus() { ui.painter().text(..) }`。
-
-  🔴 不过真正的根因是**空串的 galley 高度为 0**（不是灰字画得偏）：`LayoutJob` 没有
+  🔴 **真正的根因是空串的 galley 高度为 0**（不是灰字画得偏）：`LayoutJob` 没有
   section 时 `layout_section` 一次都不跑，`paragraph.empty_paragraph_height` 停在
   初始值 0（`text_layout.rs:81`），而光标位置是 `cursor_rect()` 用
   `cursor_pos.max.y.at_least(cursor_pos.min.y + row_height)` 算的
   （`text_cursor_state.rs:497`）——拿 0 高度的 galley 居中，左上角正好落在行中线上，
-  再往下画满一个 `row_height`，光标就低了半行。修法是给空串补一个零宽 section 并把
-  `line_height` 钉成 `row_height`，让空 galley 也有行高。
+  再往下画满一个 `row_height`，光标就低了半行。**这才是"只有空输入才偏"的原因**。
+  修法是给空串补一个零宽 section 并把 `line_height` 钉成 `row_height`，让空 galley
+  也有行高（`term_layouter` 里 `if text.is_empty() { job.append("", 0.0, ..) }`）。
 
   🔴 顺带记一条排查结论：**光标在 `PrintWindow(PW_RENDERFULLCONTENT)` 抓的帧里根本
   不出现**（每次强制重绘把闪烁相位重置回同一位，连拍 8 帧逐列统计完全一致），
-  所以"对比光标和灰字"这种验证方式本身不可靠。
+  所以"对比光标和灰字"这种验证方式本身不可靠。要看光标必须用
+  `E:\ADL\probe\cap2.cs` 的 `[Cap2]::Shot(outPath, pid, delayMs)` —— 同一进程内
+  `SetForegroundWindow` 之后立刻 `Graphics.CopyFromScreen`，另起进程会把焦点抢走、
+  egui 就不画光标了。
 - **实时语法着色走 `TextEdit::layouter`**：`PSReadLine` 也是这条路人肉上色的
   （它把 token 染好再写 console buffer），egui 侧对应的是
   `TextEdit::layouter(&mut dyn FnMut(&Ui, &dyn TextBuffer, f32) -> Arc<Galley>)`
@@ -2175,11 +2270,12 @@ if a > 0 {
   `Info`（提示）/ `Warn`（警告）/ `Err`（错误）。`Warn` 单独一条是抄 PowerShell 的多流设计：
   「插件命令被 safe 模式挡住」既不是正常输出也不是错误，用红色会像程序出事了。
   配色 `warn = #E8,C4,6F`，对应 PowerShell 的 `WarningForegroundColor = Yellow`。
-- **提示符抄 PowerShell 的形态**：`PS <目录>>`，`PS` 用青绿、路径用蓝。历史回显也
-  带 `PS` 前缀（不是第一版那个光秃秃的 `>`）。这个形态不是随手编的，来自
+- **提示符是 `PS ADL>`**（用户 m15179 定的），`PS ` 用青绿、`ADL>` 用蓝。历史回显也
+  带同样的提示符（不是第一版那个光秃秃的 `>`）。这个形状的出处是
   `InitialSessionState.cs:4885` 的 `DefaultPromptFunctionText`：
   `"PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) "`
-  —— 嵌套 prompt 会多一个 `>`，我们暂时没有嵌套层级，固定一个。
+  —— 我们保留了 `PS ...>` 的骨架，把"当前路径"换成了固定的 `ADL`（理由见上文
+  「提示符最终定成 `PS ADL>`」）。
 
 🔴 **两个 egui 输入坑（都实测踩过）**：
 
@@ -2272,8 +2368,9 @@ SendKeys 时文字进去了、回车丢了（截图上输入框里躺着 `help` 
   主动不参与淡入。
 - 消息中心只有"全部已读 / 清空"两个批量动作，没有单条已读、没有按级别过滤。
   条数上限 200 已经够用，真要翻旧账再补。
-- 插件页只有"启用/停用/打开目录/重新扫描"，**没有卸载**：删目录是不可逆操作，
-  等以后想清楚了再做（要做也得先确认"是删 `plugins/<id>/` 还是移到回收站"）。
+- 插件卸载已经做了（标记 + 下次启动删目录，见 §13.13），但**没有"移到回收站"这个选项**：
+  现在是直接 `remove_dir_all`。真要稳妥，得先定回收站方案（Windows 是 `SHFileOperation`
+  或 `IFileOperation`，跨平台没统一 API）。
 - 插件通知目前都是 `Level::Info`。`notify` 权限没带级别字段，若要区分
   "警告/错误"，得先在 manifest 或 `adl.notify()` 的 payload 里加 `level`。
 - **插件市场是空壳**：`PluginsTab::Market` / `Discover` 只有说明文字。要做真的，得先定

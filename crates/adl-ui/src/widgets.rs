@@ -128,6 +128,30 @@ pub fn small_button(ui: &mut Ui, rect: Rect, label: &str, primary: bool) -> bool
     resp.clicked()
 }
 
+/// 「⋯」更多操作按钮：三个点**手画**，不用字符。
+///
+/// 不能用 `small_button(ui, rect, "⋯", false)`：simhei 没有 U+22EF 这个字形，
+/// 渲染出来是个空方块（用户 m15179 的截图里那一列就是个空白方框）。
+/// 和标题栏的窗口按钮一样，几何形状一律自己画。
+pub fn more_button(ui: &mut Ui) -> Response {
+    let th = Theme::from_ui(ui);
+    let p = &th.palette;
+
+    let size = vec2(30.0, 24.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    if resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(th.radius.button), p.hover_bg);
+    }
+    let fg = if resp.hovered() { p.ink } else { p.muted };
+    let c = rect.center();
+    for i in -1..=1 {
+        ui.painter()
+            .circle_filled(egui::pos2(c.x + i as f32 * 4.6, c.y), 1.5, fg);
+    }
+    resp
+}
+
 /// 状态胶囊（"安全模式" / "信任模式"）。
 pub fn mode_pill(ui: &mut Ui, trusted: bool) {
     let th = Theme::from_ui(ui);

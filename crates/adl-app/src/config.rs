@@ -88,6 +88,16 @@ pub struct Config {
     pub sidebar_collapsed: bool,
     /// 每个插件的一小段主配置（只用 enabled 开关；详细设置在各插件自己的 json 里）
     pub plugins: BTreeMap<String, PluginCfg>,
+    /// 已"卸载"、但要等下次启动才真正删目录的插件 id。
+    ///
+    /// 用户 m15179：「插件卸载的话可以卸载，但是正常还在跑，要等我们整个软件
+    /// 重启后删除（怕用户还在使用）」—— 标记后立即从启用列表里消失、进程里的
+    /// `PluginHooks` 也重建掉，但磁盘上的目录留着；下次 `App::new` 启动时
+    /// 才 `remove_dir_all`，删完把标记清空。
+    pub pending_uninstall: Vec<String>,
+    /// 删除任务时是否连本地文件一起删。`None` = 还没问过（弹窗里问），
+    /// `Some(true)` = 以后不问、直接删文件，`Some(false)` = 以后不问、只删任务。
+    pub delete_files_choice: Option<bool>,
 }
 
 impl Default for Config {
@@ -107,6 +117,8 @@ impl Default for Config {
             limit_unit: "auto".to_string(),
             sidebar_collapsed: false,
             plugins: BTreeMap::new(),
+            pending_uninstall: Vec::new(),
+            delete_files_choice: None,
         }
     }
 }

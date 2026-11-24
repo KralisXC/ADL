@@ -328,6 +328,8 @@ impl App {
         // 启停要等所有卡片画完再落盘：卡片闭包里已经借了 self.gui 的锁，
         // 在闭包里写配置容易死锁（同一把 Mutex 重复 lock）。
         let mut toggle: Option<(String, bool)> = None;
+        // 卸载同理：先记下 id，卡片全部画完再动配置和磁盘。
+        let mut uninstall: Option<String> = None;
 
         // 分两组显示：内置插件是软件自带的功能（id 都以 com.adl. 开头），
         // 在插件页里只能看、不能关 —— 关掉 ua-fixer 之类的没有意义，
@@ -465,6 +467,26 @@ impl App {
                         });
                     }
 
+                    // 卸载：只对用户自己装的插件开放（内置的删了程序就残了）。
+                    // 点下去**不会立刻删目录** —— 用户 m15179 明确要求等重启，
+                    // 怕它此刻还在跑。这里只打标记，下次启动统一清。
+                    if can_toggle {
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .small_button("卸载…")
+                                .on_hover_text("立刻停用，下次启动 ADL 时删除插件目录")
+                                .clicked()
+                            {
+                                uninstall = Some(id.to_string());
+                            }
+                            adl_ui::widgets::hint(
+                                ui,
+                                "卸载后立即停用，插件目录会在下次启动时删除。",
+                            );
+                        });
+                    }
+
                 });
                 ui.add_space(8.0);
             }
@@ -489,6 +511,31 @@ impl App {
                     } else {
                         format!("已停用插件 {id}")
                     },
+                    false,
+                );
+            }
+        }
+
+        // 卸载：立刻停用 + 记进 `pending_uninstall`，磁盘等下次启动再动。
+        if let Some(id) = uninstall {
+            let mut cfg = self.gui.cfg.lock().unwrap();
+            // 停用 + 记标记：停用让它这一轮就不再跑，标记让下次启动删目录。
+            cfg.plugins
+                .insert(id.clone(), adl_app::config::PluginCfg { enabled: false });
+            if !cfg.pending_uninstall.iter().any(|x| x == &id) {
+                cfg.pending_uninstall.push(id.clone());
+            }
+            if let Err(e) = cfg.save() {
+                drop(cfg);
+                self.set_status(format!("保存卸载标记失败: {e}"), true);
+            } else {
+                let new_cfg = cfg.clone();
+                drop(cfg);
+                // 重建 hooks：这个插件从这一刻起就不在进程里了。
+                *self.gui.hooks.lock().unwrap() = build_hooks(&new_cfg);
+                self.plugin_snapshot_at = Instant::now() - Duration::from_secs(3600);
+                self.set_status(
+                    format!("已卸载插件 {id}（目录将在下次启动时删除）"),
                     false,
                 );
             }

@@ -287,25 +287,16 @@ impl App {
             LineKind::Err => ink_err,
         };
 
-        // 提示符里的目录：太长就从左边截，保留尾部（尾部的层次才是
-        // 人真正关心的部分，跟 PowerShell 折行时的效果接近）。
+        // 提示符固定成 `PS ADL>`，不再带目录（用户 m15179）。
         //
-        // 默认配置里 `dir = "."`，直接显示就是个光秃秃的 `.`，看着像坏了；
-        // PowerShell 的提示符永远是绝对路径，所以这里也换算成绝对路径再截。
-        let cwd = {
-            let raw = self.gui.cfg.lock().unwrap().dir.clone();
-            let abs = std::path::Path::new(&raw)
-                .canonicalize()
-                .map(|p| p.display().to_string().replace('\\', "/"))
-                .unwrap_or_else(|_| raw.clone());
-            let n = abs.chars().count();
-            if n > 52 {
-                let tail: String = abs.chars().skip(n - 49).collect();
-                format!("…{tail}")
-            } else {
-                abs
-            }
-        };
+        // 原来学 PowerShell 显示 `PS <绝对路径>>`，问题是路径一长就折行，
+        // 而且 `canonicalize` 在 Windows 上返回 `\\?\E:\...`，屏幕上变成
+        // `//?/E:/...`（用户 m15179 的截图里就是它）。目录去哪儿看？敲
+        // `cd` 不带参数会打印当前目录，`settings` 里也有 —— 它属于"要看
+        // 才看"的信息，不该每行都占着。
+        //
+        // 保留 `PS` 前缀是因为人在终端里就认这个；`ADL` 是本程序的名字。
+        const PROMPT_DIR: &str = "ADL>";
 
         // 大框占满可用高度。输入行**不**钉在底部，而是跟在历史输出的最后
         // 一行后面，和历史共用一个滚动区 —— 这才是真终端的样子（在 `PS>`
@@ -341,17 +332,15 @@ impl App {
                         for (kind, text) in &self.term.lines {
                             match kind {
                                 LineKind::Echo => {
-                                    // 回显要把整条提示符留住，不能只剩命令名 ——
+                                    // 回显把整条提示符留住：`PS ADL> 命令`。
                                     // 真 PowerShell 里敲过的行是原样留在屏幕上的，
-                                    // 只有 "PS 命令" 没有目录和 `>` 会看着像丢了东西。
-                                    // 用 `\t` 把"当时的目录"和"命令"分开存：
-                                    // 目录用路径色、命令用正文色，两者还对得上。
-                                    let (where_at, cmd) = text
-                                        .split_once('\t')
-                                        .unwrap_or(("", text.as_str()));
+                                    // 只留命令名会看着像丢了东西。用 `\t` 把提示符
+                                    // 和命令分开存：提示符用路径色、命令用正文色。
+                                    let (prompt_dir, cmd) =
+                                        text.split_once('\t').unwrap_or(("", text.as_str()));
                                     ui.horizontal_wrapped(|ui| {
                                         // 和下面正在输入的那一行用完全相同的
-                                        // 间距：`PS ` + `目录>` + 6px + 内容。
+                                        // 间距：`PS ` + `ADL>` + 6px + 内容。
                                         // 两处只要差一个空格，输入的字就不会
                                         // 和上面那些回显行左边对起来。
                                         ui.spacing_mut().item_spacing.x = 0.0;
@@ -361,14 +350,12 @@ impl App {
                                                 .size(12.5)
                                                 .color(ink_echo),
                                         );
-                                        if !where_at.is_empty() {
-                                            ui.label(
-                                                egui::RichText::new(where_at)
-                                                    .monospace()
-                                                    .size(12.5)
-                                                    .color(ink_path),
-                                            );
-                                        }
+                                        ui.label(
+                                            egui::RichText::new(prompt_dir)
+                                                .monospace()
+                                                .size(12.5)
+                                                .color(ink_path),
+                                        );
                                         ui.add_space(6.0);
                                         ui.label(
                                             egui::RichText::new(cmd)
@@ -413,7 +400,7 @@ impl App {
                                     .color(ink_echo),
                             );
                             ui.label(
-                                egui::RichText::new(format!("{cwd}>"))
+                                egui::RichText::new(format!("{PROMPT_DIR}"))
                                     .monospace()
                                     .size(12.5)
                                     .color(ink_path),
@@ -465,29 +452,15 @@ impl App {
                                 te.request_focus();
                                 self.term.focus = false;
                             }
-                            // 空输入时的灰字提示：**只在没有焦点时画**。
+                            // 空行不画占位提示（用户 m15179）。
                             //
-                            // 之前试过 `.hint_text(..)`、也试过自己 `painter.text`
-                            // 再钉 `TextFormat::line_height` + 手工上抬 0.7px，
-                            // 每次都要跟光标比基线 —— 因为灰字和光标是两套 galley：
-                            // 光标高度取 TextEdit 自己的 `row_height`，灰字高度取
-                            // 汉字回退字体的行高，谁也没法在不改源码的前提下压成
-                            // 一条线（用户 m13765 / m14064 / m14285 连着报了三轮）。
-                            //
-                            // 换个思路：**这两样东西本来就不需要同时出现**。
-                            // 真 PowerShell 里光标所在的空行也不显示任何提示。
-                            // 没焦点时（刚切到终端页、或者点走了）画灰字告诉用户
-                            // 能敲什么；一旦有焦点就只剩光标，谁也不跟谁比。
-                            // 想留提示可以看上面那两行 banner，那里已经写全了。
-                            if self.term.input.is_empty() && !te.has_focus() {
-                                ui.painter().text(
-                                    egui::pos2(te.rect.left() + 2.0, te.rect.center().y),
-                                    egui::Align2::LEFT_CENTER,
-                                    "输入 help 看命令",
-                                    egui::FontId::monospace(12.5),
-                                    ink_info,
-                                );
-                            }
+                            // 原来这里画一行灰字"输入 help 看命令"。删掉的理由：
+                            // 上面那行 banner 已经写了同样的内容，重复；而且灰字
+                            // 和光标是两套 galley（光标高度取 TextEdit 的
+                            // `row_height`，灰字高度取汉字回退字体的行高），
+                            // 只要它俩同时出现就永远差一两个像素 —— 用户
+                            // m13765 / m14064 / m14285 连着报了三轮。既然提示
+                            // 别处已有，就让空行干净地只剩提示符和光标。
                             // 只有输入框有焦点时才拦方向键/Esc，否则在别的页面按 ↑
                             // 也会翻终端历史（虽然看不见，但会莫名其妙改掉输入）。
                             // `lost_focus()` 也要算：回车那一帧焦点已经交还了。
@@ -561,7 +534,7 @@ impl App {
                 // 里敲过的行是整条 `PS C:\xxx> 命令` 原样留在屏幕上的。
                 // 用 `\t` 分隔目录与命令，渲染时各用各的颜色。
                 self.term
-                    .push(LineKind::Echo, format!("{cwd}>\t{line}"));
+                    .push(LineKind::Echo, format!("{PROMPT_DIR}\t{line}"));
                 self.term_exec(&line);
             }
             // 执行完把光标留在输入框，连敲才顺手

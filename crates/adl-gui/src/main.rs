@@ -4,6 +4,15 @@
 //! 本文件只负责“壳”（窗口与交互）；下载引擎在 `adl-core`，插件在 `adl-plugin`，
 //! 配置与历史在 `adl-app`。浏览器接管用的本地 HTTP API 仍由 `api_server` 提供。
 
+// 🔴 不加这一行，Windows 会给这个 exe 分配一个控制台窗口 —— 用户双击
+// 启动时看到的那些「闪一下的 PowerShell 黑框」就是它（严格说是 conhost
+// 承载的 console 窗口，宿主进程就是我们自己）。这是 exe 自己的 PE 头属性，
+// 跟打包工具无关：只要在 release 里加了，打包后也一样没有窗口。
+//
+// 用 `cfg_attr(not(debug_assertions))`：debug 下保留控制台，`eprintln!`
+// 打的插件加载日志、panic 回溯都能直接在终端里看到；release 下才藏起来。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod api_server;
 mod notice;
 mod plugins;
@@ -42,6 +51,13 @@ pub(crate) struct Task {
     /// 当前活跃连接数（引擎每帧通过 `Progress::connections` 报上来）。
     /// 顶栏的"并行线路"chip 就是把所有进行中任务的这个值加起来。
     pub(crate) connections: u32,
+    /// 每条活跃线路的区间与已写字节（任务详情页的热力矩阵就画这个）。
+    /// 由引擎 `Progress::runs` 每 64 KB 上报一次；空 `Vec` = 没有在跑的线路。
+    pub(crate) runs: Vec<adl_core::hooks::RunInfo>,
+    /// 下载目录。控制文件在任务跑完之前就存在（`<目标>.adl`），但目标
+    /// 文件名要探测完才知道，所以在下载过程中 `path` 是空的。详情页要
+    /// 画分片图就得靠这个目录 + URL 去反查控制文件（用户 m15179）。
+    pub(crate) dir: Option<String>,
     pub(crate) path: Option<String>,
     pub(crate) error: Option<String>,
     pub(crate) handle: Option<tokio::task::JoinHandle<()>>,
@@ -67,6 +83,8 @@ struct TaskView {
     total: u64,
     speed: u64,
     connections: u32,
+    runs: Vec<adl_core::hooks::RunInfo>,
+    dir: Option<String>,
     path: Option<String>,
     error: Option<String>,
 }
@@ -84,6 +102,8 @@ fn snapshot(gui: &Gui) -> Vec<TaskView> {
             total: t.total,
             speed: t.speed,
             connections: t.connections,
+            runs: t.runs.clone(),
+            dir: t.dir.clone(),
             path: t.path.clone(),
             error: t.error.clone(),
         })
@@ -110,6 +130,11 @@ enum Tab {
     /// 想翻上一条命令的输出就得重新跑一遍。终端页能留下滚动历史，
     /// 也更接近用户熟悉的 PowerShell。
     Terminal,
+    /// 单个任务的详情页（从任务行的「⋯ → 查看详情…」进）。
+    ///
+    /// 带任务 id：详情页只读 `snapshot()` 里同 id 的那条，任务被删掉时
+    /// 页面显示"任务已删除"而不是崩。
+    TaskDetail(u64),
     Settings,
     Plugin(String, String),
 }
@@ -137,6 +162,10 @@ struct App {
     f_out: String,
     /// 单次下载的 User-Agent 覆盖；空 = 用设置里的默认值
     f_ua: String,
+    /// 单次下载的保存目录覆盖；空 = 用设置里的默认下载目录。
+    /// 后端 `add_task` 早就认 `args["dir"]`，这里只是把入口补上
+    /// （用户 m15179："每个文件单独的下载目录调整（新建下载页面）"）。
+    f_dir: String,
     // 设置表单
     s_dir: String,
     s_conn: u64,
@@ -153,6 +182,8 @@ struct App {
     home_range: Range,
     // 关闭行为询问弹窗（None = 不显示）
     close_ask: Option<CloseAsk>,
+    // 删除任务确认弹窗（None = 不显示）
+    del_ask: Option<DeleteAsk>,
     // 提示
     status: Option<(String, bool, Instant)>,
     // 插件 UI 缓存
@@ -194,11 +225,31 @@ struct App {
     /// `SHBrowseForFolderW` 是模态阻塞调用，不能在有绘制的时候跑，
     /// 所以丢进独立线程、把结果从这个 channel 收回来。
     pick_rx: Option<std::sync::mpsc::Receiver<Option<std::path::PathBuf>>>,
+    /// 上面那个接收端当前服务的是谁：`true` = 新建下载弹窗的目录，
+    /// `false` = 设置页的默认下载目录。两处共用一个 `pick_rx`。
+    pick_to_add: bool,
 }
 
 /// 首次点关闭时问用户"退出还是最小化"。
 struct CloseAsk {
     /// 勾选"记住我的选择"
+    remember: bool,
+}
+
+/// 删除任务前的确认：问一句"本地文件要不要一起删"。
+///
+/// 用户 m15179：「删除文件，是否删除本地文件（还有记住选项）」——
+/// `remember` 勾上就把这次的选择写进 `cfg.delete_files_choice`，
+/// 之后删除不再弹这个框。
+struct DeleteAsk {
+    id: u64,
+    /// 显示用（文件名或 URL 尾段）
+    name: String,
+    /// 这个任务有没有落盘路径；没有的话"删文件"这个勾选框没意义
+    has_file: bool,
+    /// 当前是否勾着"同时删除本地文件"
+    delete_files: bool,
+    /// 是否记住这次选择
     remember: bool,
 }
 
@@ -210,7 +261,7 @@ struct CloseAsk {
 fn start_pick_folder() -> std::sync::mpsc::Receiver<Option<std::path::PathBuf>> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let picked = platform::pick_folder("选择默认下载目录");
+        let picked = platform::pick_folder("选择下载目录");
         // 接收端可能已经丢了（用户切换页面把状态清掉），忽略发送失败。
         let _ = tx.send(picked);
     });
@@ -331,6 +382,15 @@ impl App {
         adl_ui::Theme::light().install_and_apply(&cc.egui_ctx);
 
         let cfg = gui.cfg.lock().unwrap().clone();
+
+        // 上次标记"卸载"的插件：这一刻才真正删目录。
+        //
+        // 为什么不点按钮就删：卸载时插件可能正在跑（onProgress 每 64 KB 调
+        // 一次），当场 remove_dir_all 会把它脚下的文件抽走。用户 m15179 的
+        // 要求就是"等整个软件重启后再删"。这里是启动路径，插件还没加载，
+        // 删起来安全。
+        run_pending_uninstall(&gui);
+
         // ADL_TAB 仅用于开发/截图脚本直达某个页面，不写进文档：
         //   home | tasks | plugins | notices | terminal | settings | add | plugin:<pluginId>:<pageId>
         // `add` 现在打开弹窗而不是切页。
@@ -360,6 +420,7 @@ impl App {
             f_url: String::new(),
             f_out: String::new(),
             f_ua: String::new(),
+            f_dir: String::new(),
             s_dir: cfg.dir.clone(),
             s_conn: cfg.connections as u64,
             s_limit: cfg.limit,
@@ -375,6 +436,7 @@ impl App {
             sidebar_collapsed: cfg.sidebar_collapsed,
             home_range: Range::Month,
             close_ask: None,
+            del_ask: None,
             status: None,
             plugin_snapshot: json!({}),
             plugin_snapshot_at: Instant::now() - Duration::from_secs(3600),
@@ -396,6 +458,7 @@ impl App {
             notices: notice::Store::load(),
             toast: None,
             pick_rx: None,
+            pick_to_add: false,
         }
     }
 
@@ -455,11 +518,14 @@ impl App {
         }
         let out = self.f_out.trim();
         let ua = self.f_ua.trim();
+        let dir = self.f_dir.trim();
         let args = json!({
             "url": self.f_url.trim(),
             "out": if out.is_empty() { Value::Null } else { json!(out) },
             // 留空 = Value::Null，引擎会退回设置里的默认 UA
             "user_agent": if ua.is_empty() { Value::Null } else { json!(ua) },
+            // 留空 = 用设置里的默认下载目录（add_task 里 `.filter(!is_empty)`）
+            "dir": if dir.is_empty() { Value::Null } else { json!(dir) },
         });
         match add_task(&self.gui, &args) {
             Ok(v) => {
@@ -468,6 +534,7 @@ impl App {
                 self.f_url.clear();
                 self.f_out.clear();
                 self.f_ua.clear();
+                self.f_dir.clear();
                 self.add_open = false;
                 self.tab = Tab::Tasks;
             }
@@ -699,9 +766,17 @@ impl eframe::App for App {
                 if let Some(p) = picked {
                     // 存成带正斜杠的路径：TOML 里反斜杠是转义符，
                     // 用户手改配置文件时最容易在这里踩坑。
-                    self.s_dir = p.display().to_string().replace('\\', "/");
+                    let s = p.display().to_string().replace('\\', "/");
+                    // 同一个接收端服务两处入口：设置页的默认目录、
+                    // 新建下载弹窗里的单次目录。`pick_to_add` 记住是谁发起的。
+                    if self.pick_to_add {
+                        self.f_dir = s;
+                    } else {
+                        self.s_dir = s;
+                    }
                 }
                 self.pick_rx = None;
+                self.pick_to_add = false;
             } else {
                 // 对话框开着的时候界面也得继续呼吸（不然用户以为程序死了）
                 ctx.request_repaint_after(std::time::Duration::from_millis(120));
@@ -864,6 +939,7 @@ impl eframe::App for App {
                                 Tab::Plugins => self.page_plugins(ui),
                                 Tab::Settings => self.page_settings(ui),
                                 Tab::Plugin(_, _) => self.page_plugin(ui),
+                                Tab::TaskDetail(id) => self.page_task_detail(ui, id),
                                 // 上面已经 return 了，这里只是让 match 穷尽。
                                 Tab::Tasks | Tab::Notices | Tab::Terminal => {}
                             }
@@ -889,6 +965,8 @@ impl eframe::App for App {
             1
         } else if self.close_ask.is_some() {
             2
+        } else if self.del_ask.is_some() {
+            3
         } else {
             0
         };
@@ -905,6 +983,11 @@ impl eframe::App for App {
         // 关闭行为首次询问
         if self.close_ask.is_some() {
             self.show_close_modal(&ctx);
+        }
+
+        // 删除任务确认
+        if self.del_ask.is_some() {
+            self.show_delete_modal(&ctx);
         }
 
         ctx.request_repaint_after(Duration::from_millis(250));
@@ -1145,6 +1228,7 @@ impl App {
             Tab::Plugins => "插件".to_string(),
             Tab::Notices => "消息".to_string(),
             Tab::Terminal => "终端".to_string(),
+            Tab::TaskDetail(id) => format!("任务 #{id}"),
             Tab::Settings => "设置".to_string(),
             Tab::Plugin(plugin, page) => {
                 // 插件设置伪页面：`adl` + `settings:<pluginId>`
@@ -1409,6 +1493,254 @@ impl App {
         }
     }
 
+    /// 单个任务的详情页：热力矩阵 + 每条线路的下载量。
+    ///
+    /// 数据来源分两块：
+    /// - **已完成的分片**来自落盘的 `.adl` 控制文件里的位图（1 bit = 1 片，
+    ///   片长 `DEFAULT_PIECE_LENGTH` = 1 MiB）—— 这是唯一能拿到"整张图"的地方；
+    /// - **正在跑的分片**来自 `TaskView.runs`（引擎每 64 KB 上报一次，
+    ///   见 `adl_core::hooks::RunInfo`），它带真实区间与已写字节。
+    ///
+    /// 两条合起来才画得出"哪块已经好了、哪块正在动、哪块还没开始"。
+    fn page_task_detail(&mut self, ui: &mut egui::Ui, id: u64) {
+        ui.add_space(2.0);
+        let tasks = snapshot(&self.gui);
+        let Some(t) = tasks.iter().find(|t| t.id == id) else {
+            adl_ui::widgets::card(ui, |ui| {
+                adl_ui::widgets::section_title(ui, "任务已不存在");
+                ui.add_space(8.0);
+                adl_ui::widgets::hint(ui, "它可能已经被删掉了。");
+                ui.add_space(10.0);
+                if ui.button("← 回到任务列表").clicked() {
+                    self.tab = Tab::Tasks;
+                }
+            });
+            return;
+        };
+
+        let name = display_name(t);
+        let (status_txt, status_color) = status_style(&t.status);
+        let frac = if t.total > 0 {
+            (t.completed as f32 / t.total as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+
+        // ── 顶部：名字 + 状态 + 主要动作 ──
+        adl_ui::widgets::card(ui, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("←").on_hover_text("回到任务列表").clicked() {
+                    self.tab = Tab::Tasks;
+                }
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new(&name)
+                        .size(15.0)
+                        .strong()
+                        .color(pal().ink),
+                );
+                ui.add_space(8.0);
+                adl_ui::widgets::badge(ui, status_txt, status_color);
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("删除…").clicked() {
+                        self.del_ask = Some(DeleteAsk {
+                            id: t.id,
+                            name: name.clone(),
+                            has_file: t.path.as_ref().map(|p| !p.is_empty()).unwrap_or(false),
+                            delete_files: t.path.is_some(),
+                            remember: false,
+                        });
+                    }
+                    if t.status == "paused" {
+                        if ui.button("继续").clicked() {
+                            if let Ok(v) = add_task(&self.gui, &json!({ "url": t.url })) {
+                                let nid = v.get("id").and_then(|x| x.as_u64()).unwrap_or(0);
+                                self.set_status(format!("已继续 #{id}（新任务 #{nid}）"), false);
+                            }
+                        }
+                    } else if t.status == "downloading" {
+                        if ui.button("暂停").clicked() {
+                            let _ = pause_task(&self.gui, &json!({"id": id}));
+                        }
+                    }
+                    if ui.button("打开目录").clicked() {
+                        if let Some(p) = t.path.as_ref().filter(|p| !p.is_empty()) {
+                            let dir = std::path::Path::new(p)
+                                .parent()
+                                .map(|d| d.to_path_buf())
+                                .unwrap_or_else(|| std::path::PathBuf::from(p));
+                            let _ = platform::open_path(&dir);
+                        } else {
+                            self.set_status("这个任务还没有落盘路径", true);
+                        }
+                    }
+                });
+            });
+
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                let bar_w = (ui.available_width() - 90.0).max(80.0);
+                ui.add(
+                    egui::ProgressBar::new(frac)
+                        .desired_width(bar_w)
+                        .desired_height(8.0)
+                        .corner_radius(egui::CornerRadius::same(3))
+                        .fill(teal()),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(format!("{:.1}%", frac * 100.0))
+                        .small()
+                        .color(muted()),
+                );
+            });
+
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                let kv = |ui: &mut egui::Ui, k: &str, v: String| {
+                    ui.label(egui::RichText::new(k).small().color(muted()));
+                    ui.label(egui::RichText::new(v).small().color(pal().ink));
+                    ui.add_space(14.0);
+                };
+                kv(ui, "已下载", format_bytes(t.completed));
+                kv(ui, "总大小", format_bytes(t.total));
+                kv(
+                    ui,
+                    "速度",
+                    if t.speed > 0 { format_speed(t.speed) } else { "—".into() },
+                );
+                kv(ui, "活跃线路", format!("{} / {}", t.connections, t.runs.len()));
+            });
+
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("地址").small().color(muted()));
+                ui.label(egui::RichText::new(&t.url).small().color(pal().ink));
+            });
+            if let Some(p) = t.path.as_ref().filter(|p| !p.is_empty()) {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("保存到").small().color(muted()));
+                    ui.label(egui::RichText::new(p).small().color(pal().ink));
+                });
+            }
+            if let Some(e) = t.error.as_ref().filter(|e| !e.is_empty()) {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(e).small().color(pal().danger));
+            }
+        });
+
+        // ── 分片热力矩阵 ──
+        ui.add_space(10.0);
+        adl_ui::widgets::card(ui, |ui| {
+            ui.horizontal(|ui| {
+                adl_ui::widgets::section_title(ui, "分片");
+                ui.add_space(8.0);
+                adl_ui::widgets::hint(
+                    ui,
+                    "一格 = 1 MiB。绿=已完成，橙=正在下载，灰=还没开始。",
+                );
+            });
+            ui.add_space(10.0);
+
+            match piece_states(t) {
+                Some((pieces, done, active)) => {
+                    piece_matrix(ui, pieces, &done, &active);
+                    ui.add_space(8.0);
+                    let done_n = done.iter().filter(|b| **b).count();
+                    adl_ui::widgets::hint(
+                        ui,
+                        &format!(
+                            "共 {pieces} 片，已完成 {done_n} 片，正在下载 {} 片。",
+                            active.len()
+                        ),
+                    );
+                }
+                None => {
+                    adl_ui::widgets::hint(
+                        ui,
+                        "还没有控制文件（任务刚建立或已清理），暂时画不出分片图。",
+                    );
+                }
+            }
+        });
+
+        // ── 每条线路的下载量 ──
+        ui.add_space(10.0);
+        adl_ui::widgets::card(ui, |ui| {
+            ui.horizontal(|ui| {
+                adl_ui::widgets::section_title(ui, "活跃线路");
+                ui.add_space(8.0);
+                adl_ui::widgets::hint(
+                    ui,
+                    "引擎此刻正在跑的分片区间与各自写入的字节数。",
+                );
+            });
+            ui.add_space(10.0);
+
+            if t.runs.is_empty() {
+                adl_ui::widgets::hint(
+                    ui,
+                    if t.status == "downloading" {
+                        "这一帧没有在跑的线路（可能正在重试或等待调度）。"
+                    } else {
+                        "任务没在跑，没有活跃线路。"
+                    },
+                );
+                return;
+            }
+
+            let mut runs: Vec<&adl_core::hooks::RunInfo> = t.runs.iter().collect();
+            runs.sort_by_key(|r| r.start);
+            for (i, r) in runs.iter().enumerate() {
+                let span = r.end.saturating_sub(r.start) + 1;
+                let ratio = if span > 0 {
+                    (r.written as f32 / span as f32).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("#{}", i + 1))
+                            .small()
+                            .color(muted()),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{:>12} – {:>12}",
+                            format_bytes(r.start),
+                            format_bytes(r.end)
+                        ))
+                        .monospace()
+                        .small()
+                        .color(pal().ink),
+                    );
+                    ui.add_space(8.0);
+                    let w = (ui.available_width() - 150.0).max(60.0);
+                    ui.add(
+                        egui::ProgressBar::new(ratio)
+                            .desired_width(w)
+                            .desired_height(6.0)
+                            .corner_radius(egui::CornerRadius::same(3))
+                            .fill(pal().warn),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} / {}",
+                            format_bytes(r.written),
+                            format_bytes(span)
+                        ))
+                        .small()
+                        .color(muted()),
+                    );
+                });
+                ui.add_space(4.0);
+            }
+        });
+    }
+
     fn page_tasks(&mut self, ui: &mut egui::Ui) {
         ui.add_space(2.0);
         // 工具栏动作（插件）
@@ -1460,7 +1792,10 @@ impl App {
         ];
 
         let mut pause_id: Option<u64> = None;
+        let mut resume_id: Option<u64> = None;
         let mut remove_id: Option<u64> = None;
+        let mut open_dir_id: Option<u64> = None;
+        let mut detail_id: Option<u64> = None;
         let mut copy_url: Option<String> = None;
 
         // 行数可能上千（重装系统后补历史时就是），整表渲染会让每帧都画全部行。
@@ -1498,12 +1833,30 @@ impl App {
                             .color(egui::Color32::from_rgb(0xB0, 0x30, 0x30)),
                     );
                 } else {
-                    ui.add(
-                        egui::ProgressBar::new(frac)
-                            .desired_width(w[2] - 8.0)
-                            .fill(teal())
-                            .show_percentage(),
-                    );
+                    // 圆角矩形进度条，不是胶囊更不是圆点。
+                    //
+                    // 原来只给了 `desired_width`，高度就落到主题的
+                    // `interact_size.y = 30`；而 ProgressBar 的默认圆角是
+                    // **高度的一半**（`progress_bar.rs:137-138`），于是
+                    // 20% 时填充宽度被 `min_width = 2*圆角 = 30` 兜住，
+                    // 画出来是个 30×30 的实心圆（用户 m15179 截图）。
+                    // 现在把高度压到 8、圆角给 3、最小填充宽度自然变成 6，
+                    // 才是「细长圆角条」。
+                    ui.horizontal(|ui| {
+                        let bar_w = (w[2] - 52.0).max(40.0);
+                        ui.add(
+                            egui::ProgressBar::new(frac)
+                                .desired_width(bar_w)
+                                .desired_height(8.0)
+                                .corner_radius(egui::CornerRadius::same(3))
+                                .fill(teal()),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("{:.0}%", frac * 100.0))
+                                .small()
+                                .color(muted()),
+                        );
+                    });
                 }
             });
 
@@ -1523,21 +1876,72 @@ impl App {
             adl_ui::widgets::cell(ui, w[5], |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
-                    if t.status == "downloading" && ui.small_button("暂停").clicked() {
-                        pause_id = Some(t.id);
+                    // 只有下载中的任务能暂停，其余状态这里留空会显得缺一块，
+                    // 所以已完成/失败/暂停的给一个「继续」。
+                    if t.status == "downloading" {
+                        if ui.small_button("暂停").clicked() {
+                            pause_id = Some(t.id);
+                        }
+                    } else if t.status == "paused" {
+                        if ui
+                            .small_button("继续")
+                            .on_hover_text("从断点继续下载")
+                            .clicked()
+                        {
+                            resume_id = Some(t.id);
+                        }
                     }
-                    if ui.small_button("删除").clicked() {
-                        remove_id = Some(t.id);
-                    }
-                    // 复制下载地址。任务从浏览器接管进来时常常是带 token 的临时直链，
-                    // 想拿到别处（或者发给人）只能靠这个 —— 以前只能去网页里再抠一次。
-                    if ui
-                        .small_button("复制")
-                        .on_hover_text("复制这个任务的下载地址")
-                        .clicked()
-                    {
-                        copy_url = Some(t.url.clone());
-                    }
+                    // 其余操作收进「⋯」：三个两字按钮挤在 152px 里既挤又
+                    // 容易点错（用户 m15179：「这些按钮有点挤和奇怪」）。
+                    // 菜单里的项都带完整文字，读起来比挤成两个字清楚。
+                    let more = adl_ui::widgets::more_button(ui)
+                        .on_hover_text("更多操作");
+                    egui::Popup::menu(&more).show(|ui| {
+                        ui.set_min_width(180.0);
+                        let has_path = t
+                            .path
+                            .as_ref()
+                            .map(|p| !p.is_empty())
+                            .unwrap_or(false);
+                        if ui
+                            .add_enabled(
+                                has_path,
+                                egui::Button::new("打开文件所在位置").frame(false),
+                            )
+                            .clicked()
+                        {
+                            open_dir_id = Some(t.id);
+                            ui.close();
+                        }
+                        if ui
+                            .add(egui::Button::new("查看详情…").frame(false))
+                            .clicked()
+                        {
+                            detail_id = Some(t.id);
+                            ui.close();
+                        }
+                        if ui
+                            .add(egui::Button::new("复制下载地址").frame(false))
+                            .clicked()
+                        {
+                            copy_url = Some(t.url.clone());
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("删除任务…")
+                                        .color(egui::Color32::from_rgb(0xB0, 0x30, 0x30)),
+                                )
+                                .frame(false),
+                            )
+                            .clicked()
+                        {
+                            remove_id = Some(t.id);
+                            ui.close();
+                        }
+                    });
                 });
             });
         });
@@ -1545,12 +1949,131 @@ impl App {
         if let Some(id) = pause_id {
             let _ = pause_task(&self.gui, &json!({"id": id}));
         }
+        if let Some(id) = resume_id {
+            // 和终端里 `resume` 一条路：拿同 id 的 url 重新 add，
+            // 引擎会找到同名 `.adl` 控制文件从断点续传。
+            let url = tasks.iter().find(|t| t.id == id).map(|t| t.url.clone());
+            if let Some(url) = url {
+                match add_task(&self.gui, &json!({ "url": url })) {
+                    Ok(v) => {
+                        let nid = v.get("id").and_then(|x| x.as_u64()).unwrap_or(0);
+                        self.set_status(format!("已继续 #{id}（新任务 #{nid}）"), false);
+                    }
+                    Err(e) => self.set_status(e, true),
+                }
+            }
+        }
+        if let Some(id) = open_dir_id {
+            // 打开文件所在目录，不打开文件本身 —— 用户想干的是"看一眼""拷走"。
+            if let Some(t) = tasks.iter().find(|t| t.id == id) {
+                if let Some(p) = t.path.as_ref().filter(|p| !p.is_empty()) {
+                    let dir = std::path::Path::new(p)
+                        .parent()
+                        .map(|d| d.to_path_buf())
+                        .unwrap_or_else(|| std::path::PathBuf::from(p));
+                    if let Err(e) = platform::open_path(&dir) {
+                        self.set_status(format!("打开目录失败: {e}"), true);
+                    }
+                } else {
+                    self.set_status("这个任务还没有落盘路径", true);
+                }
+            }
+        }
+        if let Some(id) = detail_id {
+            self.tab = Tab::TaskDetail(id);
+        }
         if let Some(id) = remove_id {
-            let _ = remove_task(&self.gui, &json!({"id": id, "files": false}));
+            // 删除前先问一句"本地文件要不要一起删"。用户 m15179 要求的
+            // "记住选项"存在 cfg.delete_files_choice 里，问过一次就不再问。
+            let remembered = self.gui.cfg.lock().unwrap().delete_files_choice;
+            if let Some(del_files) = remembered {
+                self.do_remove_task(id, del_files);
+            } else if let Some(t) = tasks.iter().find(|t| t.id == id) {
+                self.del_ask = Some(DeleteAsk {
+                    id,
+                    name: display_name(t),
+                    has_file: t.path.as_ref().map(|p| !p.is_empty()).unwrap_or(false),
+                    delete_files: t.path.is_some(),
+                    remember: false,
+                });
+            }
         }
         if let Some(url) = copy_url {
             ui.ctx().copy_text(url);
             self.set_status("已复制下载地址", false);
+        }
+    }
+
+    /// 真正执行删除。`files` = 是否连本地文件与控制文件一起删。
+    fn do_remove_task(&mut self, id: u64, files: bool) {
+        match remove_task(&self.gui, &json!({"id": id, "files": files})) {
+            Ok(_) => self.set_status(
+                if files { format!("已删除任务 #{id} 和本地文件") } else { format!("已删除任务 #{id}") },
+                false,
+            ),
+            Err(e) => self.set_status(e, true),
+        }
+    }
+
+    /// 删除确认弹窗：问一句"本地文件要不要一起删"，可勾"记住"。
+    fn show_delete_modal(&mut self, ctx: &egui::Context) {
+        let mut go: Option<bool> = None;
+        let mut cancel = false;
+
+        let a = self.fade.alpha(FADE_SECS);
+        let resp = egui::Modal::new(egui::Id::unique("adl_delete_modal"))
+            .frame(fade_frame(ctx, a))
+            .backdrop_color(fade_color(egui::Color32::from_black_alpha(100), a))
+            .show(ctx, |ui| {
+            ui.set_opacity(a);
+            ui.set_width(420.0);
+            adl_ui::widgets::section_title(ui, "删除任务");
+            ui.add_space(10.0);
+            if let Some(ask) = self.del_ask.as_ref() {
+                adl_ui::widgets::hint(ui, &format!("将删除任务「{}」。", ask.name));
+            }
+            ui.add_space(10.0);
+
+            if let Some(ask) = self.del_ask.as_mut() {
+                if !ask.has_file {
+                    adl_ui::widgets::hint(ui, "这个任务还没有落盘文件，只会删掉任务记录。");
+                } else {
+                    ui.checkbox(&mut ask.delete_files, "同时删除本地文件和控制文件（不可恢复）");
+                }
+                ui.add_space(8.0);
+                ui.checkbox(&mut ask.remember, "记住我的选择（以后不再询问）");
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    let del_files = ask.delete_files && ask.has_file;
+                    if ui.button("删除").clicked() {
+                        go = Some(del_files);
+                    }
+                    if ui.button("取消").clicked() {
+                        cancel = true;
+                    }
+                });
+            }
+        });
+
+        if resp.should_close() {
+            cancel = true;
+        }
+        if cancel {
+            self.del_ask = None;
+            return;
+        }
+        if let Some(del_files) = go {
+            let (id, remember) = match self.del_ask.take() {
+                Some(a) => (a.id, a.remember),
+                None => return,
+            };
+            if remember {
+                // 记住 = 以后所有删除都按这次的选择，不再弹这个框。
+                let mut cfg = self.gui.cfg.lock().unwrap();
+                cfg.delete_files_choice = Some(del_files);
+                let _ = cfg.save();
+            }
+            self.do_remove_task(id, del_files);
         }
     }
 
@@ -1594,6 +2117,23 @@ impl App {
                     .hint_text("可选，留空自动从地址 / 响应头推断，例如 ubuntu.iso")
                     .desired_width(f32::INFINITY),
             );
+
+            ui.add_space(12.0);
+            ui.label("保存到目录");
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let pick_w = 92.0;
+                let edit_w = (ui.available_width() - pick_w - 8.0).max(80.0);
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.f_dir)
+                        .hint_text("可选，留空用设置里的默认下载目录")
+                        .desired_width(edit_w),
+                );
+                if ui.button("选择…").clicked() {
+                    self.pick_rx = Some(start_pick_folder());
+                    self.pick_to_add = true;
+                }
+            });
 
             ui.add_space(12.0);
             ui.label("User-Agent");
@@ -3170,6 +3710,116 @@ fn display_name_of_url(url: &str) -> String {
     }
 }
 
+/// 从任务的 `.adl` 控制文件读回"已完成哪些片"。
+///
+/// 返回 `(总片数, 每片是否完成, 正在跑的分片索引)`；返回 `None` 表示
+/// 拿不到控制文件（任务刚建立、已完成被清理、或路径还没落盘），
+/// 这时详情页只显示一句说明，不画假的图。
+///
+/// 关键：**下载过程中 `path` 是空的** —— 目标文件名要探测完才知道，
+/// 引擎是在拿到响应头之后才定下来的。但控制文件早就写在下载目录里了，
+/// 所以这里先用 `path` 试，失败再按 `dir` + URL 扫一遍 `.adl`
+/// （和引擎 `find_control_by_url` 同一个思路）。
+fn piece_states(t: &TaskView) -> Option<(usize, Vec<bool>, Vec<usize>)> {
+    let cf = control_of(t)?;
+    let piece_len = cf.piece_length.max(1);
+    let pieces = (cf.total.div_ceil(piece_len)).max(1) as usize;
+    let bits = hex::decode(&cf.bitfield).ok()?;
+    let mut done = vec![false; pieces];
+    for (p, slot) in done.iter_mut().enumerate() {
+        *slot = bits
+            .get(p / 8)
+            .map(|b| b & (1 << (p % 8)) != 0)
+            .unwrap_or(false);
+    }
+    // 正在跑的分片：把 `runs` 的字节区间映射到片号。
+    let mut active: Vec<usize> = Vec::new();
+    for r in &t.runs {
+        let first = (r.start / piece_len) as usize;
+        let last = (r.end / piece_len) as usize;
+        for p in first..=last.min(pieces.saturating_sub(1)) {
+            if !active.contains(&p) {
+                active.push(p);
+            }
+        }
+    }
+    Some((pieces, done, active))
+}
+
+/// 找到这个任务对应的控制文件：先按落盘路径，再按下载目录 + URL 扫。
+fn control_of(t: &TaskView) -> Option<adl_core::ControlFile> {
+    if let Some(p) = t.path.as_ref().filter(|p| !p.is_empty()) {
+        if let Ok(Some(cf)) = adl_core::ControlFile::load(std::path::Path::new(p)) {
+            return Some(cf);
+        }
+    }
+    let dir = t.dir.as_ref().filter(|d| !d.is_empty())?;
+    let rd = std::fs::read_dir(dir).ok()?;
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|s| s.to_str()) != Some(adl_core::control::CONTROL_EXT) {
+            continue;
+        }
+        // `.adl` 是 `<目标>.adl`，而 `ControlFile::load` 吃的是目标路径。
+        let data = p.with_extension("");
+        if let Ok(Some(cf)) = adl_core::ControlFile::load(&data) {
+            if cf.url == t.url {
+                return Some(cf);
+            }
+        }
+    }
+    None
+}
+
+/// 画分片热力矩阵：每格一片，绿=完成，橙=正在下载，灰=未开始。
+///
+/// 分片可能上万（几 GB 的文件），所以列数按可用宽度自适应，
+/// 行数 = 向上取整。格子最小 3px，再小就一片糊成一块。
+fn piece_matrix(ui: &mut egui::Ui, pieces: usize, done: &[bool], active: &[usize]) {
+    let pw = pal();
+    let gap = 2.0;
+    let avail = ui.available_width();
+    // 12px 一格起，最多铺满一行；行数随之变化。
+    let cell = 12.0;
+    let cols = (((avail + gap) / (cell + gap)).floor() as usize).max(1);
+    let rows = pieces.div_ceil(cols);
+    let w = cols as f32 * cell + (cols as f32 - 1.0) * gap;
+    let h = rows as f32 * cell + (rows as f32 - 1.0) * gap;
+    // 太高的矩阵截断到 260px，避免把页面撑得滚不完 —— 但这时只剩
+    // "前若干片"，所以下面那句统计仍然报全量。
+    let max_h = 260.0;
+    let (slot, _) = ui.allocate_exact_size(egui::vec2(w, h.min(max_h)), egui::Sense::hover());
+    let clip = slot.intersect(egui::Rect::from_min_size(
+        slot.min,
+        egui::vec2(w, max_h),
+    ));
+    let mut pnt = ui.painter().clone();
+    pnt.set_clip_rect(pnt.clip_rect().intersect(clip));
+
+    let active_set: std::collections::HashSet<usize> = active.iter().copied().collect();
+    for i in 0..pieces {
+        let c = i % cols;
+        let r = i / cols;
+        let x = slot.left() + c as f32 * (cell + gap);
+        let y = slot.top() + r as f32 * (cell + gap);
+        if y > clip.bottom() {
+            break;
+        }
+        let color = if active_set.contains(&i) {
+            pw.warn
+        } else if done.get(i).copied().unwrap_or(false) {
+            pw.accent
+        } else {
+            pw.hover_bg
+        };
+        pnt.rect_filled(
+            egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(cell, cell)),
+            egui::CornerRadius::same(2),
+            color,
+        );
+    }
+}
+
 /// 顶栏"后台任务"下拉里的一行：状态点 + 文件名 + 进度/大小。
 ///
 /// 刻意做得比任务列表松（不带操作按钮）—— 它只是"瞥一眼"的面板，
@@ -3272,6 +3922,65 @@ fn format_speed_unit(bps: u64, unit: &str) -> String {
 }
 
 // ───────────────────────── 与后端交互（复用原有逻辑） ─────────────────────────
+
+/// 把上次标记为"卸载"的插件目录真正删掉，然后清空标记。
+///
+/// 在 `App::new` 里调用：那时插件还没被加载进 `PluginHooks`，
+/// 删目录不会踩到正在执行它的 QuickJS 线程。
+///
+/// 删不掉的（被占用 / 权限）保留标记，下次启动再试 —— 宁可多留一轮，
+/// 也不要静默把标记丢掉、让插件变成"半卸载"状态。
+fn run_pending_uninstall(gui: &Arc<Gui>) {
+    let (ids, root) = {
+        let cfg = gui.cfg.lock().unwrap();
+        if cfg.pending_uninstall.is_empty() {
+            return;
+        }
+        (cfg.pending_uninstall.clone(), plugins_root(&cfg))
+    };
+    let Some(root) = root else {
+        return;
+    };
+
+    let mut still: Vec<String> = Vec::new();
+    for id in ids {
+        // 目录名不一定等于插件 id（manifest 里 id 和文件夹名可以不一样），
+        // 所以扫一遍目录、按各自的 plugin.toml 里的 id 匹配。
+        let dir = find_plugin_dir(&root, &id).unwrap_or_else(|| root.join(&id));
+        if !dir.exists() {
+            continue;
+        }
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            eprintln!("[plugin] 删除插件目录失败 {}: {e}", dir.display());
+            still.push(id);
+        }
+    }
+
+    let mut cfg = gui.cfg.lock().unwrap();
+    cfg.pending_uninstall = still;
+    let _ = cfg.save();
+}
+
+/// 在插件根目录里按 manifest 的 id 找对应文件夹。
+fn find_plugin_dir(root: &std::path::Path, id: &str) -> Option<PathBuf> {
+    let rd = std::fs::read_dir(root).ok()?;
+    for e in rd.flatten() {
+        let dir = e.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let mf = dir.join(adl_plugin::MANIFEST_FILE);
+        if !mf.is_file() {
+            continue;
+        }
+        if let Ok(m) = adl_plugin::Manifest::load(&mf) {
+            if m.id == id {
+                return Some(dir);
+            }
+        }
+    }
+    None
+}
 
 fn build_hooks(cfg: &Config) -> Arc<PluginHooks> {
     let mode = if cfg.mode_trusted() { Mode::Trusted } else { Mode::Safe };
@@ -3476,6 +4185,8 @@ pub(crate) fn add_task(gui: &Arc<Gui>, args: &Value) -> Result<Value, String> {
             total: 0,
             speed: 0,
             connections: 0,
+            runs: Vec::new(),
+            dir: Some(opts.dir.to_string_lossy().to_string()),
             path: None,
             error: None,
             handle: None,
@@ -3498,6 +4209,7 @@ pub(crate) fn add_task(gui: &Arc<Gui>, args: &Value) -> Result<Value, String> {
                         t.total = p.total;
                         t.speed = p.speed_bps;
                         t.connections = p.connections;
+                        t.runs = p.runs.clone();
                     }
                 }
             }
@@ -3539,6 +4251,10 @@ pub(crate) fn add_task(gui: &Arc<Gui>, args: &Value) -> Result<Value, String> {
 
         let mut tasks = gui2.tasks.lock().unwrap();
         if let Some(t) = tasks.iter_mut().find(|t| t.id == id) {
+            // 收尾时一定要把"正在跑的线路"清掉：引擎在最后一批 worker
+            // 退出之后就不再 emit_progress 了，这里不清的话详情页会
+            // 一直挂着几十条残留区间（已写入 0 B 也照样列出来）。
+            t.runs.clear();
             match &res {
                 Ok(r) => {
                     t.status = "completed".into();
@@ -3577,6 +4293,10 @@ fn pause_task(gui: &Arc<Gui>, args: &Value) -> Result<Value, String> {
         if t.status == "downloading" {
             t.status = "paused".into();
         }
+        // 停下来的任务没有"正在跑的线路"了，残留的区间留着会让人
+        // 以为它还在下（详情页照样会列出来）。
+        t.runs.clear();
+        t.speed = 0;
         Ok(json!({"ok": true}))
     } else {
         Err("任务不存在".into())
@@ -3591,6 +4311,8 @@ fn pause_all(gui: &Arc<Gui>) {
                 h.abort();
             }
             t.status = "paused".into();
+            t.runs.clear();
+            t.speed = 0;
         }
     }
 }
