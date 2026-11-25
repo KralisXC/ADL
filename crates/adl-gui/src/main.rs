@@ -15,11 +15,16 @@
 
 mod api_server;
 mod install;
+mod market;
 mod notice;
 mod plugins;
+mod queue_fn;
 mod terminal;
+mod update;
 
 use plugins::{plugins_root, PluginsTab};
+use queue_fn::{add_batch, add_task, pause_all, pause_task, remove_task, restore_tasks, resume_all,
+               resume_task, save_tasks};
 use terminal::TerminalState;
 mod platform;
 
@@ -35,8 +40,6 @@ use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 use adl_app::config::Config;
-use adl_core::hooks::Hooks;
-use adl_core::{download, DownloadOptions, Progress};
 use adl_plugin::{Mode, PluginHooks};
 use adl_ui::ChipIcon;
 
@@ -45,6 +48,7 @@ use adl_ui::ChipIcon;
 pub(crate) struct Task {
     pub(crate) id: u64,
     pub(crate) url: String,
+    /// "downloading" | "queued" | "paused" | "completed" | "failed"
     pub(crate) status: String,
     pub(crate) completed: u64,
     pub(crate) total: u64,
@@ -61,6 +65,15 @@ pub(crate) struct Task {
     pub(crate) dir: Option<String>,
     pub(crate) path: Option<String>,
     pub(crate) error: Option<String>,
+    /// 单任务下载参数。以前只活在 `add_task` 的局部变量里，重启/排队后
+    /// 就再也没人知道"这条当初是用哪个 UA 要的"（用户 m18583 要求持久化）。
+    pub(crate) out_name: Option<String>,
+    pub(crate) user_agent: Option<String>,
+    pub(crate) referer: Option<String>,
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) cookies: Option<String>,
+    /// 入队时刻（unix 秒），排序用。
+    pub(crate) added_unix: u64,
     pub(crate) handle: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -88,6 +101,7 @@ struct TaskView {
     dir: Option<String>,
     path: Option<String>,
     error: Option<String>,
+    added_unix: u64,
 }
 
 fn snapshot(gui: &Gui) -> Vec<TaskView> {
@@ -107,6 +121,7 @@ fn snapshot(gui: &Gui) -> Vec<TaskView> {
             dir: t.dir.clone(),
             path: t.path.clone(),
             error: t.error.clone(),
+            added_unix: t.added_unix,
         })
         .collect()
 }
@@ -235,6 +250,43 @@ struct App {
     /// 所以整条链路丢进一个线程，只把最终结果（成功说装了什么、失败说
     /// 为什么）从这个 channel 送回来。
     zip_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    /// 任务列表的搜索词（匹配文件名与 URL）。
+    task_search: String,
+    /// 任务列表状态筛选：all / downloading / queued / paused / completed / failed。
+    /// 初值来自 `cfg.task_filter`，改动即落盘。
+    task_filter: String,
+    /// 任务列表排序：status（默认，进行中在上）/ added / name / size / progress。
+    task_sort: String,
+    /// 插件市场的索引结果（后台拉，UI 这里只负责取）。
+    ///
+    /// `None` = 还没点过「刷新」。`Some(Err(_))` 也要留住，否则"拉失败了"
+    /// 每一帧都会重拉一次，变成死循环打 GitHub。
+    market_rx: Option<std::sync::mpsc::Receiver<Result<(Vec<market::Entry>, Vec<String>), String>>>,
+    /// 已经拿到的市场清单（空 Vec = 拉到了但一条能用的都没有）。
+    market_entries: Vec<market::Entry>,
+    /// 上次拉取失败/跳过条目的说明，直接显示在界面上。
+    market_note: Option<(String, bool)>,
+    /// 正在装的市场条目 id（同一时间只装一个，装的时候按钮禁用）。
+    market_installing: Option<String>,
+    /// 市场安装的结果通道。
+    market_install_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    /// 市场索引地址（用户可以在设置里换镜像）。
+    market_url: String,
+
+    // ── 软件自动更新（走 GitHub Releases）──
+    // 只在用户点「检查更新」时发一次请求，不常驻轮询：下载器没必要隔一小时
+    // 打一次 GitHub。`update_rx` 拿到结果后必须置 None（同 market_rx）。
+    update_rx: Option<std::sync::mpsc::Receiver<Result<update::ReleaseInfo, String>>>,
+    /// 已经查到的最新版本信息（`None` = 还没查过）。
+    update_info: Option<update::ReleaseInfo>,
+    /// 检查更新的结果说明（错误或"已是最新"）。
+    update_note: Option<(String, bool)>,
+    /// 正在下载的安装包通道。
+    update_dl_rx: Option<std::sync::mpsc::Receiver<Result<std::path::PathBuf, String>>>,
+    /// 下载进度用的提示文字（`None` = 没在下载）。
+    update_downloading: bool,
+    /// 已下好的新 exe，等用户点「重启并安装」。
+    update_staged: Option<std::path::PathBuf>,
 }
 
 /// 首次点关闭时问用户"退出还是最小化"。
@@ -441,6 +493,15 @@ impl App {
             }
             _ => Tab::Tasks,
         };
+
+        // 启动时查一次更新（设置里可关）。这里先起，免得在 `Self { .. }`
+        // 里再借 `gui` —— 那时 `gui` 已经被移进结构体了。
+        let boot_update = if cfg.check_update {
+            Some(update::start_check(&gui, String::new()))
+        } else {
+            None
+        };
+
         Self {
             gui,
             tab: initial_tab,
@@ -488,6 +549,25 @@ impl App {
             pick_rx: None,
             pick_to_add: false,
             zip_rx: None,
+            task_search: String::new(),
+            task_filter: cfg.task_filter.clone(),
+            task_sort: cfg.task_sort.clone(),
+            market_rx: None,
+            market_entries: Vec::new(),
+            market_note: None,
+            market_installing: None,
+            market_install_rx: None,
+            market_url: if cfg.market_url.trim().is_empty() {
+                market::DEFAULT_INDEX_URL.to_string()
+            } else {
+                cfg.market_url.clone()
+            },
+            update_rx: boot_update,
+            update_info: None,
+            update_note: None,
+            update_dl_rx: None,
+            update_downloading: false,
+            update_staged: None,
         }
     }
 
@@ -545,6 +625,27 @@ impl App {
             self.set_status("请填写下载地址", true);
             return;
         }
+        // 多行粘贴 = 批量添加。文件名/UA/目录只对单条有意义，批量时忽略。
+        if self.f_url.contains('\n') {
+            let (ok, errs) = add_batch(&self.gui, &self.f_url);
+            if ok == 0 && !errs.is_empty() {
+                self.set_status(format!("一条都没加进去：{}", errs[0]), true);
+                return;
+            }
+            let msg = if errs.is_empty() {
+                format!("已添加 {ok} 条任务")
+            } else {
+                format!("已添加 {ok} 条，跳过 {} 条（{}）", errs.len(), errs[0])
+            };
+            self.set_status(msg, false);
+            self.f_url.clear();
+            self.f_out.clear();
+            self.f_ua.clear();
+            self.f_dir.clear();
+            self.add_open = false;
+            self.tab = Tab::Tasks;
+            return;
+        }
         let out = self.f_out.trim();
         let ua = self.f_ua.trim();
         let dir = self.f_dir.trim();
@@ -559,7 +660,12 @@ impl App {
         match add_task(&self.gui, &args) {
             Ok(v) => {
                 let id = v.get("id").and_then(|x| x.as_u64()).unwrap_or(0);
-                self.set_status(format!("已添加任务 #{id}"), false);
+                let queued = v.get("queued").and_then(|x| x.as_bool()).unwrap_or(false);
+                if queued {
+                    self.set_status(format!("已加入队列 #{id}（同时在下的任务已满）"), false);
+                } else {
+                    self.set_status(format!("已添加任务 #{id}"), false);
+                }
                 self.f_url.clear();
                 self.f_out.clear();
                 self.f_ua.clear();
@@ -616,8 +722,13 @@ impl App {
     /// 顶栏"后台任务"下拉里的「清空已完成」用它 —— 磁盘上的文件是用户
     /// 自己下的东西，清理界面不该顺手删掉。
     fn clear_finished(&mut self) {
-        let mut tasks = self.gui.tasks.lock().unwrap();
-        tasks.retain(|t| t.status != "completed");
+        {
+            let mut tasks = self.gui.tasks.lock().unwrap();
+            tasks.retain(|t| t.status != "completed");
+        }
+        // 列表变了就等于用户改过任务表：落盘，否则重启后已完成的任务
+        // 又"复活"回列表里。
+        save_tasks(&self.gui);
     }
 
     fn run_action(&mut self, plugin: &str, action: &str) {
@@ -898,6 +1009,114 @@ impl eframe::App for App {
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     self.zip_rx = None;
+                }
+            }
+        }
+
+        // 插件市场的两个后台任务：拉索引、装某个条目。
+        //
+        // 这里的 `market_rx` 在拿到结果后置 None —— 拉失败也不会每帧重试，
+        // 否则连不上 GitHub 时会变成一秒几次的无效请求。
+        if let Some(rx) = &self.market_rx {
+            match rx.try_recv() {
+                Ok(Ok((entries, skipped))) => {
+                    self.market_rx = None;
+                    self.market_entries = entries;
+                    self.market_note = if skipped.is_empty() {
+                        None
+                    } else {
+                        Some((format!("跳过 {} 条：{}", skipped.len(), skipped.join("；")), true))
+                    };
+                }
+                Ok(Err(e)) => {
+                    self.market_rx = None;
+                    self.market_note = Some((e, true));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(120));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.market_rx = None;
+                    self.market_note = Some(("拉取插件索引的连接断了".to_string(), true));
+                }
+            }
+        }
+        if let Some(rx) = &self.market_install_rx {
+            match rx.try_recv() {
+                Ok(Ok(id)) => {
+                    self.market_install_rx = None;
+                    self.market_installing = None;
+                    let new_cfg = self.gui.cfg.lock().unwrap().clone();
+                    *self.gui.hooks.lock().unwrap() = build_hooks(&new_cfg);
+                    self.plugin_snapshot_at = Instant::now() - Duration::from_secs(3600);
+                    self.notify(
+                        notice::Level::Ok,
+                        format!("插件已安装：{id}"),
+                        "可以到「已安装」里打开它的开关。",
+                    );
+                }
+                Ok(Err(e)) => {
+                    self.market_install_rx = None;
+                    self.market_installing = None;
+                    self.set_status(format!("安装失败：{e}"), true);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(120));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.market_install_rx = None;
+                    self.market_installing = None;
+                }
+            }
+        }
+
+        // 自动更新：查版本 → 下载安装包。两段都拿到结果就清空通道，
+        // 否则连不上 GitHub 时会每帧重试。
+        if let Some(rx) = &self.update_rx {
+            match rx.try_recv() {
+                Ok(Ok(info)) => {
+                    self.update_rx = None;
+                    let newer = update::is_newer(update::CURRENT_VERSION, &info.version);
+                    self.update_note = if newer {
+                        Some((format!("发现新版本 {}", info.version), false))
+                    } else {
+                        Some((format!("已是最新（{}）", update::CURRENT_VERSION), false))
+                    };
+                    self.update_info = Some(info);
+                }
+                Ok(Err(e)) => {
+                    self.update_rx = None;
+                    self.update_note = Some((e, true));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(150));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.update_rx = None;
+                    self.update_note = Some(("检查更新的连接断了".to_string(), true));
+                }
+            }
+        }
+        if let Some(rx) = &self.update_dl_rx {
+            match rx.try_recv() {
+                Ok(Ok(path)) => {
+                    self.update_dl_rx = None;
+                    self.update_downloading = false;
+                    self.update_staged = Some(path);
+                    self.update_note = Some(("安装包已下好，点「重启并安装」".to_string(), false));
+                }
+                Ok(Err(e)) => {
+                    self.update_dl_rx = None;
+                    self.update_downloading = false;
+                    self.update_note = Some((e, true));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(150));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.update_dl_rx = None;
+                    self.update_downloading = false;
+                    self.update_note = Some(("下载安装包时连接断了".to_string(), true));
                 }
             }
         }
@@ -1699,14 +1918,11 @@ impl App {
                             remember: false,
                         });
                     }
-                    if t.status == "paused" {
+                    if matches!(t.status.as_str(), "paused" | "failed") {
                         if ui.button("继续").clicked() {
-                            if let Ok(v) = add_task(&self.gui, &json!({ "url": t.url })) {
-                                let nid = v.get("id").and_then(|x| x.as_u64()).unwrap_or(0);
-                                self.set_status(format!("已继续 #{id}（新任务 #{nid}）"), false);
-                            }
+                            let _ = resume_task(&self.gui, &json!({"id": id}));
                         }
-                    } else if t.status == "downloading" {
+                    } else if matches!(t.status.as_str(), "downloading" | "queued") {
                         if ui.button("暂停").clicked() {
                             let _ = pause_task(&self.gui, &json!({"id": id}));
                         }
@@ -1918,9 +2134,145 @@ impl App {
             });
         }
 
-        let tasks = snapshot(&self.gui);
+        let mut tasks = snapshot(&self.gui);
+
+        // ── 搜索 / 筛选 / 排序（用户 m18583）───────────────
+        //
+        // 先过滤再排序：`total` 与 `completed` 都是过滤后的子集，计数才对得上。
+        // 默认排序是 `status`，它把"正在下载"顶到最上面、已完成的沉到最下面 ——
+        // 用户明确要求过这一点（原来按 id 排，新下的反而在最下面）。
+        let mut filter_changed = false;
+        // Some(true) = 点了「全部继续」；Some(false) = 点了「全部暂停」。
+        let mut bulk_action: Option<bool> = None;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            let search_w = 220.0;
+            ui.add(
+                egui::TextEdit::singleline(&mut self.task_search)
+                    .hint_text("搜索文件名 / 地址")
+                    .desired_width(search_w),
+            );
+            egui::ComboBox::from_id_salt("adl_task_filter")
+                .width(96.0)
+                .selected_text(match self.task_filter.as_str() {
+                    "downloading" => "下载中",
+                    "queued" => "排队中",
+                    "paused" => "已暂停",
+                    "completed" => "已完成",
+                    "failed" => "失败",
+                    _ => "全部",
+                })
+                .show_ui(ui, |ui| {
+                    for (v, label) in [
+                        ("all", "全部"),
+                        ("downloading", "下载中"),
+                        ("queued", "排队中"),
+                        ("paused", "已暂停"),
+                        ("completed", "已完成"),
+                        ("failed", "失败"),
+                    ] {
+                        if ui.selectable_label(self.task_filter == v, label).clicked() {
+                            self.task_filter = v.to_string();
+                            filter_changed = true;
+                        }
+                    }
+                });
+            egui::ComboBox::from_id_salt("adl_task_sort")
+                .width(104.0)
+                .selected_text(match self.task_sort.as_str() {
+                    "added" => "按添加时间",
+                    "name" => "按文件名",
+                    "size" => "按大小",
+                    "progress" => "按进度",
+                    _ => "按状态",
+                })
+                .show_ui(ui, |ui| {
+                    for (v, label) in [
+                        ("status", "按状态"),
+                        ("added", "按添加时间"),
+                        ("name", "按文件名"),
+                        ("size", "按大小"),
+                        ("progress", "按进度"),
+                    ] {
+                        if ui.selectable_label(self.task_sort == v, label).clicked() {
+                            self.task_sort = v.to_string();
+                            filter_changed = true;
+                        }
+                    }
+                });
+            ui.label(
+                egui::RichText::new(format!("{} 条", tasks.len()))
+                    .small()
+                    .color(muted()),
+            );
+            // 批量控制放在右边：任务一多，逐行点暂停很烦。
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("全部继续").clicked() {
+                    bulk_action = Some(true);
+                }
+                if ui.small_button("全部暂停").clicked() {
+                    bulk_action = Some(false);
+                }
+            });
+        });
+        if filter_changed {
+            // 筛选/排序是用户偏好，下次打开还要在，所以落配置里。
+            let mut cfg = self.gui.cfg.lock().unwrap();
+            cfg.task_filter = self.task_filter.clone();
+            cfg.task_sort = self.task_sort.clone();
+            let _ = cfg.save();
+        }
+        match bulk_action {
+            Some(true) => {
+                resume_all(&self.gui);
+                self.set_status("已把暂停/失败的任务全部放回队列", false);
+            }
+            Some(false) => {
+                pause_all(&self.gui);
+                self.set_status("已暂停全部任务", false);
+            }
+            None => {}
+        }
+
+        let needle = self.task_search.trim().to_lowercase();
+        if !needle.is_empty() {
+            tasks.retain(|t| {
+                t.url.to_lowercase().contains(&needle)
+                    || display_name(t).to_lowercase().contains(&needle)
+            });
+        }
+        if self.task_filter != "all" {
+            tasks.retain(|t| t.status == self.task_filter);
+        }
+        // 状态排序：下载中 → 排队中 → 暂停/失败 → 完成，同档内按 id 正序
+        // （先加的在上面，符合"队列"的直觉）。
+        fn rank(s: &str) -> u8 {
+            match s {
+                "downloading" => 0,
+                "queued" => 1,
+                "paused" | "failed" => 2,
+                _ => 3,
+            }
+        }
+        match self.task_sort.as_str() {
+            "added" => tasks.sort_by_key(|t| (std::cmp::Reverse(t.added_unix), t.id)),
+            "name" => tasks.sort_by(|a, b| display_name(a).cmp(&display_name(b))),
+            "size" => tasks.sort_by_key(|t| (std::cmp::Reverse(t.total), t.id)),
+            "progress" => tasks.sort_by(|a, b| {
+                let fa = if b.total > 0 { a.completed as f64 / b.total as f64 } else { 0.0 };
+                let fb = if b.total > 0 { b.completed as f64 / b.total as f64 } else { 0.0 };
+                fb.partial_cmp(&fa).unwrap_or(std::cmp::Ordering::Equal)
+            }),
+            // 默认：状态档优先，再按 id（先加的在上）
+            _ => tasks.sort_by_key(|t| (rank(&t.status), t.id)),
+        }
+
         if tasks.is_empty() {
-            adl_ui::widgets::empty_state(ui, "还没有下载任务，点左上角「+ 新建下载」开始。");
+            if snapshot(&self.gui).is_empty() {
+                adl_ui::widgets::empty_state(ui, "还没有下载任务，点左上角「+ 新建下载」开始。");
+            } else {
+                adl_ui::widgets::empty_state(ui, "没有符合当前筛选条件的任务。");
+            }
             return;
         }
         ui.add_space(8.0);
@@ -2127,17 +2479,10 @@ impl App {
             let _ = pause_task(&self.gui, &json!({"id": id}));
         }
         if let Some(id) = resume_id {
-            // 和终端里 `resume` 一条路：拿同 id 的 url 重新 add，
-            // 引擎会找到同名 `.adl` 控制文件从断点续传。
-            let url = tasks.iter().find(|t| t.id == id).map(|t| t.url.clone());
-            if let Some(url) = url {
-                match add_task(&self.gui, &json!({ "url": url })) {
-                    Ok(v) => {
-                        let nid = v.get("id").and_then(|x| x.as_u64()).unwrap_or(0);
-                        self.set_status(format!("已继续 #{id}（新任务 #{nid}）"), false);
-                    }
-                    Err(e) => self.set_status(e, true),
-                }
+            // 继续 = 把这一条放回队列（原行复用），不再新开一条。
+            match resume_task(&self.gui, &json!({"id": id})) {
+                Ok(_) => self.set_status(format!("已把 #{id} 放回队列"), false),
+                Err(e) => self.set_status(e, true),
             }
         }
         if let Some(id) = open_dir_id {
@@ -2280,13 +2625,28 @@ impl App {
 
             ui.label("下载地址");
             ui.add_space(4.0);
+            // 多行 = 批量添加。用户 m18583：「批量添加的话可以添加一下多行黏贴」。
+            // 单行时行为和以前完全一样（回车即开始），多行时按行拆开逐条入队。
+            let multiline = self.f_url.contains('\n');
             let url_edit = ui.add(
-                egui::TextEdit::singleline(&mut self.f_url)
-                    .hint_text("https://…")
-                    .desired_width(f32::INFINITY),
+                egui::TextEdit::multiline(&mut self.f_url)
+                    .hint_text("https://…（粘贴多行可以一次添加多条）")
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(if multiline { 5 } else { 1 }),
             );
-            if url_edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            if !multiline
+                && url_edit.lost_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter))
+            {
                 start = true;
+            }
+            if multiline {
+                let n = self
+                    .f_url
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .count();
+                adl_ui::widgets::hint(ui, &format!("已识别 {n} 条地址，会一起入队。"));
             }
 
             ui.add_space(12.0);
@@ -2659,6 +3019,46 @@ impl App {
 
         ui.add_space(12.0);
 
+        // ── 同时下载的任务数（队列上限）──
+        // 这是"同时跑几条任务"，和上面的"并发上限"（一条任务开几条连接）是两回事：
+        // 前者决定带宽怎么分给不同文件，后者决定单个文件能不能吃满带宽。
+        let mut save_max_tasks = false;
+        adl_ui::widgets::card(ui, |ui| {
+            adl_ui::widgets::section_title(ui, "同时下载");
+            ui.add_space(4.0);
+            let opts: [(u64, &str); 7] = [
+                (1, "1"),
+                (2, "2"),
+                (3, "3"),
+                (5, "5"),
+                (8, "8"),
+                (12, "12"),
+                (16, "16"),
+            ];
+            if let Some(v) = adl_ui::widgets::segmented(
+                ui,
+                self.gui.cfg.lock().unwrap().max_concurrent_tasks as u64,
+                &opts,
+            ) {
+                let mut cfg = self.gui.cfg.lock().unwrap();
+                cfg.max_concurrent_tasks = v as usize;
+                let _ = cfg.save();
+                save_max_tasks = true;
+            }
+            ui.add_space(6.0);
+            adl_ui::widgets::hint(
+                ui,
+                "超过这个数量的任务会排在队里等着，前面的下完自动补位。\
+                 想先下某个文件，可以在任务列表里把它「继续」——它会被放回队首。",
+            );
+        });
+        if save_max_tasks {
+            // 调大上限之后，可能立刻就有空位了：推一把队列。
+            queue_fn::pump_queue(&self.gui);
+        }
+
+        ui.add_space(12.0);
+
         // ── 其它：目录、代理与 UA ──
         // 两个后缀按钮：
         //  - `pick_dir` 弹系统目录选择框（手打 Windows 路径很容易漏反斜杠）
@@ -2704,6 +3104,157 @@ impl App {
                 .hint("留空 = exe 同级 plugins"),
         ];
         adl_ui::form(ui, "插件", &mut plug_fields);
+
+        // ── 软件更新 ──
+        // 只认 release 里挂的 .exe：没有 CI 的时候发布可能只带源码包，
+        // 那种情况下退化成"打开下载页"，不做自动替换。
+        ui.add_space(10.0);
+        let mut check_now = false;
+        let mut download_now = false;
+        let mut apply_now = false;
+        let mut toggle_check = false;
+        adl_ui::widgets::card(ui, |ui| {
+            adl_ui::widgets::section_title(ui, "软件更新");
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                let mut on = self.gui.cfg.lock().unwrap().check_update;
+                if ui.checkbox(&mut on, "启动时检查更新").changed() {
+                    toggle_check = on;
+                }
+                ui.add_space(6.0);
+                let busy = self.update_rx.is_some();
+                if ui
+                    .add_enabled(!busy, egui::Button::new(if busy { "正在检查…" } else { "检查更新" }))
+                    .clicked()
+                {
+                    check_now = true;
+                }
+            });
+            ui.add_space(4.0);
+            adl_ui::widgets::hint(
+                ui,
+                &format!(
+                    "当前版本 {}。只检查，不自动装 —— 换二进制要你点一下。",
+                    update::CURRENT_VERSION
+                ),
+            );
+            if let Some((msg, err)) = &self.update_note {
+                ui.add_space(4.0);
+                let color = if *err { pal().danger } else { pal().muted };
+                ui.label(egui::RichText::new(msg).size(12.5).color(color));
+            }
+            // 发布名（release 的 `name`）：GitHub 上常写成「ADL 0.2.0」，
+            // 比 tag 好读，直接拿来当标题行。
+            if self
+                .update_info
+                .as_ref()
+                .map(|i| update::is_newer(update::CURRENT_VERSION, &i.version))
+                .unwrap_or(false)
+            {
+                if let Some(info) = &self.update_info {
+                    if !info.title.trim().is_empty() {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(&info.title)
+                                .size(13.0)
+                                .strong()
+                                .color(pal().ink),
+                        );
+                    }
+                }
+            }
+            // 查到新版本：给出下载按钮；没挂 exe 就退化成打开发布页。
+            let newer = self
+                .update_info
+                .as_ref()
+                .map(|i| update::is_newer(update::CURRENT_VERSION, &i.version))
+                .unwrap_or(false);
+            if newer {
+                if let Some(info) = &self.update_info {
+                    ui.add_space(6.0);
+                    if !info.notes.trim().is_empty() {
+                        // 更新说明只显示前 12 行：GitHub 上的正文可能很长，
+                        // 塞满设置页反而把按钮挤下去。
+                        let short: String = info
+                            .notes
+                            .lines()
+                            .take(12)
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        ui.label(egui::RichText::new(short).size(12.0).color(pal().muted));
+                        ui.add_space(4.0);
+                    }
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 10.0;
+                        if info.exe.is_some() {
+                            let label = if self.update_downloading {
+                                "正在下载…"
+                            } else if self.update_staged.is_some() {
+                                "已下载"
+                            } else {
+                                "下载更新"
+                            };
+                            if ui
+                                .add_enabled(
+                                    !self.update_downloading && self.update_staged.is_none(),
+                                    egui::Button::new(label),
+                                )
+                                .clicked()
+                            {
+                                download_now = true;
+                            }
+                            if self.update_staged.is_some()
+                                && ui.button("重启并安装").clicked()
+                            {
+                                apply_now = true;
+                            }
+                        } else {
+                            // 没挂 exe：只能让用户自己去发布页拿包。
+                            if ui.button("打开发布页").clicked() {
+                                platform::open_in_browser(&info.page);
+                            }
+                        }
+                    });
+                }
+            }
+        });
+        if toggle_check {
+            let mut cfg = self.gui.cfg.lock().unwrap();
+            cfg.check_update = toggle_check;
+            let _ = cfg.save();
+        }
+        if check_now {
+            self.update_note = None;
+            self.update_staged = None;
+            self.update_rx = Some(update::start_check(&self.gui, String::new()));
+        }
+        if download_now {
+            if let Some(info) = &self.update_info {
+                if let Some((_, url, size)) = &info.exe {
+                    self.update_downloading = true;
+                    self.update_dl_rx = Some(update::start_download(
+                        &self.gui,
+                        url.clone(),
+                        *size,
+                    ));
+                }
+            }
+        }
+        if apply_now {
+            if let Some(path) = self.update_staged.clone() {
+                match update::swap_and_spawn(&path) {
+                    Ok(_) => {
+                        // 替换成功、新进程已拉起。这里必须走正常退出路径：
+                        // 直接 `exit` 会跳过配置落盘，还可能和新进程抢单实例锁。
+                        self.closing = true;
+                        ui.ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    Err(e) => self.set_status(e, true),
+                }
+            }
+        }
 
         // ── 关闭行为 ──
         // 只有两个选项：问过一次之后就定下来了，"每次询问"不再是可选状态
@@ -3855,6 +4406,8 @@ fn status_style(status: &str) -> (&'static str, egui::Color32) {
         "completed" => ("完成", egui::Color32::from_rgb(0x2E, 0x7D, 0x6B)),
         "failed" => ("失败", egui::Color32::from_rgb(0xB0, 0x30, 0x30)),
         "paused" => ("已暂停", egui::Color32::from_rgb(0x8A, 0x6D, 0x1F)),
+        // 排队等名额的状态必须看得见：否则用户以为点了没反应。
+        "queued" => ("排队中", egui::Color32::from_rgb(0x5E, 0x6D, 0x6B)),
         _ => ("下载中", egui::Color32::from_rgb(0x1F, 0x5F, 0x8A)),
     }
 }
@@ -4302,224 +4855,6 @@ fn set_settings(gui: &Arc<Gui>, args: &Value) -> Result<Value, String> {
     Ok(snapshot)
 }
 
-pub(crate) fn add_task(gui: &Arc<Gui>, args: &Value) -> Result<Value, String> {
-    let url = args
-        .get("url")
-        .and_then(|x| x.as_str())
-        .filter(|s| !s.trim().is_empty())
-        .ok_or("缺少下载地址")?
-        .to_string();
-    let out = args.get("out").and_then(|x| x.as_str()).map(|s| s.to_string());
-
-    let cfg = gui.cfg.lock().unwrap().clone();
-
-    let mut opts = DownloadOptions::default();
-    opts.url = url.clone();
-    opts.dir = args
-        .get("dir")
-        .and_then(|x| x.as_str())
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| cfg.dir_path());
-    opts.out_name = out.clone();
-    opts.concurrency = adl_core::clamp_concurrency(cfg.connections);
-    opts.speed_limit = cfg.limit;
-    opts.http1_only = cfg.http1;
-    opts.proxy = cfg.proxy_opt();
-    if let Some(ua) = cfg.user_agent_opt() {
-        opts.user_agent = ua;
-    }
-    if let Some(r) = args.get("referer").and_then(|x| x.as_str()) {
-        if !r.is_empty() {
-            opts.referer = Some(r.to_string());
-        }
-    }
-    if let Some(ua) = args.get("user_agent").and_then(|x| x.as_str()) {
-        if !ua.is_empty() {
-            opts.user_agent = ua.to_string();
-        }
-    }
-    if let Some(obj) = args.get("headers").and_then(|x| x.as_object()) {
-        for (k, v) in obj {
-            if let Some(s) = v.as_str() {
-                opts.headers.push((k.clone(), s.to_string()));
-            }
-        }
-    }
-    if let Some(c) = args.get("cookies").and_then(|x| x.as_str()) {
-        if !c.is_empty() {
-            opts.headers.push(("Cookie".to_string(), c.to_string()));
-        }
-    }
-
-    let hooks: Arc<dyn Hooks> = gui.hooks.lock().unwrap().clone();
-
-    let id = gui.next_id.fetch_add(1, Ordering::SeqCst);
-    {
-        let mut tasks = gui.tasks.lock().unwrap();
-        tasks.push(Task {
-            id,
-            url: url.clone(),
-            status: "downloading".into(),
-            completed: 0,
-            total: 0,
-            speed: 0,
-            connections: 0,
-            runs: Vec::new(),
-            dir: Some(opts.dir.to_string_lossy().to_string()),
-            path: None,
-            error: None,
-            handle: None,
-        });
-    }
-
-    let gui2 = gui.clone();
-    let handle = gui.rt.spawn(async move {
-        let gui3 = gui2.clone();
-        let start = Instant::now();
-        let last_emit = Arc::new(AtomicU64::new(0));
-        let last_emit2 = last_emit.clone();
-        let progress: adl_core::ProgressFn = Arc::new(move |p: Progress| {
-            let ms = start.elapsed().as_millis() as u64;
-            if ms.saturating_sub(last_emit2.load(Ordering::Relaxed)) >= 150 {
-                last_emit2.store(ms, Ordering::Relaxed);
-                if let Ok(mut tasks) = gui3.tasks.lock() {
-                    if let Some(t) = tasks.iter_mut().find(|t| t.id == id) {
-                        t.completed = p.completed;
-                        t.total = p.total;
-                        t.speed = p.speed_bps;
-                        t.connections = p.connections;
-                        t.runs = p.runs.clone();
-                    }
-                }
-            }
-        });
-
-        let res = download(opts, hooks, Some(progress)).await;
-
-        // 完成 / 失败都记一条消息：状态条 6 秒就没了，用户切走页面就看不到
-        // "那个到底下完没有"。
-        match &res {
-            Ok(r) => {
-                let name = r
-                    .path
-                    .file_name()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| display_name_of_url(&url));
-                if let Ok(mut q) = gui2.pending_notices.lock() {
-                    q.push((
-                        notice::Level::Ok,
-                        format!("下载完成：{name}"),
-                        format!(
-                            "{} · 用时 {:.1} 秒",
-                            format_bytes(r.total),
-                            start.elapsed().as_secs_f64()
-                        ),
-                    ));
-                }
-            }
-            Err(e) => {
-                if let Ok(mut q) = gui2.pending_notices.lock() {
-                    q.push((
-                        notice::Level::Error,
-                        format!("下载失败：{}", display_name_of_url(&url)),
-                        e.to_string(),
-                    ));
-                }
-            }
-        }
-
-        let mut tasks = gui2.tasks.lock().unwrap();
-        if let Some(t) = tasks.iter_mut().find(|t| t.id == id) {
-            // 收尾时一定要把"正在跑的线路"清掉：引擎在最后一批 worker
-            // 退出之后就不再 emit_progress 了，这里不清的话详情页会
-            // 一直挂着几十条残留区间（已写入 0 B 也照样列出来）。
-            t.runs.clear();
-            match &res {
-                Ok(r) => {
-                    t.status = "completed".into();
-                    t.completed = r.total;
-                    t.total = r.total;
-                    t.path = Some(r.path.to_string_lossy().to_string());
-                    t.speed = r.speed_bps();
-                    t.connections = 0;
-                }
-                Err(e) => {
-                    t.status = "failed".into();
-                    t.error = Some(e.to_string());
-                    t.connections = 0;
-                }
-            }
-        }
-    });
-
-    {
-        let mut tasks = gui.tasks.lock().unwrap();
-        if let Some(t) = tasks.iter_mut().find(|t| t.id == id) {
-            t.handle = Some(handle);
-        }
-    }
-
-    Ok(json!({"ok": true, "id": id}))
-}
-
-fn pause_task(gui: &Arc<Gui>, args: &Value) -> Result<Value, String> {
-    let id = args.get("id").and_then(|x| x.as_u64()).ok_or("缺少 id")?;
-    let mut tasks = gui.tasks.lock().unwrap();
-    if let Some(t) = tasks.iter_mut().find(|t| t.id == id) {
-        if let Some(h) = t.handle.take() {
-            h.abort();
-        }
-        if t.status == "downloading" {
-            t.status = "paused".into();
-        }
-        // 停下来的任务没有"正在跑的线路"了，残留的区间留着会让人
-        // 以为它还在下（详情页照样会列出来）。
-        t.runs.clear();
-        t.speed = 0;
-        Ok(json!({"ok": true}))
-    } else {
-        Err("任务不存在".into())
-    }
-}
-
-fn pause_all(gui: &Arc<Gui>) {
-    let mut tasks = gui.tasks.lock().unwrap();
-    for t in tasks.iter_mut() {
-        if t.status == "downloading" {
-            if let Some(h) = t.handle.take() {
-                h.abort();
-            }
-            t.status = "paused".into();
-            t.runs.clear();
-            t.speed = 0;
-        }
-    }
-}
-
-fn remove_task(gui: &Arc<Gui>, args: &Value) -> Result<Value, String> {
-    let id = args.get("id").and_then(|x| x.as_u64()).ok_or("缺少 id")?;
-    let delete_files = args.get("files").and_then(|x| x.as_bool()).unwrap_or(false);
-    let mut tasks = gui.tasks.lock().unwrap();
-    if let Some(pos) = tasks.iter().position(|t| t.id == id) {
-        let t = tasks.remove(pos);
-        if let Some(h) = t.handle {
-            h.abort();
-        }
-        if delete_files {
-            if let Some(p) = &t.path {
-                let path = PathBuf::from(p);
-                let _ = std::fs::remove_file(&path);
-                let mut ctl = path.into_os_string();
-                ctl.push(".adl");
-                let _ = std::fs::remove_file(PathBuf::from(ctl));
-            }
-        }
-        Ok(json!({"ok": true}))
-    } else {
-        Err("任务不存在".into())
-    }
-}
 
 // ───────────────────────── 入口 ─────────────────────────
 
@@ -4563,6 +4898,10 @@ fn main() -> eframe::Result {
         return Ok(());
     }
 
+    // 上一次自动更新留下的 `<exe>.old`：那一刻它还是正在运行的旧程序，
+    // Windows 不让删；现在跑的是新 exe，可以清了。
+    update::cleanup_old();
+
     let cfg = Config::load();
     let gui = Arc::new(Gui {
         tasks: Mutex::new(Vec::new()),
@@ -4605,6 +4944,15 @@ fn main() -> eframe::Result {
     match api_server::start(gui.clone(), api_port) {
         Ok(p) => eprintln!("[api] 浏览器接管 API 监听 127.0.0.1:{p}"),
         Err(e) => eprintln!("[api] 启动失败: {e}"),
+    }
+
+    // 把上次退出时的任务表读回来。未完成的（含上次还在下的、排队的、
+    // 用户手动暂停的）一律转成 queued 交给队列按上限慢慢拉起 ——
+    // 开机一次拉起十几条会把刚连上的网络打满（用户 m18583）。
+    // 已完成/失败的照原样进列表，方便直接「打开文件所在位置」。
+    let restored = restore_tasks(&gui);
+    if restored > 0 {
+        eprintln!("[tasks] 从 tasks.json 恢复了 {restored} 条任务");
     }
 
     // 休眠 / 唤醒

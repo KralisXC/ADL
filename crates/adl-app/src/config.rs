@@ -159,6 +159,22 @@ pub struct Config {
     /// 删除任务时是否连本地文件一起删。`None` = 还没问过（弹窗里问），
     /// `Some(true)` = 以后不问、直接删文件，`Some(false)` = 以后不问、只删任务。
     pub delete_files_choice: Option<bool>,
+    /// 同时下载的任务数上限（1–16）。超出的进队列，等前面跑完再自动开始。
+    ///
+    /// 以前是"加上就立刻开跑"，一次粘 20 个链接就有 20 个任务同时抢带宽，
+    /// 每个都只能分到一小口，整体反而更慢（用户 m18583："队列"）。
+    pub max_concurrent_tasks: usize,
+    /// 任务列表默认排序：`status`（进行中在上，默认）/ `name` / `size` / `added`。
+    pub task_sort: String,
+    /// 任务列表默认筛选：`all` / `downloading` / `completed` / `failed`。
+    pub task_filter: String,
+    /// 是否自动检查更新（GitHub Releases）。
+    pub check_update: bool,
+    /// 插件市场索引地址（`index.json` 的完整 URL）。空 = 用内置官方源。
+    ///
+    /// 之所以做成可配置：官方源是 GitHub raw，国内直连经常抽风；用户
+    /// 换成镜像或自己 fork 的仓库时不用改代码。
+    pub market_url: String,
 }
 
 impl Default for Config {
@@ -187,6 +203,11 @@ impl Default for Config {
             plugins: BTreeMap::new(),
             pending_uninstall: Vec::new(),
             delete_files_choice: None,
+            max_concurrent_tasks: 3,
+            task_sort: "status".to_string(),
+            task_filter: "all".to_string(),
+            check_update: true,
+            market_url: String::new(),
         }
     }
 }
@@ -358,6 +379,23 @@ limit_unit = "auto"
 
 # 侧边栏是否收起（只留一条窄轨道）
 sidebar_collapsed = false
+
+# 同时下载的任务数上限（1–16）。多出来的任务排队，等前面跑完自动开始。
+max_concurrent_tasks = 3
+
+# 任务列表默认排序："status"（进行中在最上面）/ "name" / "size" / "added"
+task_sort = "status"
+
+# 任务列表默认筛选："all" / "downloading" / "completed" / "failed"
+task_filter = "all"
+
+# 启动时自动检查 GitHub 新版本
+check_update = true
+
+# 插件市场索引地址（index.json 的完整 URL）。留空 = 用内置官方源：
+#   https://raw.githubusercontent.com/KralisXC/adl-extensions/main/index.json
+# 官方源走 GitHub raw，连不上时可以换成镜像或自己 fork 的仓库。
+market_url = ""
 "#;
 
 #[cfg(test)]
@@ -377,6 +415,10 @@ mod tests {
         assert!(!c.close_to_tray());
         assert_eq!(c.limit_unit, "auto");
         assert!(!c.sidebar_collapsed);
+        assert_eq!(c.max_concurrent_tasks, 3);
+        assert_eq!(c.task_sort, "status");
+        assert!(c.check_update);
+        assert!(c.market_url.is_empty());
     }
 
     #[test]

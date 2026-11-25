@@ -9,6 +9,7 @@
 //! 停用一次就再也点不到「启用」）。
 
 use super::*;
+use crate::market;
 
 
 /// 插件页的两个分段（对应 DSH 的"已安装 / 插件市场"）。
@@ -561,44 +562,152 @@ impl App {
         }
             }
             PluginsTab::Market => {
-                // 插件市场目前是空壳：源地址还没定（用户计划接自己的 GitHub
-                // 仓库），所以这里只把"将来会有什么"说清楚，不做假列表 ——
-                // 假数据会让人以为已经能装了。
+                // 市场：从 `index.json` 拉清单，点「安装」就地下载 + 校验 sha256
+                // + 解包。装的链路复用 `install::install_zip`，所以"装完删包"、
+                // zip slip 防护、"目标目录已存在就拒"这些行为跟本地装包一致。
+                let mut fetch_now = false;
+                let mut install_id: Option<String> = None;
+
                 adl_ui::widgets::card(ui, |ui| {
                     adl_ui::widgets::section_title(ui, "插件市场");
-                    ui.add_space(6.0);
+                    ui.add_space(4.0);
                     ui.label(
-                        egui::RichText::new(
-                            "还没有配置插件市场源。\n\
-                             之后会接一个从 GitHub 拉取插件索引的官方源，在这里浏览并一键安装。",
-                        )
-                        .size(12.5)
-                        .color(muted()),
+                        egui::RichText::new(&self.market_url)
+                            .font(egui::FontId::monospace(12.0))
+                            .color(muted()),
                     );
-                    ui.add_space(10.0);
+                    ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        if ui.button("来源配置").clicked() {
-                            // 现在唯一能配的"来源"就是本地插件目录，直接带用户去，
-                            // 比留一个点了没反应的按钮好。
+                        let busy = self.market_rx.is_some();
+                        let label = if busy { "正在拉取…" } else { "刷新清单" };
+                        if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
+                            fetch_now = true;
+                        }
+                        if ui.button("换源…").clicked() {
                             open_market_cfg = true;
                         }
                     });
-                    ui.add_space(8.0);
+                    ui.add_space(6.0);
                     adl_ui::widgets::hint(
                         ui,
-                        "插件市场需要插件源索引（JSON）与签名校验，等官方源就绪后开放。",
+                        "清单来自扩展中心仓库的 index.json。每个包都会比对 sha256，\
+                         对不上就丢弃、绝不解包。",
                     );
+                    if let Some((msg, err)) = &self.market_note {
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(msg)
+                                .size(12.0)
+                                .color(if *err { pal().danger } else { muted() }),
+                        );
+                    }
                 });
+
+                if fetch_now {
+                    self.market_note = None;
+                    self.market_rx = Some(market::start_fetch(&self.gui, self.market_url.clone()));
+                }
+
+                ui.add_space(12.0);
+                if self.market_entries.is_empty() {
+                    let msg = if self.market_rx.is_some() {
+                        "正在从扩展中心拉取插件清单…"
+                    } else {
+                        "还没有清单。点「刷新清单」从扩展中心获取。"
+                    };
+                    adl_ui::widgets::empty_state(ui, msg);
+                } else {
+                    // 已经装了的 id：市场行上显示「已安装」、按钮不出现，
+                    // 否则用户会反复点、每次都被"目录已存在"拒一次。
+                    let installed: Vec<String> = {
+                        let cfg = self.gui.cfg.lock().unwrap();
+                        let mut v: Vec<String> = cfg.plugins.keys().cloned().collect();
+                        v.extend(cfg.pending_uninstall.iter().cloned());
+                        v
+                    };
+                    let entries = self.market_entries.clone();
+                    for e in &entries {
+                        let is_installed = installed.iter().any(|x| x == &e.id);
+                        let installing = self.market_installing.as_deref() == Some(e.id.as_str());
+                        adl_ui::widgets::card(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(if e.name.is_empty() {
+                                        e.id.as_str()
+                                    } else {
+                                        e.name.as_str()
+                                    })
+                                    .strong()
+                                    .color(pal().ink),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!("v{}", e.version))
+                                        .small()
+                                        .color(muted()),
+                                );
+                                if e.needs_trusted {
+                                    adl_ui::widgets::badge(ui, "需信任模式", pal().warn);
+                                }
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if is_installed {
+                                            adl_ui::widgets::badge(ui, "已安装", pal().accent);
+                                        } else if installing {
+                                            ui.label(
+                                                egui::RichText::new("安装中…").small().color(muted()),
+                                            );
+                                        } else if ui
+                                            .add_enabled(
+                                                self.market_installing.is_none(),
+                                                egui::Button::new("安装"),
+                                            )
+                                            .clicked()
+                                        {
+                                            install_id = Some(e.id.clone());
+                                        }
+                                    },
+                                );
+                            });
+                            if !e.description.is_empty() {
+                                ui.add_space(3.0);
+                                ui.label(
+                                    egui::RichText::new(&e.description)
+                                        .size(12.5)
+                                        .color(pal().ink),
+                                );
+                            }
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} · {:.1} MB · API {}+",
+                                    e.id, e.size_mb, e.min_api
+                                ))
+                                .small()
+                                .color(muted()),
+                            );
+                        });
+                    }
+
+                    if let Some(id) = install_id {
+                        let entry = entries.iter().find(|e| e.id == id).cloned();
+                        if let (Some(entry), Some(dir)) = (entry, root.clone()) {
+                            self.market_installing = Some(id);
+                            self.market_install_rx =
+                                Some(market::start_install(&self.gui, entry, dir));
+                        } else if root.is_none() {
+                            self.set_status("还没有插件目录，先用「打开插件目录」建一个", true);
+                        }
+                    }
+                }
             }
         }
 
         if open_market_cfg {
-            // 直接给本地插件目录：目前"来源"只有这一个。
-            if let Some(dir) = root.as_ref() {
-                if let Err(e) = platform::open_path(dir) {
-                    self.set_status(format!("打开目录失败: {e}"), true);
-                }
-            }
+            // 「换源…」：市场源地址得在设置页改（那里才有输入框），
+            // 直接把用户送过去，别在这儿留一个点了没反应的按钮。
+            self.tab = Tab::Settings;
+            self.set_status("在「设置」里可以改插件市场索引地址", false);
         }
     }
 

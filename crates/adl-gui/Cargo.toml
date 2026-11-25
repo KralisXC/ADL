@@ -52,6 +52,10 @@ muda = { version = "0.20", default-features = false }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+# 插件市场要把 index.json 与插件包拉回来。用的就是下载那一套客户端
+# （`adl_core::http::build_client`，UA / 代理 / HTTP1 全跟设置一致），
+# 所以这里必须能直接写 reqwest 的类型。
+reqwest = { workspace = true }
 # 详情页要解 `.adl` 控制文件里的十六进制位图
 hex = { workspace = true }
 # 插件以 zip 压缩包分发（GitHub Releases），装完就把包删掉。

@@ -109,6 +109,8 @@ cargo build --release -p adl-gui
 - **换页动效**：侧栏那根 3px 竖条会**跨行滑动**到新选中的按钮（0.18s），按钮底色**整块淡入**（0.16s），页面内容同时淡入（**只做透明度、不做位移** —— 每帧挪几像素会让整屏闪；深色终端与虚拟列表不参与淡入）。三者共用一个时钟，所以看起来是"一次切换"而不是三件事。
 - **剪贴板可用**：`eframe` 的 `clipboard` / `links` feature **显式开启**（写在 `default-features = false` 之后，否则整组默认 feature 全关、Ctrl+V 毫无反应也不报错）。下载地址可以一键拷走（任务行的 `⋯` 菜单里「复制下载地址」）。
 - **任务操作收进 `⋯` 菜单**：每行只有「暂停/继续」+ 一个手画的三点按钮（`⋯` 在 simhei 里没有字形、会渲染成空方块，所以是画出来的），点开是「打开文件所在位置 / 查看详情… / 复制下载地址 / ─── / 删除任务…」。
+- **任务列表工具栏**：搜索框（匹配文件名与地址）+ 状态筛选（全部/下载中/排队中/已暂停/已完成/失败）+ 排序（按状态/添加时间/文件名/大小/进度）+ 右侧「全部暂停 / 全部继续」。默认「按状态」—— **正在下载的在最顶上，已完成的沉底**。筛选与排序会写回配置。
+- **批量添加**：新建下载的地址框是多行的，粘贴一坨链接会一行一条一起入队（自动跳过空行和重复行），框下面实时显示识别到几条。
 - **任务详情页**：点「查看详情…」进入 `#id` 页面 —— 任务信息 + 8px 圆角进度条 + **分片热力矩阵**（一格 = 1 MiB，绿=已完成、橙=正在下载、灰=未开始）+ **活跃线路列表**（每条区间的起止偏移、已写/总长）。数据来自引擎新增的 `RunInfo`（真实在跑的区间，不是按并发数平分的假数据）。
 - **删除会问要不要连文件一起删**：弹窗里两个勾选框（删本地文件 / 记住我的选择），记住之后写进 `config.toml` 的 `delete_files_choice`，以后不再问。
 - **新建下载可以给单个文件指定目录**：弹窗第三段「保存到目录」，右侧「选择…」调系统文件夹对话框。
@@ -117,7 +119,7 @@ cargo build --release -p adl-gui
 - 支持插件声明式 UI 页面（**29 个组件**：text/heading/badge/status/grid/stat/kv/table/progress/toggle/select/button/alert/collapse/scroll/steps/spinner/copy…）、动作按钮、插件设置；插件组件树与本体的界面共用同一套视觉语言与主题令牌。
 - 单实例（再次启动会唤醒已有窗口）、托盘（点托盘「显示主界面」恢复）、系统休眠自动暂停。
 - 与 CLI 共用 `adl-core` 引擎、`adl-plugin` 插件、`adl-app` 配置/历史；浏览器接管 API 同进程运行。
-- **设置项只给档位**：并发 7 档（1/2/4/8/16/32/64，本质仍是自适应）；限速 = 数值 + 单位（自动 / B/s / KB/s / MB/s / GB/s，用英文单位）。HTTP/1.1 不再由用户选（引擎自动）。
+- **设置项只给档位**：并发 7 档（1/2/4/8/16/32/64，本质仍是自适应）；限速 = 数值 + 单位（自动 / B/s / KB/s / MB/s / GB/s，用英文单位）；**同时下载** 7 档（1/2/3/5/8/12/16 条任务，与"一条任务开几条连接"是两个维度）。HTTP/1.1 不再由用户选（引擎自动）。
 
 > **渲染后端可切换**（环境变量 `ADL_RENDERER`）：
 > - 不设 / `glow`：OpenGL，**默认**，兼容性最好（虚拟机、远程桌面、老核显都能开）。
@@ -126,9 +128,10 @@ cargo build --release -p adl-gui
 >
 > 为什么默认 glow：wgpu 后端在部分虚拟机 / 远程桌面环境会因 surface 丢失让进程静默退出；glow 稳定兜底。想要 Vulkan/DX12 时显式 `ADL_RENDERER=wgpu` 即可。
 
-## 图形界面（M5 · 旧方案：tao + wry + WebView2，已弃用）
+## 图形界面（M5 · 旧方案：tao + wry + WebView2，已删除）
 
-> 已被上面的「原生界面」取代，仅保留说明。旧的 `web/`（Vue）与 `static_server.rs` 不再编入。
+> 已被上面的「原生界面」取代。旧的 `web/`（Vue）与 `static_server.rs` 已从仓库删除，
+> 下面是历史记录，命令已不可用。
 
 `adl-gui.exe` 曾是基于 tao + wry（WebView2）的桌面窗口，前端是 Vue SFC + vite 构建。
 
@@ -199,7 +202,8 @@ adl.onBeforeRequest(function (ctx) {
 - 插件能拿到的东西：`adl.notify()`、`adl.settings.get()`、文件读写（`fs.read` / `fs.write` / `fs.writeBytes` / `fs.exists`，受 `fs_read`/`fs_write` 白名单约束）、`adl.pluginDir()`（自己的安装目录，用来调随包分发的可执行文件）、`adl.exec({ program, args, cwd, timeoutMs })`（**需要 `exec` 权限 + 信任模式**，子进程不弹黑框、带超时与 kill、stdout/stderr 并发读取不会卡管道）。
 - **从压缩包安装**：插件页右上角「从压缩包安装…」选一个 zip，ADL 解开到 `plugins/<id>/`、**装完立刻删除压缩包**；包内 `plugin.toml` 在根目录或第一层子目录都能认（GitHub 打的包会多套一层）。路径穿越（`../`、绝对路径、盘符）一律拒绝。
 - 详见 [plugins/README.md](plugins/README.md)。内置示例：`ua-fixer`、`auto-concurrency`、`notify-on-complete`、`block-html`、`ui-demo`。
-- 扩展插件在另一个仓库：[**KralisXC/adl-extensions**](https://github.com/KralisXC/adl-extensions)。每个扩展是一个目录 + 一个挂在 Releases 上的 zip，`index.json` 是给插件市场页用的清单（还没接上）。目前有一个：`com.kralisxc.media-converter`（ffmpeg 无损转封装 / 抽音轨）。
+- 扩展插件在另一个仓库：[**KralisXC/adl-extensions**](https://github.com/KralisXC/adl-extensions)。每个扩展是一个目录 + 一个挂在 Releases 上的 zip，`index.json` 是给插件市场页用的清单。目前有一个：`com.kralisxc.media-converter`（ffmpeg 无损转封装 / 抽音轨）。
+- **插件市场**：插件页「插件市场」页签直接读扩展中心的 `index.json` 并列出可装的扩展，点「安装」就下载 → 比对 `sha256`（对不上立刻丢弃、绝不解包）→ 解压到 `plugins/<id>/` → 删压缩包。索引地址可在设置里换（`market_url`，留空即默认源）。
 
 ## 插件 UI 扩展点
 
@@ -308,6 +312,14 @@ adl.notify({ title: "下载完成", body: "report.pdf · 12.4 MB" });
 - ✅ 内置插件 `本地媒体转换`（ffmpeg 无损转封装 / 抽音轨，只 `-c copy` 不重编码）
 - ✅ 插件以压缩包发布到扩展中心 [KralisXC/adl-extensions](https://github.com/KralisXC/adl-extensions)（`index.json` 索引 + GitHub Releases），ADL 侧装完即删包
 - ✅ Linux / BSD 构建前置已补齐：`eframe` 的 `x11`/`wayland`、`tray-icon` 的 `ksni` 后端（详见 [docs/DESIGN.md](docs/DESIGN.md) §13.17；macOS/Linux 真机验证仍未做）
+- ✅ **任务列表落盘与恢复**（`tasks.json`：每任务的 UA / referer / headers / cookies / 目录都存，重启后状态完整回来；进行中的转成排队，由队列按上限慢慢放）
+- ✅ **队列 + 同时下载上限**（默认 3，设置页 1/2/3/5/8/12/16；与「一条任务开几条连接」是两回事）
+- ✅ **任务列表搜索 / 筛选 / 排序**（默认「按状态」，正在下载的在最顶上、已完成的沉底）+ 全部暂停 / 全部继续
+- ✅ **批量添加**（新建下载地址框可多行粘贴，一行一条，跳过空行与重复行）
+- ✅ **插件市场接通** `index.json`（列表 / 一键安装 / sha256 校验 / 装完删包，可换源）
+- ✅ **检查更新接 GitHub Releases**（启动时自动查，发现新版可下载并「重启并安装」；只认 asset 里的 `.exe`，换文件用改名再写回、失败自动回滚）
+- ✅ 删掉遗留的 `web/`（Vue）
+- ⛔ **剪贴板监听不做**（自动嗅探剪贴板里复制的 URL 太吵；Ctrl+V 粘贴一直在）
 
 设计文档见 [docs/DESIGN.md](docs/DESIGN.md)。
 

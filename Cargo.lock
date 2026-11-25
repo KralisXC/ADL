@@ -54,6 +54,7 @@ dependencies = [
  "eframe",
  "hex",
  "muda",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

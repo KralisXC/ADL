@@ -2046,10 +2046,9 @@ if a > 0 {
   `*gui.hooks.lock() = build_hooks(&new_cfg)` → 快照立即失效。
   卡片闭包里已经借了 `self.gui` 的锁，**在闭包里写配置会死锁** —— 点击结果先收到
   `let mut toggle: Option<(String, bool)>`，全部卡片画完再落盘。
-- **插件市场是空壳，而且故意是空壳**：源地址还没定（用户计划接自己的 GitHub
-  仓库），所以这一页只把"将来会有什么"说清楚。**不做假列表** —— 假数据会让人以为已经
-  能装了。「来源配置」按钮落到"打开本地插件目录"，因为现在唯一的"来源"就是它；
-  留一个点了没反应的按钮比没有按钮更糟。
+- **插件市场曾长期是空壳**（源地址没定，用户计划接自己的 GitHub 仓库），当时故意
+  不放假列表 —— 假数据会让人以为已经能装了。**现在已接通** `index.json`，
+  实现见 §13.18.5；那一版历史保留在 §13.16/§13.17 的语境里。
 - **新控件 `switch(ui, on) -> Response`**（`crates/adl-ui/src/widgets.rs`）：38×21
   圆角 11 的轨道 + r=8 白圆点，`animate_bool_responsive` 驱动平移。配一个
   `mix_color(a, b, t)` 做逐通道插值（`Color32` 没有 `lerp`）。
@@ -2486,12 +2485,128 @@ egui::Area::new(egui::Id::unique("adl_statusbar"))
     这不是我们代码的问题，装个 `x86_64-linux-gnu-gcc` 也不解决（后面还要 Linux
     链接器和图形库）。**结论：语法级交叉检查到此为止，真验证必须上真机或 CI。**
 
-### 13.18 待续
+### 13.18 队列、任务持久化、搜索筛选排序、插件市场、自动更新
+
+用户 m18583：「先把明显缺口补充了，任务列表可以添加筛选和排序（对了记得默认的下载最顶上
+的是正在下载的，而不是已完成的。）批量添加的话可以添加一下多行黏贴。剪切板不要做！……
+插件市场仍是空壳，我们不是已经差不多弄好了嘛？软件自动更新的话就接入我们的 github
+自动更新吧。浏览器扩展的话可以先等等……不过遗留代码可以先删了。」
+
+#### 13.18.1 任务落盘与恢复（`crates/adl-app/src/tasks.rs`）
+
+- `SavedTask` 把**每任务的全部参数**写进去，不只是 url：`out_name` / `dir` /
+  `user_agent` / `referer` / `headers` / `cookies` / `status` / `completed` / `total` /
+  `path` / `error` / `added_unix`，全部 `#[serde(default)]`（老文件缺字段不报错）。
+  以前重启只能"拿同 URL 重新 add"，登录站点的 Cookie、自定义 UA 全丢。
+- 落盘时机**只挑用户看得见的状态变化**：加、开跑、暂停、继续、删除、完成、失败。
+  **不跟进度每秒写** —— 进度本来就在 `.adl` 控制文件里，写盘频率降下来磁盘才安静。
+- 启动恢复（`restore_tasks`）：`completed` / `failed` 原样保留，其余（downloading /
+  queued / paused / 未知）**一律转成 `queued`**。理由：如果原样恢复成 downloading，
+  开机就会一口气拉起十几条把带宽打满；转队列后由 `pump_queue` 按上限慢慢放。
+- 原子写：先写 `<path>.json.tmp` 再 `rename`，中途崩溃不会留下半个 JSON。
+
+#### 13.18.2 队列与"同时下载"上限（`crates/adl-gui/src/queue_fn.rs`）
+
+- 状态机扩成五态：`downloading | queued | paused | completed | failed`。
+  队列上限是 `cfg.max_concurrent_tasks`（默认 3，设置页 1/2/3/5/8/12/16 七档）。
+  它和「并发上限（`cfg.connections`：一条任务开几条连接）」是**两个东西**，
+  设置页的 hint 里专门写清了。
+- 🔴 **`add_task` 里新任务必须先记成 `queued`，再调 `pump_queue`**。最初的实现是
+  `status: if queued { "queued" } else { "downloading" }`，而 `pump_queue` 只捞
+  `status == "queued"` 的任务 —— 于是"没排队"的那几条**永远不会被任何人启动**。
+  症状极有迷惑性：`/status` 显示 `downloading`、速度 0、进度 0，目标目录根本没被创建，
+  服务端日志里一条引擎请求都没有。这个 bug 是靠"下完看文件在不在"才抓出来的，
+  光看界面会以为在正常下载。
+- `pump_queue` 循环里**先把状态改成 `downloading` 再 `launch_task`**，否则下一轮扫描
+  又会挑到同一条，死循环。
+- `launch_task` **从 `Task` 自己的字段读参数**（不是从 `args`）：排队任务被拉起时
+  那个 `serde_json::Value` 早就没了。
+- 「继续」不再是"按同 id 的 url 重新 add 一条新任务"，而是把本行改回 `queued`。
+  旧做法会让列表里多出一行、原行还挂着「已暂停」，看着像下了两遍。
+
+#### 13.18.3 搜索 / 筛选 / 排序（任务列表顶部工具栏）
+
+- 搜索框匹配**文件名与 URL**（都转小写），筛选六项（全部/下载中/排队中/已暂停/
+  已完成/失败），排序五项（按状态/按添加时间/按文件名/按大小/按进度）。
+  选中的筛选与排序写回 `cfg.task_filter` / `cfg.task_sort`，下次启动还是这套。
+- **默认排序「按状态」的序是 `downloading(0) → queued(1) → paused|failed(2) → 其它(3)`**
+  —— 用户明确要"最顶上是正在下载的，而不是已完成的"。别按 id 排，
+  id 序会让刚下完的沉底、老任务浮上来。
+- 右侧「全部暂停 / 全部继续」两个批量动作。`right_to_left` 布局里要**倒着 add**
+  才是视觉顺序（先 add「全部继续」，再 add「全部暂停」）。
+- 列表为空时分两种文案：真没任务 vs「没有符合当前筛选条件的任务」——
+  后者再点「清空筛选」也找不回来，用户会以为任务丢了。
+- `status_style` 补 `queued => ("排队中", #5E6D6B)`：排队态不可见的话，
+  用户点了下载看不出反应。
+
+#### 13.18.4 批量添加（多行粘贴）
+
+- 新建下载弹窗的地址框从单行改 **`TextEdit::multiline`**（默认 1 行高，
+  输入框里出现换行就长到 5 行），提示「粘贴多行可以一次添加多条」，
+  下方实时显示「已识别 N 条地址，会一起入队」。
+- `do_add` 里 `self.f_url.contains('\n')` 就走 `add_batch`：逐行、去空白、
+  跳过空行与 `#` 开头的注释行、**跳过重复行**（从网页复制下来的列表里重复很常见，
+  重复入队等于下两遍）。
+- 单行时仍然保持"回车即提交"，多行时回车只换行 —— 不然粘贴完最后一下回车就误提交了。
+
+#### 13.18.5 插件市场（`crates/adl-gui/src/market.rs`）
+
+- 清单直接读扩展中心的
+  `https://raw.githubusercontent.com/KralisXC/adl-extensions/main/index.json`
+  （可用 `cfg.market_url` 换源，留空即默认）。结构：
+  `{api_version, plugins:[{id,name,version,description,zip,sha256,size_mb,min_api,needs_trusted}]}`。
+- `parse_index` 做三道过滤：`api_version > 本程序 API_VERSION` 直接整体拒绝
+  （「索引要求的 API 版本 N 比本程序支持的 M 新」）；缺 `id`/`zip`/`sha256` 的条目和
+  `min_api` 超版的条目进 skipped 列表并在界面上说明跳过了几条。
+- 安装链路：下载到 `app_data_dir()/cache/<id>-<version>.zip` → `hash_file` 比对
+  **sha256（不符即删包并报「插件包校验失败」，绝不解包）** → `install::install_zip`
+  （装完它自己删 zip）。
+- 界面在「插件市场」页签：清单卡片（`id` · `size_mb` MB · `API n+`）、`needs_trusted`
+  的挂「需信任模式」badge、已装的挂「已安装」、安装中按钮变「安装中…」并禁用所有
+  其他安装按钮（一次只装一个）。
+- 🔴 拿到结果后必须把 `market_rx` / `market_install_rx` 置 `None`：不清的话每帧都
+  认为还在等，失败时会变成死循环反复打 GitHub。
+
+#### 13.18.6 软件自动更新（`crates/adl-gui/src/update.rs`）
+
+- 数据源是 GitHub 的 `releases/latest`（`https://github.com/KralisXC/ADL/releases/latest`），
+  **不自建版本文件**。三条硬约束：
+  1. **只认 asset 里的 `.exe`**。没挂 exe 的 release（例如只挂源码包）退化成
+     「打开发布页」，比下一个不知道该怎么装的 zip 强。
+  2. 只读元数据、**不做静默更新**：检查是自动的（`cfg.check_update`，默认开），
+     下载与替换必须用户点。
+  3. 换文件用"**先改名再写回**"：Windows 不允许删正在运行的 exe，但**允许改名**。
+     把当前 exe 改名为 `.old` → 拷新的到原路径 → 拉起新进程 → 走正常退出路径。
+     拷贝失败就把 `.old` 改回去并报「已回滚」——绝不能把用户搞成"双击没反应"。
+     `.old` 留到下次启动由 `cleanup_old()` 删（运行时它自己删不掉自己）。
+- `is_newer` 是**分段数字比较**，不是完整 semver。🔴 必须先砍掉 `-`/`+` 之后的部分
+  再分段：`0.2.0-beta.1` 里的 `beta.1` 会被当成第四段 `1`，把预发布判成比正式版还新。
+- 点「重启并安装」后：`swap_and_spawn` → `self.closing = true` +
+  `ViewportCommand::Close`。**不能直接 `exit`** —— 会跳过配置落盘，还会和刚拉起的新
+  进程抢单实例锁。
+- 下载校验：`expect_size > 0` 时字节数不符直接丢弃并报「安装包大小不符」。
+  GitHub 的 release asset 没有独立的哈希字段（`digest` 只在 API 里给），
+  所以这里只做长度校验；插件市场那边有 `sha256` 字段，那边才做真校验。
+
+#### 13.18.7 清理与实测
+
+- 删掉 `web/`（Vue 遗留 8 个文件）—— 用户「遗留代码可以先删了」。
+  `static_server.rs` 更早之前就删了，README 里那段历史说明保留。
+- 实测：`POST /add` 连加 4 条（上限 3）→ 3 条立刻开跑、第 4 条 `queued`，
+  跑完 `pump_queue` 自动接上，四条全部 `completed`，文件齐全；
+  强杀进程重启 → stderr `[tasks] 从 tasks.json 恢复了 4 条任务`，四条状态完整。
+- `cargo test --release -p adl-core -p adl-plugin -p adl-app` → 8 / 68 / 13 全绿；
+  `cargo test --release -p adl-gui --bin adl-gui` → 7 passed（install 2 + market 2 +
+  update 3）。
+
+### 13.19 待续
 - macOS / Linux 的**真机**构建验证仍未做（本机只有 Windows；M 芯片 Mac 无法在本机测）。
   交叉编译也不能替代：`eframe` 的 glow/wgpu 后端要链接平台图形库。
+  用户 m18452 已明确「只做 win 先」，这条暂时搁置。
 - **剪贴板与 `links` 靠 `eframe` feature 编入**（见 §13.4 的 🔴 警告）：现在是显式写在
   features 列表里的，以后谁再动这行，构建日志里没有 `Compiling arboard` 就说明又关掉了。
-- 旧的 `web/`（Vue）与 `static_server.rs` 已不再编入（保留仅作历史），后续可清理。
+- **剪贴板监听（自动嗅探复制的 URL）明确不做**（用户 m18583：「这个是吃力不讨好的，
+  随便复制一个网址就弹出来了很难弄的」）。Ctrl+V 粘贴是另一回事，那个一直在。
 - `render_node` 已改用 `adl_ui` 的 `badge`/`card`/`hairline`，但 `table`/`kv`/`grid`
   仍是自己算列宽（插件表格要支持任意列数与单元格节点，与 `adl_ui::table` 的
   `FnMut(ui, i, widths)` 签名不同构）；后续可抽公共的"均分列宽"函数。
@@ -2518,12 +2633,9 @@ egui::Area::new(egui::Id::unique("adl_statusbar"))
   或 `IFileOperation`，跨平台没统一 API）。
 - 插件通知目前都是 `Level::Info`。`notify` 权限没带级别字段，若要区分
   "警告/错误"，得先在 manifest 或 `adl.notify()` 的 payload 里加 `level`。
-- **插件市场是空壳**：`PluginsTab::Market` 只有说明文字。要做真的，得先定
-  索引 JSON 的格式（`id/name/version/download_url/sha256/min_api`）、**签名校验**
-  （否则等于开放任意代码执行）。用户明确说会接自己的 GitHub 源
-  （`https://github.com/KralisXC/adl-extensions`），插件以压缩包挂在 Releases 上；
-  **"下载 + 解压 + 删包"这条链路已经有了**（§13.16 的 `install.rs`），缺的只是
-  "从 URL 下载到临时目录"和"列表从哪来"这两步。
+- 插件市场已接上扩展中心的 `index.json`（见 §13.18.5），但**没有签名校验**：
+  现在只比对压缩包 `sha256`（防传输损坏/半包），防不了"索引本身被改"。
+  真要防，得对 `index.json` 做签名（或直接 pin 一份 index 的哈希进二进制）。
 - 终端页的命令是硬编码的 `match`，没有子命令级别的 `--help`、没有把插件命令
   动态列进 `help`（`plugin list` 只列 id，不带命令）。Tab 补全只到第二级，
   插件 id / 任务 id 这类动态参数没补。语法着色也是"按词查表"这种最粗糙的实现，
