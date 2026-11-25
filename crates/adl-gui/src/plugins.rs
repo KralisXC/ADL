@@ -238,9 +238,14 @@ impl App {
         let mut open_dir = false;
         let mut refresh = false;
         let mut open_market_cfg = false;
+        // 从 zip 装插件：文件选择对话框是模态的，必须丢子线程，否则整个
+        // 窗口冻住（和 `pick_folder` 一个道理）。
+        let mut pick_zip = false;
 
-        // ── 顶部：说明 + 右侧刷新（"添加插件"已去掉：添加就是往目录里放
-        // 文件夹，按钮只能把目录打开，插件目录卡片里已经有同一个按钮了）──
+        // ── 顶部：说明 + 右侧刷新 / 从压缩包安装 ──
+        //
+        // 「从压缩包安装」对的是插件分发形态：扩展中心把插件打成 zip 传
+        // 到 GitHub Releases，用户下回来点这里装。装完压缩包会被删掉。
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new("安装、启用和配置插件")
@@ -250,6 +255,9 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("刷新").clicked() {
                     refresh = true;
+                }
+                if ui.button("从压缩包安装…").clicked() {
+                    pick_zip = true;
                 }
             });
         });
@@ -312,6 +320,17 @@ impl App {
             *self.gui.hooks.lock().unwrap() = build_hooks(&new_cfg);
             self.plugin_snapshot_at = Instant::now() - Duration::from_secs(3600);
             self.set_status("已重新扫描插件目录", false);
+        }
+        if pick_zip {
+            match root.as_ref() {
+                Some(dir) => {
+                    // 整条链路（选文件 + 解包）丢子线程，结果从 `zip_rx` 回来，
+                    // 那边顺带重建 hooks。
+                    self.zip_rx = Some(start_install_zip(dir.clone()));
+                    self.set_status("正在安装插件…", false);
+                }
+                None => self.set_status("还没有插件目录，先用「打开插件目录」建一个", true),
+            }
         }
 
         ui.add_space(14.0);

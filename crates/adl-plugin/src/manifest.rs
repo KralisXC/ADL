@@ -24,6 +24,13 @@ pub enum HookPoint {
     Preempt,
     Degrade,
     Complete,
+    /// 用户在界面/终端里点插件声明的按钮时触发。
+    ///
+    /// 它不在下载管线里，是"用户主动发起"的入口；但照样要走 `[[hooks]]`
+    /// 声明，否则宿主的 `active_hooks` 里没有它，插件页会显示"没挂任何 hook"。
+    Action,
+    /// 用户在终端里敲插件命令时触发，同上。
+    Command,
 }
 
 impl HookPoint {
@@ -38,6 +45,8 @@ impl HookPoint {
             HookPoint::Preempt => "onPreempt",
             HookPoint::Degrade => "onDegrade",
             HookPoint::Complete => "onComplete",
+            HookPoint::Action => "onAction",
+            HookPoint::Command => "onCommand",
         }
     }
 
@@ -57,15 +66,26 @@ impl HookPoint {
             "preempt" => Some(Self::Preempt),
             "degrade" => Some(Self::Degrade),
             "complete" => Some(Self::Complete),
+            "action" => Some(Self::Action),
+            "command" => Some(Self::Command),
             _ => None,
         }
     }
 
-    /// 这个 hook 是否需要 Transform 权限（能改写引擎行为）。
+    /// 这个 hook 是否需要 Transform 权限（能改写引擎行为，或替用户动手）。
+    ///
+    /// `Action` / `Command` 也算：它们由用户点击触发，但里面能干的事
+    /// （执行外部程序、写文件）比下载管线里的 hook 更重，safe 模式下
+    /// 按钮本来就不显示（`ui.collect` 只在 trusted 下输出 actions），
+    /// 这里保持一致，否则插件页会显示"挂着 onAction"却点不动。
     pub fn needs_transform(self) -> bool {
         matches!(
             self,
-            HookPoint::Resolve | HookPoint::Plan | HookPoint::BeforeRequest
+            HookPoint::Resolve
+                | HookPoint::Plan
+                | HookPoint::BeforeRequest
+                | HookPoint::Action
+                | HookPoint::Command
         )
     }
 

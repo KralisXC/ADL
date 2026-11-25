@@ -14,6 +14,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod api_server;
+mod install;
 mod notice;
 mod plugins;
 mod terminal;
@@ -228,6 +229,12 @@ struct App {
     /// 上面那个接收端当前服务的是谁：`true` = 新建下载弹窗的目录，
     /// `false` = 设置页的默认下载目录。两处共用一个 `pick_rx`。
     pick_to_add: bool,
+    /// 正在进行的"从压缩包安装插件"。
+    ///
+    /// 选文件 + 解包都是阻塞动作（系统对话框要等人点，解包要读磁盘），
+    /// 所以整条链路丢进一个线程，只把最终结果（成功说装了什么、失败说
+    /// 为什么）从这个 channel 送回来。
+    zip_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
 }
 
 /// 首次点关闭时问用户"退出还是最小化"。
@@ -264,6 +271,27 @@ fn start_pick_folder() -> std::sync::mpsc::Receiver<Option<std::path::PathBuf>> 
         let picked = platform::pick_folder("选择下载目录");
         // 接收端可能已经丢了（用户切换页面把状态清掉），忽略发送失败。
         let _ = tx.send(picked);
+    });
+    rx
+}
+
+/// 「从压缩包安装插件」的整条链路：选文件 → 解包 → 删包。
+///
+/// 三件事都是阻塞的（系统对话框要等人点、解包要读磁盘），所以整段丢进
+/// 一个线程，只把最终结论送回来 —— `Ok(插件 id)` 或 `Err(给人看的理由)`。
+/// 成功之后调用方还要重建 `PluginHooks`、让快照失效，那两步需要 `self`，
+/// 不能在这里做。
+fn start_install_zip(root: std::path::PathBuf) -> std::sync::mpsc::Receiver<Result<String, String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let picked = platform::pick_file("选择插件压缩包", ("插件压缩包", "zip"));
+        let Some(zip_path) = picked else {
+            // 用户取消：发个空结果让界面把「安装中」的状态收掉。
+            let _ = tx.send(Err(String::new()));
+            return;
+        };
+        let res = install::install_zip(&zip_path, &root).map(|inst| inst.id);
+        let _ = tx.send(res);
     });
     rx
 }
@@ -459,6 +487,7 @@ impl App {
             toast: None,
             pick_rx: None,
             pick_to_add: false,
+            zip_rx: None,
         }
     }
 
@@ -605,6 +634,69 @@ impl App {
             }
             None => self.set_status("插件动作不可用（需要 trusted 模式）", true),
         }
+    }
+
+    /// 执行「作用于单个任务」的插件动作，把任务的文件信息塞进 payload。
+    ///
+    /// 插件拿不到全局任务表（`getTask` 在宿主里还是空实现），所以这里
+    /// 主动把 `path` / `dir` / `url` / `name` 一起递过去 —— 媒体插件至少
+    /// 得知道要转哪个文件。
+    ///
+    /// 🔴 **必须丢到子线程**：转码一个 1 GB 的视频要几分钟，而 `run_action`
+    /// 是同步等待 JS 返回的。在 UI 线程上直接调，整个窗口会卡死到转完为止。
+    /// 结果从 `pending_notices` 回来，走的是和后台下载任务同一条通道。
+    fn run_task_action(&mut self, plugin: &str, action: &str, id: u64) {
+        let task = snapshot(&self.gui).into_iter().find(|t| t.id == id);
+        let Some(t) = task else {
+            self.set_status(format!("任务 #{id} 已经不在了"), true);
+            return;
+        };
+        if t.path.as_ref().map(|p| p.is_empty()).unwrap_or(true) {
+            self.set_status("这个任务还没有落盘文件，等下载完再操作", true);
+            return;
+        }
+        let name = display_name(&t);
+        let payload = json!({
+            "taskId": t.id,
+            "url": t.url,
+            "name": name,
+            "path": t.path,
+            "dir": t.dir,
+            "status": t.status,
+            "total": t.total,
+        });
+        let hooks = self.gui.hooks.lock().unwrap().clone();
+        let gui = self.gui.clone();
+        let plugin = plugin.to_string();
+        let action = action.to_string();
+        self.set_status(format!("已交给插件处理：{name}"), false);
+        std::thread::spawn(move || {
+            let res = hooks.run_action(&plugin, &action, &payload);
+            let (level, title, body) = match res {
+                Some(v) => {
+                    let ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(true);
+                    let msg = v
+                        .get("message")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or(if ok { "插件动作已完成" } else { "插件动作失败" })
+                        .to_string();
+                    let lv = if ok {
+                        crate::notice::Level::Ok
+                    } else {
+                        crate::notice::Level::Error
+                    };
+                    (lv, format!("{plugin} · {name}"), msg)
+                }
+                None => (
+                    crate::notice::Level::Warn,
+                    format!("{plugin} · {name}"),
+                    "插件动作不可用（需要信任模式）".to_string(),
+                ),
+            };
+            if let Ok(mut q) = gui.pending_notices.lock() {
+                q.push((level, title, body));
+            }
+        });
     }
 }
 
@@ -783,6 +875,33 @@ impl eframe::App for App {
             }
         }
 
+        // 「从压缩包安装」的结果：真正的解包在子线程做完了，这里只负责
+        // 重建 hooks + 让插件快照立刻失效 + 报一句结果。
+        if let Some(rx) = &self.zip_rx {
+            match rx.try_recv() {
+                Ok(Ok(id)) => {
+                    self.zip_rx = None;
+                    let new_cfg = self.gui.cfg.lock().unwrap().clone();
+                    *self.gui.hooks.lock().unwrap() = build_hooks(&new_cfg);
+                    self.plugin_snapshot_at = Instant::now() - Duration::from_secs(3600);
+                    self.set_status(format!("已安装插件 {id}（压缩包已删除）"), false);
+                }
+                Ok(Err(e)) => {
+                    self.zip_rx = None;
+                    // 空串 = 用户在对话框里点了取消，什么都不用说。
+                    if !e.is_empty() {
+                        self.set_status(format!("安装失败：{e}"), true);
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(120));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.zip_rx = None;
+                }
+            }
+        }
+
         // 无边框窗口：系统不再提供边缘拖拽，八向热区要自己铺。
         resize_borders(ui);
 
@@ -851,10 +970,15 @@ impl eframe::App for App {
                 });
         }
 
-        // 状态提示条（6 秒后消失）——放在外壳正上方，不参与圆角
+        // 状态提示条（6 秒后消失）——浮在内容上方的圆角小条，不占布局
         //
-        // 最后 0.45 秒做淡出，否则一条通栏色带会"啪"地消失，很突兀。
-        // 淡出期间继续请求重绘，不然静止的窗口只会重绘一次就停住。
+        // 原来是一条通栏色带（`Panel::top` + 满宽底色），压在标题栏下面：
+        // 方角、通宽、和周围全是圆角卡片的界面格格不入（用户说"突兀、
+        // 不适配"）。改成和右下角 toast 同一套形态：圆角 + 描边 + 左侧色点，
+        // 只是锚在顶部居中，宽度随文字自适应、上限 520。
+        //
+        // 最后 0.45 秒做淡出，否则会"啪"地消失；淡出期间持续请求重绘，
+        // 不然静止的窗口只会重绘一次就停在半透明。
         if let Some((msg, err, at)) = &self.status {
             let el = at.elapsed().as_secs_f32();
             if el < STATUS_SECS {
@@ -870,20 +994,43 @@ impl eframe::App for App {
                 }
                 let text = msg.clone();
                 let is_err = *err;
-                egui::Panel::top("adl_statusbar")
-                    .resizable(false)
-                    .show_separator_line(false)
-                    .frame(
-                        egui::Frame::new()
-                            .fill(fill.gamma_multiply(alpha))
-                            .inner_margin(egui::Margin::symmetric(20, 6)),
-                    )
-                    .show(ui, |ui| {
+                egui::Area::new(egui::Id::unique("adl_statusbar"))
+                    .order(egui::Order::Middle)
+                    .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 54.0))
+                    // `Area` 自带 fade_in 会和这里的 alpha 叠乘，显得发虚。
+                    .fade_in(false)
+                    .interactable(false)
+                    .show(&ctx, |ui| {
                         ui.set_opacity(alpha);
-                        ui.horizontal(|ui| {
-                            ui.colored_label(color, if is_err { "!" } else { "OK" });
-                            ui.colored_label(color, text);
-                        });
+                        egui::Frame::new()
+                            .fill(fade_color(fill, alpha))
+                            // 描边用同色系但更重一档，弱到只在浅底上勾出边界；
+                            // 不用 `card` 的白底 + 阴影，那是给可交互卡片的。
+                            .stroke(egui::Stroke::new(1.0, fade_color(color.gamma_multiply(0.35), alpha)))
+                            .corner_radius(egui::CornerRadius::same(8))
+                            .inner_margin(egui::Margin::symmetric(14, 8))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    let dot_at = egui::pos2(
+                                        ui.cursor().left() + 4.0,
+                                        ui.cursor().top() + 8.0,
+                                    );
+                                    ui.painter().circle_filled(dot_at, 3.4, fade_color(color, alpha));
+                                    ui.add_space(14.0);
+                                    ui.label(
+                                        egui::RichText::new(if is_err { "失败" } else { "完成" })
+                                            .size(12.5)
+                                            .strong()
+                                            .color(fade_color(color, alpha)),
+                                    );
+                                    ui.add_space(6.0);
+                                    ui.label(
+                                        egui::RichText::new(text)
+                                            .size(12.5)
+                                            .color(fade_color(ink(), alpha)),
+                                    );
+                                });
+                            });
                     });
             }
         }
@@ -1797,6 +1944,25 @@ impl App {
         let mut open_dir_id: Option<u64> = None;
         let mut detail_id: Option<u64> = None;
         let mut copy_url: Option<String> = None;
+        // 插件声明的「作用于单个任务」的动作，以及这一帧用户点了哪一个。
+        let task_actions: Vec<(String, String, String)> = self
+            .plugin_snapshot
+            .get("actions")
+            .and_then(|x| x.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter(|a| a.get("place").and_then(|x| x.as_str()) == Some("task"))
+                    .filter_map(|a| {
+                        Some((
+                            a.get("plugin")?.as_str()?.to_string(),
+                            a.get("id")?.as_str()?.to_string(),
+                            a.get("label")?.as_str()?.to_string(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut task_action: Option<(String, String, u64)> = None;
 
         // 行数可能上千（重装系统后补历史时就是），整表渲染会让每帧都画全部行。
         // virtual_table 自带 ScrollArea + show_rows，只画视口里的那几十行。
@@ -1927,6 +2093,17 @@ impl App {
                             copy_url = Some(t.url.clone());
                             ui.close();
                         }
+                        // 插件声明的、作用于单个任务的动作（`place = "task"`）。
+                        // 放在这里而不是工具栏：转码这类动作天然要指定"哪一个文件"。
+                        for (plugin, action, label) in task_actions.iter() {
+                            if ui
+                                .add(egui::Button::new(label.as_str()).frame(false))
+                                .clicked()
+                            {
+                                task_action = Some((plugin.clone(), action.clone(), t.id));
+                                ui.close();
+                            }
+                        }
                         ui.separator();
                         if ui
                             .add(
@@ -2001,6 +2178,9 @@ impl App {
         if let Some(url) = copy_url {
             ui.ctx().copy_text(url);
             self.set_status("已复制下载地址", false);
+        }
+        if let Some((plugin, action, id)) = task_action {
+            self.run_task_action(&plugin, &action, id);
         }
     }
 
@@ -2486,7 +2666,7 @@ impl App {
         //                比"从 blank 开始自己拼一整串 UA"现实得多
         let mut fields = vec![
             adl_ui::Field::text("默认下载目录", &mut self.s_dir)
-                .hint("留空 = 当前目录")
+                .hint("留空 = 系统的「下载」文件夹")
                 .action("选择…", "pick_dir"),
             adl_ui::Field::text("HTTP 代理", &mut self.s_proxy)
                 .hint("http://127.0.0.1:7890（留空 = 直连）"),

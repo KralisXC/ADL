@@ -193,10 +193,12 @@ adl.onBeforeRequest(function (ctx) {
 });
 ```
 
-- 9 个 hook 点：`onResolve` / `onPlan` / `onBeforeRequest` / `onResponse` / `onProgress` / `onRetry` / `onPreempt` / `onDegrade` / `onComplete`。
+- 9 个 hook 点：`onResolve` / `onPlan` / `onBeforeRequest` / `onResponse` / `onProgress` / `onRetry` / `onPreempt` / `onDegrade` / `onComplete`；另有 `onAction` / `onCommand` 两个**用户主动触发**的入口（不在下载管线里）。
 - **安全模式**：`--safe`（默认）只允许 Observe（观察类）+ Guard（拦截类，只能放行/拒绝）；`--trusted` 才允许 Transform（改写 URL / 请求头 / 分片方案）。默认从配置文件 `mode` 读取。
 - 权限**声明 ≠ 授权**：manifest 里声明了才可能被允许，未声明的调用一律拒绝并审计。
-- 详见 [plugins/README.md](plugins/README.md)。内置示例：`ua-fixer`、`auto-concurrency`、`notify-on-complete`、`block-html`、`ui-demo`。
+- 插件能拿到的东西：`adl.notify()`、`adl.settings.get()`、文件读写（`fs.read` / `fs.write` / `fs.writeBytes` / `fs.exists`，受 `fs_read`/`fs_write` 白名单约束）、`adl.pluginDir()`（自己的安装目录，用来调随包分发的可执行文件）、`adl.exec({ program, args, cwd, timeoutMs })`（**需要 `exec` 权限 + 信任模式**，子进程不弹黑框、带超时与 kill、stdout/stderr 并发读取不会卡管道）。
+- **从压缩包安装**：插件页右上角「从压缩包安装…」选一个 zip，ADL 解开到 `plugins/<id>/`、**装完立刻删除压缩包**；包内 `plugin.toml` 在根目录或第一层子目录都能认（GitHub 打的包会多套一层）。路径穿越（`../`、绝对路径、盘符）一律拒绝。
+- 详见 [plugins/README.md](plugins/README.md)。内置示例：`ua-fixer`、`auto-concurrency`、`notify-on-complete`、`block-html`、`ui-demo`；随包分发的扩展插件示例：`com.kralisxc.media-converter`（ffmpeg 无损转封装 / 抽音轨）。
 
 ## 插件 UI 扩展点
 
@@ -297,6 +299,12 @@ adl.notify({ title: "下载完成", body: "report.pdf · 12.4 MB" });
 - ✅ 文字对比度：`muted` 提到 WCAG AA（5.9:1），`.strong()` 一律显式给色
 - ✅ 任务列表虚拟滚动（`show_rows` 只画视口内的行）；消息页顶部统计卡固定在滚动区外
 - ✅ 一个文件只发一条完成通知（`notify-on-complete` 插件改为 `enabled_by_default = false`）
+- ✅ 状态提示改成顶部居中的浮动圆角小条（原来是一条通栏方角色带，和周围圆角卡片不搭）
+- ✅ 默认下载目录 = 系统的「下载」文件夹（`SHGetKnownFolderPath(FOLDERID_Downloads)` / `XDG_DOWNLOAD_DIR`；配置里留空即跟随系统）
+- ✅ 插件能执行外部程序（`exec`，带超时与 `CREATE_NO_WINDOW`）、探测文件（`fs.exists`）、写二进制（`fs.writeBytes`）、拿到自己的安装目录（`pluginDir`）
+- ✅ 插件动作可挂到**任务行**上（`[[ui.actions]] place = "task"`，在「⋯」菜单里出现；放到子线程跑，不冻界面）
+- ✅ **从压缩包安装插件**（`zip` 只开 `deflate-flate2`、挡 zip slip、装完自动删压缩包、失败回滚）
+- ✅ 内置插件 `本地媒体转换`（ffmpeg 无损转封装 / 抽音轨，只 `-c copy` 不重编码）
 
 设计文档见 [docs/DESIGN.md](docs/DESIGN.md)。
 

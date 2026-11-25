@@ -43,6 +43,67 @@ pub fn app_data_dir() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
+/// 系统默认的「下载」文件夹。
+///
+/// 之所以要问系统而不是硬拼 `$HOME/Downloads`：Windows 上这个目录是可以被
+/// 用户（或被 OneDrive / 某些优化工具）搬到别处的，注册表里存着真实路径；
+/// 硬拼出来的 `C:\Users\x\Downloads` 可能指向一个已经不用的空目录。
+///
+/// 拿不到就返回 `None`，由调用方回退到 `.`（当前目录）。
+pub fn system_download_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::Shell::{
+            FOLDERID_Downloads, KF_FLAG_DEFAULT, SHGetKnownFolderPath,
+        };
+        let mut ptr: *mut u16 = std::ptr::null_mut();
+        // SAFETY: SHGetKnownFolderPath 成功时把 CoTaskMem 分配的字符串写进 ptr，
+        // 失败时不动它（我们预先置空，失败直接返回）。
+        let hr = unsafe {
+            SHGetKnownFolderPath(&FOLDERID_Downloads, KF_FLAG_DEFAULT as u32, std::ptr::null_mut(), &mut ptr)
+        };
+        if hr < 0 || ptr.is_null() {
+            return None;
+        }
+        let mut len = 0usize;
+        // SAFETY: 系统保证这是以 0 结尾的宽字符串。
+        unsafe {
+            while *ptr.add(len) != 0 {
+                len += 1;
+            }
+        }
+        // SAFETY: 上面已量出长度，只读这一段。
+        let s = unsafe { String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len)) };
+        // SAFETY: 这个 PIDL/字符串是 COM 分配器给的，必须还给 CoTaskMemFree。
+        unsafe { windows_sys::Win32::System::Com::CoTaskMemFree(ptr as *const core::ffi::c_void) };
+        if s.trim().is_empty() {
+            return None;
+        }
+        return Some(PathBuf::from(s));
+    }
+    #[cfg(not(windows))]
+    {
+        let home = std::env::var("HOME").ok().filter(|h| !h.trim().is_empty())?;
+        let home = PathBuf::from(home);
+        #[cfg(target_os = "linux")]
+        {
+            // freedesktop 标准：~/.config/user-dirs.dirs 里 XDG_DOWNLOAD_DIR="$HOME/下载"
+            if let Ok(text) = std::fs::read_to_string(home.join(".config/user-dirs.dirs")) {
+                for line in text.lines() {
+                    let line = line.trim();
+                    if let Some(rest) = line.strip_prefix("XDG_DOWNLOAD_DIR=") {
+                        let v = rest.trim().trim_matches('"');
+                        if !v.is_empty() {
+                            return Some(PathBuf::from(v.replace("$HOME", &home.display().to_string())));
+                        }
+                    }
+                }
+            }
+        }
+        Some(home.join("Downloads"))
+    }
+}
+
 /// 配置文件路径：优先 exe 同级的（便携），否则应用数据目录。
 pub fn config_path() -> PathBuf {
     if let Ok(exe) = std::env::current_exe() {
@@ -103,7 +164,14 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            dir: ".".to_string(),
+            // 默认落到系统的「下载」文件夹，而不是当前工作目录。
+            //
+            // 用 `"."` 的话，双击 exe 启动时是 exe 所在目录、从终端启动时是
+            // 终端的工作目录 —— 同一个软件在两处下到不同地方，用户会觉得
+            // "文件丢了"。问系统要真实路径最稳。
+            dir: system_download_dir()
+                .map(|p| p.display().to_string().replace('\\', "/"))
+                .unwrap_or_else(|| ".".to_string()),
             connections: 16,
             chunk_size: 0,
             limit: 0,
@@ -181,6 +249,11 @@ impl Config {
     }
 
     pub fn dir_path(&self) -> PathBuf {
+        // 空串 = 用系统的「下载」文件夹。模板里默认就是空的，这样用户
+        // 不用改配置也能落在系统认为对的地方；取不到再退回 "."。
+        if self.dir.trim().is_empty() {
+            return system_download_dir().unwrap_or_else(|| PathBuf::from("."));
+        }
         PathBuf::from(&self.dir)
     }
 
@@ -241,8 +314,10 @@ const TEMPLATE: &str = r#"# ADL 配置文件（TOML）
 # 命令行参数会覆盖这里同名的设置。
 
 # 默认保存目录（相对路径相对当前工作目录）。
+# 新配置默认填系统的「下载」文件夹（Windows 的 FOLDERID_Downloads /
+# macOS 的 ~/Downloads / Linux 的 XDG_DOWNLOAD_DIR），这里留空等于用它。
 # 路径里的反斜杠要写成双反斜杠或改用正斜杠，例如 "E:\\Downloads" 或 "E:/Downloads"。
-dir = "."
+dir = ""
 
 # 期望的最大并发连接数（1–64）。引擎会按服务器实际接受的量自适应收敛。
 connections = 16
@@ -309,9 +384,19 @@ mod tests {
         let c: Config = toml::from_str("connections = 4\nmode = \"trusted\"").unwrap();
         assert_eq!(c.connections, 4);
         assert!(c.mode_trusted());
-        // 其它字段走 default
-        assert_eq!(c.dir, ".");
+        // 其它字段走 default。`dir` 不再固定是 "."，而是系统的「下载」文件夹
+        // （拿不到才回退 "."），所以这里只能断言非空。
+        assert!(!c.dir.is_empty());
         assert_eq!(c.chunk_size, 0);
+    }
+
+    #[test]
+    fn system_download_dir_is_absolute_when_present() {
+        // 拿不到允许返回 None；拿到了就必须是绝对路径，否则引擎会在
+        // 进程工作目录下建目录，等于又回到 "." 的老问题。
+        if let Some(p) = system_download_dir() {
+            assert!(p.is_absolute(), "系统下载目录应当是绝对路径: {}", p.display());
+        }
     }
 
     #[test]

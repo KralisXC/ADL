@@ -361,3 +361,84 @@ pub fn pick_folder(_title: &str) -> Option<std::path::PathBuf> {
 pub fn pick_folder(_title: &str) -> Option<std::path::PathBuf> {
     None
 }
+
+/// 弹系统的"打开文件"对话框，返回用户选中的文件。
+///
+/// 和 [`pick_folder`] 一样是**模态阻塞**的 —— 调用方必须丢到
+/// `std::thread::spawn` 里再用 channel 收结果，否则整个界面冻住。
+///
+/// `filter` 是 `(描述, 扩展名不带点)`，比如 `("插件压缩包", "zip")`；
+/// 对话框里同时挂一条"所有文件"，免得用户的包扩展名不标准就选不着。
+#[cfg(windows)]
+pub fn pick_file(title: &str, filter: (&str, &str)) -> Option<std::path::PathBuf> {
+    use windows_sys::Win32::UI::Controls::Dialogs::{
+        GetOpenFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    };
+
+    unsafe {
+        let title_w: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+
+        // 过滤器是 "描述\0通配\0描述\0通配\0\0" 这样双终止的宽字符串，
+        // 少一个 \0 系统会一路读过界。
+        let parts = [
+            filter.0.to_string(),
+            format!("*.{}", filter.1),
+            "所有文件".to_string(),
+            "*.*".to_string(),
+        ];
+        let mut filter_w: Vec<u16> = Vec::new();
+        for part in parts.iter() {
+            filter_w.extend(part.encode_utf16());
+            filter_w.push(0);
+        }
+        filter_w.push(0);
+
+        // 1024 个 wchar 够放路径了；不用 MAX_PATH 是因为长路径也常见。
+        let mut buf = [0u16; 1024];
+        let mut ofn: OPENFILENAMEW = std::mem::zeroed();
+        ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+        // hwndOwner 给 null：对话框当独立窗口弹出，位置交给系统。
+        ofn.hwndOwner = std::ptr::null_mut();
+        ofn.lpstrFilter = filter_w.as_ptr();
+        ofn.lpstrFile = buf.as_mut_ptr();
+        ofn.nMaxFile = buf.len() as u32;
+        ofn.lpstrTitle = title_w.as_ptr();
+        ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+
+        // 返回 0 = 用户取消（或出错），两种情况我们都当"没选"。
+        if GetOpenFileNameW(&mut ofn) == 0 {
+            return None;
+        }
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        let s = String::from_utf16_lossy(&buf[..len]);
+        if s.is_empty() {
+            None
+        } else {
+            Some(std::path::PathBuf::from(s))
+        }
+    }
+}
+
+/// macOS 侧用 `osascript` 调系统的选择文件面板（同样阻塞）。
+#[cfg(target_os = "macos")]
+pub fn pick_file(_title: &str, _filter: (&str, &str)) -> Option<std::path::PathBuf> {
+    let out = std::process::Command::new("osascript")
+        .args(["-e", "POSIX path of (choose file)"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(std::path::PathBuf::from(s))
+    }
+}
+
+/// 其它平台没有现成实现，返回 `None`。
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn pick_file(_title: &str, _filter: (&str, &str)) -> Option<std::path::PathBuf> {
+    None
+}

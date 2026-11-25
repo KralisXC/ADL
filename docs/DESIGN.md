@@ -2342,7 +2342,105 @@ SendKeys 时文字进去了、回车丢了（截图上输入框里躺着 `help` 
   行高靠 `row_h` 算，实际更高就会被裁。任务列表的文件名走 `table::truncated`
   （单行 + `on_hover_text`），正是这个约束下才站得住。
 
-### 13.16 待续
+### 13.16 状态条、系统下载目录、插件能力扩展、压缩包安装
+
+**状态条改成浮动小条**（用户 m16664：「顶上这个小提示有点突兀。就是感觉跟其他的有点
+不适配」）
+
+原来是 `egui::Panel::top("adl_statusbar")` 铺一条**通栏方角**的浅色带 —— 周围全是圆角
+卡片，只有它是满宽硬边，一眼就看出来是"贴上去的"。现在换成和右下角 toast 同一套形态：
+
+```rust
+egui::Area::new(egui::Id::unique("adl_statusbar"))
+    .order(egui::Order::Middle)
+    .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 54.0))
+    .fade_in(false)          // 见下
+    .interactable(false)
+    .show(&ctx, |ui| { /* 圆角 8 + 1px 描边 + 左侧 r=3.4 圆点 + 完成/失败 + 正文 */ });
+```
+
+- 顶部居中、**宽度随文字自适应**，不再占满一行；圆角 8 + 描边 + 左侧色点与 toast 同构，
+  区别只有"锚在顶部"和"不接收鼠标"（`.interactable(false)`）。
+- 🔴 **`.fade_in(false)` 是必须的**：`Area` 建好 ui 之后自己会 `multiply_opacity` 做入场
+  淡入，和本项目的 `alpha` 淡出叠乘会显得发虚（toast 那边踩过同一个坑）。
+- 🔴 `Area::show` 的第一个参数是 `&Context`，写 `ctx` 会报
+  `error[E0308]: expected &Context, found Context` → `.show(&ctx, ...)`。
+- 淡出仍是 `STATUS_SECS = 6.0` 最后 `STATUS_FADE = 0.45` 线性降到 0，`alpha < 1.0` 时
+  每帧 `request_repaint()`（窗口静止也要继续画，否则停在半透明）。
+
+**默认下载目录 = 系统的「下载」文件夹**（用户 m16664：「默认下载地址就是 windows 自带的
+指定的下载地址（mac那些也是）」）
+
+- `adl_app::config::system_download_dir() -> Option<PathBuf>`：Windows 走
+  `SHGetKnownFolderPath(&FOLDERID_Downloads, KF_FLAG_DEFAULT, ..)` + `CoTaskMemFree`；
+  Linux 读 `~/.config/user-dirs.dirs` 的 `XDG_DOWNLOAD_DIR`（支持 `$HOME` 前缀），
+  其余回退 `$HOME/Downloads`。
+  **不能拼 `C:\Users\<name>\Downloads`** —— 这个目录可能被 OneDrive 或各种"优化工具"
+  搬走，只有已知文件夹 API 知道真实位置。
+- `Config::default().dir` 用它（失败才退回 `"."`）；`dir_path()` 在 `dir` 为空串时也用它，
+  于是 `config.toml` 里 `dir = ""` 就是"跟随系统"。
+  `"."` 的问题很具体：双击 exe 时它是 exe 所在目录，从终端启动时它是终端的工作目录 ——
+  同一个软件两处下到不同地方，用户只会以为"文件丢了"。
+
+**插件能力扩展**（ffmpeg 插件的前置，用户 m16664 第②条）
+
+旧项目 aria2-harness 的媒体转换插件要 `exec` / `fs.exists` / 知道自己装在哪儿，
+这三样 M3 都没有，所以先补宿主：
+
+| op | 权限门槛 | 说明 |
+|---|---|---|
+| `pluginDir` | 无 | 返回 `HostCtx.plugin_dir`（插件常要调随包分发的 `bin/ffmpeg.exe`） |
+| `fs.exists` | trusted + `fs_read` | `{path} → {exists}` |
+| `fs.writeBytes` | trusted + `fs_write` | base64 进、字节落盘（`fs.write` 只收 `&str`，写不了媒体文件） |
+| `exec` | trusted + `declared.exec` | `{program,args,cwd,timeoutMs} → {ok,code,timedOut,stdout,stderr}` |
+
+- `run_process()` 用 `std::process`（插件跑在各自的 OS 线程上，`invoke_sync` 那条路没有
+  async 运行时）。Windows 必须加 `creation_flags(CREATE_NO_WINDOW = 0x0800_0000)` ——
+  GUI 是 `windows_subsystem`，子进程默认会闪一个黑框。
+- **stdout/stderr 各起一个线程 `read_to_end`**：不读的话子进程写满管道缓冲就卡死，
+  然后被超时 kill 掉，看起来像"ffmpeg 卡住了"。
+- 超时 `try_wait()` 25ms 轮询 + `kill()` + `wait()` 回收，`timeoutMs` 夹在 1s~1h。
+- `path_allowed()` 支持 **`"*"` 通配**：媒体插件的输入输出在用户任意目录，写死前缀没法用；
+  它本来就要 `exec`，再拿路径白名单当安全边界是自欺欺人。
+- 🔴 **`run_process` 的返回 json 必须带 `"ok": true`**。JS 侧 `adl.exec` 的形状是
+  `const r = ...; return (r && r.ok) ? r : { ok: false }` —— 宿主不回 `ok` 时它认为
+  "程序没起来"，转码明明成功却报「ffmpeg 起不来：未知错误」。这个 bug 藏了两轮，
+  因为失败信息本身看起来非常合理。
+
+**`HookPoint::Action` / `Command`**（用户主动触发、不在下载管线里）
+
+- 加进 `enum HookPoint` 并纳入 `needs_transform()`：manifest 里不声明
+  `[[hooks]] point = "onAction"` 的话 `active_hooks` 是空的，插件页会显示"没挂任何 hook"，
+  而 `ui.collect()` 又只在 trusted 下输出 actions —— 两边不一致会让人以为插件坏了。
+- 任务行「⋯」菜单里插一条每个 `place == "task"` 的插件动作
+  （`snapshot["actions"]` → `run_task_action(plugin, action, task_id)`）。
+- 🔴 **`run_task_action` 必须丢子线程**：`PluginHooks::run_action` 是同步等 JS 返回的，
+  而转码一个 1 GB 视频要几分钟，在 UI 线程直接调整个窗口就冻住。状态条先给
+  「已交给插件处理」，完成/失败由 `pending_notices` 通道回到消息中心。
+- payload 主动带上 `taskId/url/name/path/dir/status/total`：插件的 `getTask` 还是空实现，
+  它自己拿不到全局任务表。
+
+**从压缩包安装插件**（用户 m16664：插件以压缩包传到 GitHub Releases，ADL 侧下载解压，
+「记得安装完成后删除压缩包」）
+
+`crates/adl-gui/src/install.rs`：
+
+- `install_zip(zip_path, root) -> Result<Installed, String>`：找 `plugin.toml`
+  （**根目录或第一层子目录都认** —— GitHub 打的包常多套一层 `<repo>-<tag>/`）→
+  用 `adl_plugin::Manifest::parse` 取 `id`（借插件自己的解析器，别再写一份 TOML 规则）→
+  目标 `plugins/<id>/` 已存在就报「先卸载再装」→ 解包 → **`remove_file(zip_path)`**。
+- `safe_join()` 挡 zip slip：只接受 `Component::Normal` / `CurDir`，且最后
+  `out.starts_with(base)` 再确认一次（`../evil`、`C:/Windows/...`、`/etc/passwd` 全拒）。
+- 解包中途失败 `remove_dir_all(dest)` 回滚，不留半个插件。
+- 依赖：`zip = { version = "9.1.2", default-features = false, features = ["deflate-flate2"] }`。
+  🔴 **不能开 default**：会拉 `bzip2`/`lzma`/`ppmd`/`zstd`/`aes-crypto`，离线环境装不上。
+- 🔴 `zip 9.x` 的 `ZipFile::name()` 返回 `ZipResult<Cow<'_, str>>`，不是 `&str`。
+- 🔴 单测不能用 `std::env::temp_dir()`：本机 `%TEMP%` 对 Rust 进程是拒绝访问
+  （`Os { code: 5 }`），用 `CARGO_MANIFEST_DIR/../../target/test-tmp`。
+- 选文件用 `platform::pick_file()`（Windows `GetOpenFileNameW`），与 `pick_folder` 一样
+  是**模态阻塞**的，整条"选文件 + 解包"链路丢 `std::thread` + mpsc，UI 只收结论。
+
+### 13.17 待续
 - Linux/macOS 需在 `eframe` features 补 `x11`/`wayland`；`platform.rs` 的 Win32 部分已用 `#[cfg(windows)]` 隔离。
 - **剪贴板与 `links` 靠 `eframe` feature 编入**（见 §13.4 的 🔴 警告）：现在是显式写在
   features 列表里的，以后谁再动这行，构建日志里没有 `Compiling arboard` 就说明又关掉了。
@@ -2373,10 +2471,12 @@ SendKeys 时文字进去了、回车丢了（截图上输入框里躺着 `help` 
   或 `IFileOperation`，跨平台没统一 API）。
 - 插件通知目前都是 `Level::Info`。`notify` 权限没带级别字段，若要区分
   "警告/错误"，得先在 manifest 或 `adl.notify()` 的 payload 里加 `level`。
-- **插件市场是空壳**：`PluginsTab::Market` / `Discover` 只有说明文字。要做真的，得先定
-  索引 JSON 的格式（`id/name/version/download_url/sha256/min_api`）、下载与解压策略
-  （看到 `plugin.toml` 才认）、**签名校验**（否则等于开放任意代码执行），以及"装到哪"
-  （`plugins/<id>/`，重名要确认覆盖）。用户明确说会接自己的 GitHub 源。
+- **插件市场是空壳**：`PluginsTab::Market` 只有说明文字。要做真的，得先定
+  索引 JSON 的格式（`id/name/version/download_url/sha256/min_api`）、**签名校验**
+  （否则等于开放任意代码执行）。用户明确说会接自己的 GitHub 源
+  （`https://github.com/KralisXC/adl-extensions`），插件以压缩包挂在 Releases 上；
+  **"下载 + 解压 + 删包"这条链路已经有了**（§13.16 的 `install.rs`），缺的只是
+  "从 URL 下载到临时目录"和"列表从哪来"这两步。
 - 终端页的命令是硬编码的 `match`，没有子命令级别的 `--help`、没有把插件命令
   动态列进 `help`（`plugin list` 只列 id，不带命令）。Tab 补全只到第二级，
   插件 id / 任务 id 这类动态参数没补。语法着色也是"按词查表"这种最粗糙的实现，

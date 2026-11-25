@@ -35,6 +35,27 @@ globalThis.adl = {
   log:    (...a) => __adl_host("log", JSON.stringify({ msg: a.map(String).join(" ") })),
   notify: (title, body) => __adl_host("notify", JSON.stringify({ title: String(title), body: String(body == null ? "" : body) })),
   getTask: () => { try { return JSON.parse(__adl_host("getTask", "{}")).data || {}; } catch(e) { return {}; } },
+  // 插件自己的安装目录（绝对路径）。随包分发的可执行文件放这里。
+  pluginDir: () => { try { var r = JSON.parse(__adl_host("pluginDir", "{}")); return (r && r.ok && r.data) ? r.data.dir : ""; } catch(e) { return ""; } },
+  fs: {
+    exists: (path) => { try { var r = JSON.parse(__adl_host("fs.exists", JSON.stringify({path: String(path)}))); return !!(r && r.ok && r.data && r.data.exists); } catch(e) { return false; } },
+    read: (path) => { try { var r = JSON.parse(__adl_host("fs.read", JSON.stringify({path: String(path)}))); return (r && r.ok && r.data) ? r.data.content : null; } catch(e) { return null; } },
+    write: (path, content) => { try { var r = JSON.parse(__adl_host("fs.write", JSON.stringify({path: String(path), content: String(content)}))); return !!(r && r.ok); } catch(e) { return false; } },
+    writeBytes: (path, base64) => { try { var r = JSON.parse(__adl_host("fs.writeBytes", JSON.stringify({path: String(path), base64: String(base64)}))); return !!(r && r.ok); } catch(e) { return false; } }
+  },
+  // 执行外部程序（需要 manifest 的 `exec = true` 且 trusted 模式）。
+  // 返回 {ok, code, timedOut, stdout, stderr} —— 失败也返回 ok:false 而不是抛。
+  exec: (opts) => {
+    opts = opts || {};
+    var payload = { program: String(opts.program || ""), args: (opts.args || []).map(String) };
+    if (opts.cwd) payload.cwd = String(opts.cwd);
+    if (opts.timeoutMs) payload.timeoutMs = opts.timeoutMs | 0;
+    try {
+      var r = JSON.parse(__adl_host("exec", JSON.stringify(payload)));
+      if (r && r.ok) { r.ok = true; return r; }
+      return r || { ok: false };
+    } catch(e) { return { ok: false, error: String(e) }; }
+  },
   settings: {
     get: (key, dflt) => { try { var r = JSON.parse(__adl_host("settings.get", JSON.stringify({key: key, default: dflt}))); return (r && r.ok && "data" in r) ? r.data : dflt; } catch(e) { return dflt; } }
   }
@@ -155,11 +176,14 @@ pub fn load_plugin(dir: &Path, mode: Mode) -> Result<LoadedPlugin, String> {
     let subs: Vec<(HookPoint, i64)> = manifest.hook_subscriptions();
     let active = manifest.active_hooks(mode.trusted());
 
-    let host = Arc::new(HostCtx::new(
-        manifest.id.clone(),
-        manifest.permissions.clone(),
-        mode,
-    ));
+    let host = Arc::new(
+        HostCtx::new(
+            manifest.id.clone(),
+            manifest.permissions.clone(),
+            mode,
+        )
+        .with_dir(dir),
+    );
     let audit = host.audit.clone();
     let memory_mb = manifest.limits.memory_mb;
     let default_timeout = manifest.limits.timeout_ms;

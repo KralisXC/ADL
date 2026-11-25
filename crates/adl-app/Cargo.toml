@@ -20,3 +20,12 @@ clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
+
+# 取系统「下载」文件夹（`SHGetKnownFolderPath(FOLDER_ID_Downloads)`）。
+# 与 GUI 侧共用同一个 windows-sys 版本，不额外增加依赖树。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+] }

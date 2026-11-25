@@ -40,6 +40,10 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 # 详情页要解 `.adl` 控制文件里的十六进制位图
 hex = { workspace = true }
+# 插件以 zip 压缩包分发（GitHub Releases），装完就把包删掉。
+# 🔴 default features 会拉 bzip2/lzma/ppmd/zstd/aes，那些 crate 本机缓存里没有，
+# 只能开 deflate —— 我们自己打包时用 deflate 就够了。
+zip = { version = "9.1.2", default-features = false, features = ["deflate-flate2"] }
 # Windows 平台胶水：单实例（命名互斥量）、唤醒（命名事件）、
 # 休眠/唤醒通知（PowerRegisterSuspendResumeNotification）、
 # 选择文件夹对话框（SHBrowseForFolderW，系统自带，不引第三方依赖）。
@@ -51,4 +55,6 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Com",
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
+    "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
 ] }
