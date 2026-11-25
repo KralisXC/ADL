@@ -2471,6 +2471,8 @@ egui::Area::new(egui::Id::unique("adl_statusbar"))
   `https://static.rust-lang.org/dist/2026-10-01/rust-std-1.99.0-x86_64-unknown-linux-gnu.tar.xz`，
   解包后把 `rustlib/x86_64-unknown-linux-gnu/` 拷进 `$(rustc --print sysroot)/lib/rustlib/`
   —— 手动补组件，`cargo` 就认得这个 target 了。
+  🔴 手动拷进去的组件 **rustup 不知道**（`rustup target list --installed` 仍只列
+  `x86_64-pc-windows-msvc`），所以 `rustup update` / 换工具链会把它清掉，得重拷一次。
 - 补上之后能跑 `cargo check --target x86_64-unknown-linux-gnu`（不链接）：
   - ✅ `adl-ui` 全绿（egui/epaint 这条链在 Linux 下没问题）。
   - ✅ 单独的 `eframe` 探针（与本项目同样的 features 列表）全绿，
