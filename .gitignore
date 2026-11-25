@@ -25,3 +25,5 @@ history.json
 /PowerShell-master
 # ffmpeg 二进制（67 MB，只走 Releases 的 zip 包分发，不入库）
 /plugins/com.kralisxc.media-converter/bin/
+# 插件打包产物（走 adl-extensions 的 Releases）
+/dist
