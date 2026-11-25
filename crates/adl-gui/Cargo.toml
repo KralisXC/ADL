@@ -25,14 +25,28 @@ adl-ui = { path = "../adl-ui" }
 # 而我们 `default-features = false` 把这整组关掉了 —— 结果 Ctrl+V 粘不进
 # 下载地址、Ctrl+C 也拷不走文件路径，界面上完全没反应，看着像"输入框坏了"。
 # `links` 顺带开：插件页里将来会有文档链接。
+#
+# 🔴 `x11` / `wayland` 也是 default 里的，同样被关掉了 —— 在 Linux 上
+# 少了它们 winit 建不出窗口，程序启动即 panic「no compatible backend」。
+# 这两个 feature 在 Windows/macOS 上是空操作（winit 内部按 cfg(unix) 才编
+# x11-dl / wayland-client），所以无条件开着最省心。
 eframe = { version = "0.37", default-features = false, features = [
     "clipboard",
     "glow",
     "wgpu",
     "default_fonts",
     "links",
+    "x11",
+    "wayland",
 ] }
 # 托盘菜单（跨平台，Windows 上只需默认后端）。
+# 🔴 `default-features = false` 在 Linux 上会直接编译失败：
+# tray-icon-0.25.1/src/lib.rs:128 有
+#   compile_error!("either the `libappindicator` or `ksni` feature must be enabled on Linux and BSD")
+# 所以 Linux 那边必须从下面那个 target 表里补一个后端（我们选 ksni：
+# 纯 Rust + zbus，不依赖 GTK/AppIndicator 那套 C 库，也不用装 libxdo）。
+# 对应地 muda 保持 default-features = false，Linux 上走 `noop` 平台实现
+# （菜单项画不出来，但不 panic；要真能弹菜单得引 gtk3，那是发行版级依赖）。
 tray-icon = { version = "0.25.1", default-features = false }
 muda = { version = "0.20", default-features = false }
 serde = { workspace = true }
@@ -58,3 +72,9 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_UI_Controls",
     "Win32_UI_Controls_Dialogs",
 ] }
+# Linux / BSD：tray-icon 必须补一个后端，否则 lib.rs:128 直接 compile_error!
+# （`either the libappindicator or ksni feature must be enabled on Linux and BSD`）。
+# 选 ksni：纯 Rust + zbus，不依赖 GTK / AppIndicator 的 C 库，也不用装 libxdo。
+# 注意这张表必须放在文件最后 —— 表头之后的裸依赖都会并进这张表。
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+tray-icon = { version = "0.25.1", default-features = false, features = ["ksni"] }

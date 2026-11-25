@@ -306,6 +306,8 @@ adl.notify({ title: "下载完成", body: "report.pdf · 12.4 MB" });
 - ✅ 插件动作可挂到**任务行**上（`[[ui.actions]] place = "task"`，在「⋯」菜单里出现；放到子线程跑，不冻界面）
 - ✅ **从压缩包安装插件**（`zip` 只开 `deflate-flate2`、挡 zip slip、装完自动删压缩包、失败回滚）
 - ✅ 内置插件 `本地媒体转换`（ffmpeg 无损转封装 / 抽音轨，只 `-c copy` 不重编码）
+- ✅ 插件以压缩包发布到扩展中心 [KralisXC/adl-extensions](https://github.com/KralisXC/adl-extensions)（`index.json` 索引 + GitHub Releases），ADL 侧装完即删包
+- ✅ Linux / BSD 构建前置已补齐：`eframe` 的 `x11`/`wayland`、`tray-icon` 的 `ksni` 后端（详见 [docs/DESIGN.md](docs/DESIGN.md) §13.17；macOS/Linux 真机验证仍未做）
 
 设计文档见 [docs/DESIGN.md](docs/DESIGN.md)。
 

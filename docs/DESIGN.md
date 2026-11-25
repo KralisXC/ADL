@@ -2440,8 +2440,53 @@ egui::Area::new(egui::Id::unique("adl_statusbar"))
 - 选文件用 `platform::pick_file()`（Windows `GetOpenFileNameW`），与 `pick_folder` 一样
   是**模态阻塞**的，整条"选文件 + 解包"链路丢 `std::thread` + mpsc，UI 只收结论。
 
-### 13.17 待续
-- Linux/macOS 需在 `eframe` features 补 `x11`/`wayland`；`platform.rs` 的 Win32 部分已用 `#[cfg(windows)]` 隔离。
+### 13.17 Linux / BSD 的构建前置（已补）
+
+`platform.rs` 的 Win32 部分早就用 `#[cfg(windows)]` 隔离了，但**依赖声明**本身还有两处
+在非 Windows 上会直接编不过，本轮补上：
+
+- **`eframe` 的 `x11` / `wayland`**（`crates/adl-gui/Cargo.toml`）：这两个本来在
+  `eframe` 的 `default` 里，我们 `default-features = false` 时一并关掉了 →
+  Linux 上 `winit` 建不出窗口，启动即 panic。它们对 Windows / macOS 是空操作
+  （内部按 `cfg(unix)` 才编 `x11-dl` / `wayland-client`），所以**无条件开着**。
+- **`tray-icon` 的 `ksni` 后端**：`tray-icon-0.25.1/src/lib.rs:128` 有
+  `compile_error!("either the \`libappindicator\` or \`ksni\` feature must be enabled on Linux and BSD")`，
+  而我们是 `default-features = false`。补一张只对
+  `cfg(all(unix, not(target_os = "macos")))` 生效的表加 `features = ["ksni"]`
+  —— 选 `ksni` 不选 `libappindicator`：前者是纯 Rust（zbus/DBus StatusNotifier），
+  不用发行版装 GTK3 / libappindicator / libxdo；后者会连带 `muda-gtk3`。
+- 🔴 **`[target.'cfg(..)'.dependencies]` 表必须放在文件最末尾**：TOML 里表头之后的
+  裸依赖全都会并进这张表，第一版把它插在 `serde`/`hex`/`zip` 前面，结果这三个
+  变成了 unix-only 依赖，Windows 上直接 `cannot find crate serde_json / hex / zip`（31 个错误）。
+- `muda` 在 Linux 上仍 `default-features = false` → 走它自己的 `noop` 平台实现：
+  菜单项画不出来但**不 panic**。要真能弹右键菜单得引 `gtk3`，那是发行版级 C 依赖，
+  暂时不做（托盘图标本身由 `ksni` 提供，可用）。
+
+**验证到了什么程度**（本机只有 Windows，没有 WSL / docker）：
+
+- `rustup target add x86_64-unknown-linux-gnu` 失败：`~/.cargo/config.toml` 把 crates
+  源指到 tuna，dist 也走 tuna，而**tuna 镜像缺
+  `rust-std-1.99.0-x86_64-unknown-linux-gnu.tar.xz`（404）**；`RUSTUP_DIST_SERVER`
+  改不掉（rustup 从 channel manifest 里取 xz_url）。绕法：直接下官方的
+  `https://static.rust-lang.org/dist/2026-10-01/rust-std-1.99.0-x86_64-unknown-linux-gnu.tar.xz`，
+  解包后把 `rustlib/x86_64-unknown-linux-gnu/` 拷进 `$(rustc --print sysroot)/lib/rustlib/`
+  —— 手动补组件，`cargo` 就认得这个 target 了。
+- 补上之后能跑 `cargo check --target x86_64-unknown-linux-gnu`（不链接）：
+  - ✅ `adl-ui` 全绿（egui/epaint 这条链在 Linux 下没问题）。
+  - ✅ 单独的 `eframe` 探针（与本项目同样的 features 列表）全绿，
+    `wayland-client` / `x11-dl` / `glutin` / `winit` 全部编过 —— 证明 `x11`/`wayland`
+    这两个 feature 补对了。
+  - ✅ 单独的 `tray-icon` 探针全绿，`ksni v0.3.7` 被正确拉进来 —— 证明
+    `compile_error!` 那一关过了，且 Windows 侧不受影响。
+  - ❌ `adl-core` / `adl-plugin` / `adl-app` / `adl-gui` 编不过，**卡在 `ring v0.17.14`
+    的 build script**：它要调 `x86_64-linux-gnu-gcc` 编汇编（rustls 的加密后端），
+    而 Windows 上没有 Linux 的 C 交叉编译器（`cc-rs: failed to find tool`）。
+    这不是我们代码的问题，装个 `x86_64-linux-gnu-gcc` 也不解决（后面还要 Linux
+    链接器和图形库）。**结论：语法级交叉检查到此为止，真验证必须上真机或 CI。**
+
+### 13.18 待续
+- macOS / Linux 的**真机**构建验证仍未做（本机只有 Windows；M 芯片 Mac 无法在本机测）。
+  交叉编译也不能替代：`eframe` 的 glow/wgpu 后端要链接平台图形库。
 - **剪贴板与 `links` 靠 `eframe` feature 编入**（见 §13.4 的 🔴 警告）：现在是显式写在
   features 列表里的，以后谁再动这行，构建日志里没有 `Compiling arboard` 就说明又关掉了。
 - 旧的 `web/`（Vue）与 `static_server.rs` 已不再编入（保留仅作历史），后续可清理。
