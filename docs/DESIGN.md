@@ -2599,7 +2599,171 @@ egui::Area::new(egui::Id::unique("adl_statusbar"))
   `cargo test --release -p adl-gui --bin adl-gui` → 7 passed（install 2 + market 2 +
   update 3）。
 
-### 13.19 待续
+### 13.19 插件目录固定、设置草稿模式、托盘与程序图标
+
+这一批全是「用起来不对劲」的细节，改动零散但每条都踩过坑。
+
+#### 13.19.1 插件目录固定为 exe 同级 `plugins/`
+
+用户 m19629：「我们的插件储存位置还是直接固定吧（放在 exe 同根目录的 plugins 文件夹）」。
+于是 `Config::plugin_dir` 字段、`plugin_dir_opt()`、`plugin.toml` 模板里那一行、
+设置页的「插件目录」输入框全部删掉，只留：
+
+```rust
+// crates/adl-gui/src/plugins.rs
+pub(crate) fn plugins_root() -> Option<PathBuf> {
+    std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("plugins")))
+}
+```
+
+- 设置页改成只读显示「插件目录：`<绝对路径>`」，省得用户怀疑插件装到哪去了。
+- 终端 `settings` 命令同样打印这个路径。
+- CLI 的 `--plugin-dir` 保留，那是开发/测试用的临时覆盖，不是用户配置。
+- 🔴 **插件必须跟着 exe 走**：改完之后 `E:\ADL\target\release\plugins\` 是空的，
+  复制 exe 之后要一并 `Copy-Item 'E:\ADL\plugins\*' 'E:\ADL\target\release\plugins\' -Recurse`，
+  否则界面上一片插件都看不见、`build_hooks` 也不加载任何 hook。
+
+#### 13.19.2 GitHub 自动更新的 406
+
+用户 m19629：「github自动更新的话现在获取的是返回http 406」。
+
+根因：`https://github.com/KralisXC/ADL/releases/latest` 是**网页端点**，浏览器请求会
+302 到 HTML；非浏览器 UA 直接被 GitHub 回 406。改用 API 端点：
+
+```rust
+pub const DEFAULT_RELEASES_API: &str = "https://api.github.com/repos/KralisXC/ADL/releases/latest";
+```
+
+`fetch_latest()` 按状态码分派文案，不再一律「GitHub 返回 HTTP N」：
+
+| 状态 | 文案 |
+|---|---|
+| 404 | 这个仓库还没有发布任何 release |
+| 406 | GitHub 拒绝了这次请求（406）…（提示改 API 端点） |
+| 403 / 429 | GitHub 接口调用太频繁了，过一会儿再试 |
+| 其它非 2xx | GitHub 返回 HTTP `{code}` |
+
+另外 `parse_release` 的错误里只要提到 `tag_name`，一律翻成「这个仓库还没有发布任何 release」——
+因为 `api.github.com/.../releases` 在零 release 时返的是 **200 + `[\n\n]`**，
+不是 404，光靠状态码分不出来。
+
+#### 13.19.3 设置页草稿模式（改绿 / 原黄）
+
+用户 m19629：「我们在设置直接改的是预更改，点了保存才是正式更改（改了就是绿色的
+（原来的可以显示黄色））」。
+
+- `App` 里所有设置项都本来是草稿字段（`s_dir`/`s_conn`/…），这次把剩下五个
+  「改一下就立刻 `cfg.save()`」的补上：并发上限、限速、同时下载、启动时检查更新、
+  关闭行为。现在**只有「保存设置」一处落盘**。
+- `fn settings_dirty_count()` **每帧现算**，不缓存脏标记：把值改回原样时计数必须自己减回去，
+  缓存一个 `dirty: bool` 就得在十几个地方记得清。
+- `fn settings_bar()` 画在页面级 `ScrollArea` **外面**（`main.rs` 里 `rule(ui)` 之后、
+  `let pf = ...` 之前），否则一滚就跟着跑。左边「没有未保存的更改」/「已更改 N 项」，
+  右边 `right_to_left` 里**先 add「保存设置」再 add「取消」**才是视觉顺序。
+- 卡级高亮：`fn dirty_title(ui, title, dirty)` —— 改过的卡标题用 `pal().accent` + 挂
+  「已修改」badge；原值用 `widgets::hint_was()` 画成 `pal().warn` 的小字「原：16」。
+  🔴 **用 `warn` 不用 `muted`**：灰色会被当成又一条 hint 略过。
+- `adl_ui::form::Field` 加 `mark: Option<&'a str>` 与链式 `.mark(orig)`：`form()` 里
+  标签变强调色、控件下面补一行「原：xxx」。私有 getter 必须叫 `mark_of` 而非 `mark`，
+  否则与链式构造器同名，`&mut Field` 上调用会解析成构造器，报
+  `E0599: form::Field<'_> is not an iterator`。
+- 🔴 **`segmented` 的交互 id 必须带 `id_salt`**：原来每格是 `ui.scope_id().with(("seg", i))`，
+  而同一张页面里所有卡片的 `scope_id()` 完全相同 → 「并发上限」和「同时下载」两行的格子
+  逐格撞车，点一个另一个跟着动（用户 m21220 报的真 bug）。签名改成
+  `segmented(ui, id_salt: &str, current, items)`，四个调用点各给一个 salt。
+- `segmented` 每格补无障碍信息，供 UI Automation 用：
+  ```rust
+  resp.widget_info(|| WidgetInfo::selected(Role::RadioButton, true, on, *label));
+  ```
+
+#### 13.19.4 `accesskit` feature（自动化验证的前提）
+
+`eframe` 的 `accesskit` 在 `default` 里；我们 `default-features = false` 时它一并被关掉，
+后果是**egui 界面在 Windows UI Automation 里完全不可见** —— 只能截图 + 猜坐标。
+本机 DPI 150%、窗口物理原点每次启动都变（实测出现过 38/114/304/501 四种），
+猜一次错一次。feature 列表里显式加上 `"accesskit"` 之后，
+`Snapshot(use_ui_tree=true)` 就能按控件名读写：
+
+```
+window "ADL 下载器"
+├── [#14] (1654,431) 按钮 "保存设置"  [action: click]
+├── [#13]..[#7] 单选按钮 "1/2/4/8/16/32/64"（16 selected）
+└── [#6]..[#0]  单选按钮 "1/2/3/5/8/12/16"（3 selected）
+```
+
+这比任何像素法都可靠，**以后要自动化点界面先确认这行 feature 还在**。
+
+#### 13.19.5 运行时数据全部搬到 exe 同级 `data/`
+
+用户 m21598：「除了默认下载位置是放在win自动那边，其他的数据全都放我们自己的文件夹里面」。
+
+- `adl_app::config::app_data_dir()` 重写：先试 `current_exe().parent()/data`，
+  **能不能写靠实写一个探针文件 `.adl-write-probe` 判断**（`fn dir_writable`），
+  不看 ACL —— 有 Deny ACE、只读卷、OneDrive 占位文件这些情况光看权限位判断不出来。
+  写不进去才回退 `%LOCALAPPDATA%/ADL` → `$HOME/.local/share/adl` → cwd，
+  并打印一行提示。`OnceLock` 缓存，避免每次调用都建探针。
+- `config_path()` 仍然**优先认 exe 同级的裸 `config.toml`**（早期便携模式，老用户升级不受影响），
+  否则用 `data/config.toml`。
+- 跟随生效（都走 `app_data_dir()`）：`config.toml` / `history.json` / `tasks.json` /
+  `notices.json` / `plugin-settings/` / `cache/`（插件市场）/ `update/`（更新包）。
+- 默认下载目录不变：仍是 `system_download_dir()`（Windows 是
+  `SHGetKnownFolderPath(FOLDERID_Downloads)`）。
+- `Config::save()` 的错误信息全部带上具体路径，且 **`rename` 失败时退回直接覆盖写**：
+  目录有 Deny ACE、只读卷、杀软占句柄时改名会失败，但 `fs::write` 往往仍可行。
+  两路都失败才报「保存到 {path} 失败: {write_err}（改名也失败: {rename_err}）」。
+  用户 m21507 报的「保存设置 os error 5」就是在这里被修掉的（旧版只给一句光秃秃的
+  `拒绝访问`，且数据还在 `%LOCALAPPDATA%`）。
+
+#### 13.19.6 托盘图标：GUID 身份、透明图标、失败兜底
+
+- `TRAY_GUID`（`0x4144_4c31_0000_4000_8000_0000_0000_0001`）：不传 GUID 时托盘的
+  身份是「exe 路径 + 进程序号」，每次启动都是新图标，用户拖出溢出区之后下次又回去。
+- `make_icon()` 原先画的是**满幅不透明方块**（alpha 全 `0xFF`），托盘里就是一块青色方片。
+  重写成圆角矩形 SDF + 向下箭头，圆角外 `alpha = 0`，并拆出 `icon_rgba(size)` 让
+  托盘图标（32）与窗口图标（64）共用同一套几何。
+- 🔴 **`tray-icon 0.25.1` 会把 `NIM_ADD` 的失败完全吞掉**（`platform_impl/windows/mod.rs:159-162`：
+  `if !register_tray_icon(...) { /* 等 TaskbarCreated 重注册 */ }`），所以 `build()`
+  永远返回 `Ok`。`build_tray()` 因此拆成两层：先带 GUID 建一次，用
+  `TrayIcon::rect()`（内部 `Shell_NotifyIconGetRect`）确认真的注册上了；问不到位置就
+  退回不带 GUID 的老式 `hWnd + uID` 身份再试一次。两路都问不到就打印
+  「没能注册到任务栏（进程被降权，或 explorer 未响应）」。
+- **为什么注册会失败**（实测结论，对排查同类问题有用）：`Shell_NotifyIconW(NIM_ADD)`
+  在 **Low 完整性级别**（`S-1-16-4096`）的进程里返回 `FALSE` + `GetLastError() = 5`
+  （`ERROR_ACCESS_DENIED`）；同样的代码在 Medium（`S-1-16-8192`）下成功。
+  与 GUID、图标像素、ACL、Job 的 `uiRestrictions` 都无关 —— 同一个 Job 里的 pwsh
+  明明 `uiRestrictions = 0x00003FFE` 却注册成功，唯一差别就是完整性级别。
+  > 这条也是「受限沙箱里看不到托盘图标」的通用解释：不是软件 bug。
+
+#### 13.19.7 程序图标（PE 资源 + 窗口图标）
+
+用户 m21290：「要，一起做」——资源管理器 / 任务栏 / Alt+Tab 都要有图标。
+
+- `crates/adl-gui/assets/adl.ico`：7 个尺寸（16/24/32/48/64/128/256），
+  由 `probe/make_icon.py`（Pillow，8× 超采样 + LANCZOS）生成；
+  底 `#2E7D6B`、箭头 `#F2F7F6`。
+- `crates/adl-gui/assets/adl.rc` 三处必须这么写，否则 rc.exe 静默产出坏资源：
+  1. 🔴 **不要 `#include <winres.h>`**：`embed-resource` 只在它自己找 rc.exe 的分支里
+     才把 SDK 的 Include 塞进 `%INCLUDE%`，环境里一旦有 `RC` 变量就走另一条路 →
+     `RC1015: cannot open include file 'winres.h'`。改用字面量
+     `VOS_NT_WINDOWS32 = 0x40004L` / `VFT_APP = 0x1L` / `VS_FFI_FILEFLAGSMASK = 0x3FL`。
+  2. 🔴 **必须 `#pragma code_page(65001)`**：rc.exe 默认按系统 ANSI 代码页（本机 936）
+     读源文件，中文 `FileDescription` 的 UTF-8 字节会把解析搞崩，
+     报 `RC2133: unexpected value in value data`。
+  3. 🔴 **资源 id 写 `1 VERSIONINFO`，不能写 `VS_VERSION_INFO VERSIONINFO`**：
+     `VS_VERSION_INFO` 是 winver.h 里的宏（= 1），写成字符串后资源名成了字符串，
+     而 `version.dll` 按**整数 ID 1 + RT_VERSION** 找，于是属性页里版本字段全空
+     （`GetFileVersionInfoSize` 返 `ERROR_RESOURCE_TYPE_NOT_FOUND`）。
+- `build.rs` 用 `embed_resource::compile(&rc, embed_resource::NONE).manifest_optional()`：
+  `compile` 返回 `#[must_use]` 的 `CompilationResult`，`manifest_optional()` 把
+  `NotWindows`/`Ok`/`NotAttempted` 都当成功（找不到 rc.exe 只是没图标、不该编不过）；
+  出错也只 `cargo:warning`。依赖写在 `[target.'cfg(windows)'.build-dependencies]`。
+- 窗口图标是**另一处**：`ViewportBuilder::with_icon(make_window_icon())`（64×64）。
+  PE 资源里的图标只有在资源管理器/任务栏/Alt+Tab 用，窗口自己不会自动拿。
+- 验证方法（不用打开资源管理器）：
+  `[System.Drawing.Icon]::ExtractAssociatedIcon($exe)` 看像素、
+  `[System.Diagnostics.FileVersionInfo]::GetVersionInfo($exe)` 看版本字段。
+
+### 13.20 待续
 - macOS / Linux 的**真机**构建验证仍未做（本机只有 Windows；M 芯片 Mac 无法在本机测）。
   交叉编译也不能替代：`eframe` 的 glow/wgpu 后端要链接平台图形库。
   用户 m18452 已明确「只做 win 先」，这条暂时搁置。

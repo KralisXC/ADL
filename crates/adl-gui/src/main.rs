@@ -189,7 +189,12 @@ struct App {
     s_proxy: String,
     s_ua: String,
     s_mode: String,
-    s_plugin_dir: String,
+    // 队列上限（同时下载几条任务）—— 草稿值，点「保存设置」才落盘
+    s_max_tasks: u64,
+    // 启动时检查更新 —— 草稿值
+    s_check_update: bool,
+    // 关闭窗口时的行为 —— 草稿值（"tray" / "close"）
+    s_close_action: String,
     // 限速显示单位（"auto" 或固定单位）
     limit_unit: String,
     // 侧栏收起
@@ -397,6 +402,13 @@ const STATUS_FADE: f32 = 0.45;
 const TOAST_SECS: f32 = 4.0;
 const TOAST_FADE: f32 = 0.35;
 
+/// 托盘图标的固定身份。
+///
+/// Windows 用 GUID（而不是 exe 路径 + 进程序号）来记住这个图标在任务栏上的
+/// 位置：用户把它从溢出区拖出来之后，下次启动还在原地。随便定一个常量即可，
+/// 只要**永远不变**就行 —— 换了 GUID 等于换了一个新图标，位置又重置了。
+const TRAY_GUID: u128 = 0x4144_4c31_0000_4000_8000_0000_0000_0001;
+
 /// 弹窗淡入计时器。
 ///
 /// 为什么不用 `ctx.animate_bool`：egui 的动画管理器在**首次**遇到某个 id 时
@@ -516,7 +528,13 @@ impl App {
             s_proxy: cfg.proxy.clone(),
             s_ua: cfg.user_agent.clone(),
             s_mode: if cfg.mode_trusted() { "trusted".into() } else { "safe".into() },
-            s_plugin_dir: cfg.plugin_dir.clone(),
+            s_max_tasks: cfg.max_concurrent_tasks as u64,
+            s_check_update: cfg.check_update,
+            s_close_action: if cfg.close_action.trim().is_empty() {
+                "tray".to_string()
+            } else {
+                cfg.close_action.clone()
+            },
             limit_unit: if cfg.limit_unit.trim().is_empty() {
                 "auto".to_string()
             } else {
@@ -688,18 +706,158 @@ impl App {
             "proxy": self.s_proxy,
             "mode": self.s_mode,
             "http1": http1,
-            "plugin_dir": self.s_plugin_dir,
             "limit_unit": self.limit_unit,
             // 空字符串 = 回到内置默认 UA（引擎侧 user_agent_opt() 返回 None）
             "user_agent": self.s_ua,
+            // 下面三项以前是"一改就落盘"，现在和别的设置一样走草稿
+            "max_concurrent_tasks": self.s_max_tasks,
+            "check_update": self.s_check_update,
+            "close_action": self.s_close_action,
         });
         match set_settings(&self.gui, &args) {
             Ok(_) => {
+                // 队列上限可能被调大了，立刻看一眼有没有空位可以补。
+                queue_fn::pump_queue(&self.gui);
                 self.set_status("已保存设置", false);
                 self.plugin_snapshot_at = Instant::now() - Duration::from_secs(3600);
             }
             Err(e) => self.set_status(e, true),
         }
+    }
+
+    /// 把草稿字段全部重置回已保存的配置（「取消」按钮）。
+    fn reset_settings_draft(&mut self) {
+        let cfg = self.gui.cfg.lock().unwrap().clone();
+        self.s_dir = cfg.dir.clone();
+        self.s_conn = cfg.connections as u64;
+        self.s_limit = cfg.limit;
+        self.s_proxy = cfg.proxy.clone();
+        self.s_ua = cfg.user_agent.clone();
+        self.s_mode = if cfg.mode_trusted() {
+            "trusted".into()
+        } else {
+            "safe".into()
+        };
+        self.s_max_tasks = cfg.max_concurrent_tasks as u64;
+        self.s_check_update = cfg.check_update;
+        self.s_close_action = if cfg.close_action.trim().is_empty() {
+            "tray".to_string()
+        } else {
+            cfg.close_action.clone()
+        };
+        self.limit_unit = if cfg.limit_unit.trim().is_empty() {
+            "auto".to_string()
+        } else {
+            cfg.limit_unit.clone()
+        };
+    }
+
+    /// 设置页的草稿与已保存配置差了几项。
+    ///
+    /// 每帧现算，**不缓存脏标记**：用户把一个值改回去时计数必须跟着减，
+    /// 脏标记做不到这件事（除非每次编辑都反查原值，那就等于现算了）。
+    fn settings_dirty_count(&self) -> usize {
+        let cfg = self.gui.cfg.lock().unwrap();
+        let cfg_limit_unit = if cfg.limit_unit.trim().is_empty() {
+            "auto".to_string()
+        } else {
+            cfg.limit_unit.clone()
+        };
+        let cfg_mode = if cfg.mode_trusted() {
+            "trusted".to_string()
+        } else {
+            "safe".to_string()
+        };
+        let cfg_close = if cfg.close_action.trim().is_empty() {
+            "tray".to_string()
+        } else {
+            cfg.close_action.clone()
+        };
+        let mut n = 0usize;
+        if self.s_conn as usize != cfg.connections {
+            n += 1;
+        }
+        if self.s_limit != cfg.limit {
+            n += 1;
+        }
+        if self.limit_unit != cfg_limit_unit {
+            n += 1;
+        }
+        if self.s_dir.trim() != cfg.dir.trim() {
+            n += 1;
+        }
+        if self.s_proxy.trim() != cfg.proxy.trim() {
+            n += 1;
+        }
+        if self.s_ua.trim() != cfg.user_agent.trim() {
+            n += 1;
+        }
+        if self.s_mode != cfg_mode {
+            n += 1;
+        }
+        if self.s_max_tasks as usize != cfg.max_concurrent_tasks {
+            n += 1;
+        }
+        if self.s_check_update != cfg.check_update {
+            n += 1;
+        }
+        if self.s_close_action != cfg_close {
+            n += 1;
+        }
+        n
+    }
+
+    /// 设置页顶部那条固定工具条：保存 / 取消 / 已更改 N 项。
+    ///
+    /// 它必须画在页面级 `ScrollArea` **外面**（用户 m19629：把「保存设置」
+    /// 从页面底部挪到「设置」标题下面），否则一滚动就跟着往上跑，设置页
+    /// 又有十来张卡片，改完最后一项还得滚回底部才能保存。
+    fn settings_bar(&mut self, ui: &mut egui::Ui) -> bool {
+        let dirty = self.settings_dirty_count();
+        let mut save = false;
+        let mut cancel = false;
+        adl_ui::widgets::card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                if dirty == 0 {
+                    ui.label(
+                        egui::RichText::new("没有未保存的更改")
+                            .size(12.5)
+                            .color(muted()),
+                    );
+                } else {
+                    adl_ui::widgets::badge(
+                        ui,
+                        &format!("已更改 {dirty} 项"),
+                        pal().warn,
+                    );
+                    ui.label(
+                        egui::RichText::new("改动只是预演，点「保存设置」才生效")
+                            .size(12.0)
+                            .color(muted()),
+                    );
+                }
+                // 按钮靠右：`right_to_left` 里第一个 add 落在最右边，
+                // 所以视觉顺序"取消 → 保存"要倒着 add。
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    if ui.button("保存设置").clicked() {
+                        save = true;
+                    }
+                    if ui
+                        .add_enabled(dirty > 0, egui::Button::new("取消"))
+                        .clicked()
+                    {
+                        cancel = true;
+                    }
+                });
+            });
+        });
+        if cancel {
+            self.reset_settings_draft();
+            self.set_status("已撤销未保存的更改", false);
+        }
+        save
     }
 
     /// 关闭行为：记住用户的选择并落盘。
@@ -831,6 +989,26 @@ fn muted() -> egui::Color32 {
 }
 fn ink() -> egui::Color32 {
     pal().ink
+}
+
+/// 设置卡的小节标题：`dirty == true` 时用强调色，提示"这张卡里改过东西"。
+///
+/// 用户 m19629 要求"改了就是绿色的"，指的就是这种即时反馈：
+/// 草稿改过但还没保存的项是绿的，下面再用 `hint_was` 把原值用黄字标出来。
+fn dirty_title(ui: &mut egui::Ui, title: &str, dirty: bool) {
+    let color = if dirty { pal().accent } else { pal().ink };
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        ui.label(
+            egui::RichText::new(title)
+                .size(theme().text.section)
+                .strong()
+                .color(color),
+        );
+        if dirty {
+            adl_ui::widgets::badge(ui, "已修改", pal().accent);
+        }
+    });
 }
 /// 侧栏左右内边距，必须与 `sidebar_frame()` 的 `Margin::symmetric(12, 14)`
 /// 保持一致：面板内的可用宽度已经是 `sidebar_w - 2*PAD`，内容再按
@@ -1266,6 +1444,17 @@ impl eframe::App for App {
                 ui.add_space(4.0);
                 adl_ui::widgets::rule(ui);
                 ui.add_space(4.0);
+
+                // 设置页的「保存 / 取消 / 已更改 N 项」固定在标题下面。
+                //
+                // 必须放在页面级 ScrollArea **外面**：设置页有十来张卡片，
+                // 保存按钮原来在页面最底部，改完靠上的某项还得一路滚下去。
+                if self.tab == Tab::Settings {
+                    if self.settings_bar(ui) {
+                        self.do_save_settings();
+                    }
+                    ui.add_space(8.0);
+                }
 
                 // 换页淡入：只做透明度，**不做位移**。
                 //
@@ -2840,7 +3029,7 @@ impl App {
                         (Range::Month, "月"),
                         (Range::Week, "周"),
                     ];
-                    if let Some(r) = adl_ui::widgets::segmented(ui, self.home_range, &items) {
+                    if let Some(r) = adl_ui::widgets::segmented(ui, "home_range", self.home_range, &items) {
                         self.home_range = r;
                     }
                 });
@@ -2920,12 +3109,60 @@ impl App {
         // 标题已在顶栏显示
         ui.add_space(2.0);
 
+        // 草稿模式下每张卡都要回答两个问题："这项改了吗"、"原来是什么"。
+        // 这里一次性把已保存的值抄出来，下面各卡直接比、直接显示原值。
+        let (
+            was_conn,
+            was_limit,
+            was_limit_unit,
+            was_dir,
+            was_proxy,
+            was_ua,
+            was_mode,
+            was_max_tasks,
+            was_check_update,
+            was_close,
+        ) = {
+            let cfg = self.gui.cfg.lock().unwrap();
+            (
+                cfg.connections as u64,
+                cfg.limit,
+                if cfg.limit_unit.trim().is_empty() {
+                    "auto".to_string()
+                } else {
+                    cfg.limit_unit.clone()
+                },
+                cfg.dir.clone(),
+                cfg.proxy.clone(),
+                cfg.user_agent.clone(),
+                if cfg.mode_trusted() {
+                    "trusted".to_string()
+                } else {
+                    "safe".to_string()
+                },
+                cfg.max_concurrent_tasks as u64,
+                cfg.check_update,
+                if cfg.close_action.trim().is_empty() {
+                    "tray".to_string()
+                } else {
+                    cfg.close_action.clone()
+                },
+            )
+        };
+        // 字符串项的原值只在真的改过时才传给 `Field::mark`（`None` = 没改，
+        // 不画那一行黄字）。空串也算一个合法原值，所以不能拿"非空"当条件。
+        let was_dir = (self.s_dir.trim() != was_dir.trim()).then_some(was_dir);
+        let was_proxy = (self.s_proxy.trim() != was_proxy.trim()).then_some(was_proxy);
+        let was_ua = (self.s_ua.trim() != was_ua.trim()).then_some(was_ua);
+
         // ── 并发：只给档位，不给自由输入 ──
         // 用户要求"最大值 + 固定 1/2/4/8/16/32/64，本质还是自适应"：
         // 这里选的是**上限**，引擎会按服务器实际放行量自动收敛。
-        let mut save_conn = false;
+        //
+        // 从 m19629 起，这一项也是草稿：改动只动 `self.s_conn`，点「保存设置」
+        // 才写进配置。以前是"点一下立刻落盘"，用户想反悔只能自己记住原值再点回去。
         adl_ui::widgets::card(ui, |ui| {
-            adl_ui::widgets::section_title(ui, "并发上限");
+            dirty_title(ui, "并发上限", self.s_conn != was_conn);
             ui.add_space(4.0);
             let opts: [(u64, &str); 7] = [
                 (1, "1"),
@@ -2936,9 +3173,11 @@ impl App {
                 (32, "32"),
                 (64, "64"),
             ];
-            if let Some(v) = adl_ui::widgets::segmented(ui, self.s_conn, &opts) {
+            if let Some(v) = adl_ui::widgets::segmented(ui, "conn_limit", self.s_conn, &opts) {
                 self.s_conn = v;
-                save_conn = true;
+            }
+            if self.s_conn != was_conn {
+                adl_ui::widgets::hint_was(ui, &format!("原：{}", was_conn));
             }
             ui.add_space(6.0);
             adl_ui::widgets::hint(
@@ -2947,18 +3186,13 @@ impl App {
                  稳定后偶尔试探 +1，被拒就退回并把试探间隔翻倍，避免触发反爬。",
             );
         });
-        if save_conn {
-            let mut cfg = self.gui.cfg.lock().unwrap();
-            cfg.connections = adl_core::clamp_concurrency(self.s_conn as usize);
-            let _ = cfg.save();
-        }
 
         ui.add_space(12.0);
 
         // ── 限速：数值 + 单位选择（英文单位，中文读起来别扭）──
-        let mut save_limit = false;
         adl_ui::widgets::card(ui, |ui| {
-            adl_ui::widgets::section_title(ui, "限速");
+            let dirty = self.s_limit != was_limit || self.limit_unit != was_limit_unit;
+            dirty_title(ui, "限速", dirty);
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
@@ -2971,7 +3205,6 @@ impl App {
                 );
                 if resp.changed() {
                     self.s_limit = shown.saturating_mul(unit_scale.max(1) as u64);
-                    save_limit = true;
                 }
                 let units: [(&str, &str); 5] = [
                     ("auto", "自动"),
@@ -2991,7 +3224,6 @@ impl App {
                         for (v, l) in units {
                             if ui.selectable_value(&mut cur, v.to_string(), l).clicked() {
                                 self.limit_unit = v.to_string();
-                                save_limit = true;
                             }
                         }
                     });
@@ -3005,26 +3237,34 @@ impl App {
                 );
             });
             ui.add_space(6.0);
+            if dirty {
+                adl_ui::widgets::hint_was(
+                    ui,
+                    &format!(
+                        "原：{}（{}）",
+                        if was_limit == 0 {
+                            "不限速".to_string()
+                        } else {
+                            format_speed_unit(was_limit, &was_limit_unit)
+                        },
+                        was_limit_unit
+                    ),
+                );
+                ui.add_space(4.0);
+            }
             adl_ui::widgets::hint(
                 ui,
                 "0 = 不限速。限速是全局上限，所有任务共享同一个令牌桶。",
             );
         });
-        if save_limit {
-            let mut cfg = self.gui.cfg.lock().unwrap();
-            cfg.limit = self.s_limit;
-            cfg.limit_unit = self.limit_unit.clone();
-            let _ = cfg.save();
-        }
 
         ui.add_space(12.0);
 
         // ── 同时下载的任务数（队列上限）──
         // 这是"同时跑几条任务"，和上面的"并发上限"（一条任务开几条连接）是两回事：
         // 前者决定带宽怎么分给不同文件，后者决定单个文件能不能吃满带宽。
-        let mut save_max_tasks = false;
         adl_ui::widgets::card(ui, |ui| {
-            adl_ui::widgets::section_title(ui, "同时下载");
+            dirty_title(ui, "同时下载", self.s_max_tasks != was_max_tasks);
             ui.add_space(4.0);
             let opts: [(u64, &str); 7] = [
                 (1, "1"),
@@ -3035,15 +3275,11 @@ impl App {
                 (12, "12"),
                 (16, "16"),
             ];
-            if let Some(v) = adl_ui::widgets::segmented(
-                ui,
-                self.gui.cfg.lock().unwrap().max_concurrent_tasks as u64,
-                &opts,
-            ) {
-                let mut cfg = self.gui.cfg.lock().unwrap();
-                cfg.max_concurrent_tasks = v as usize;
-                let _ = cfg.save();
-                save_max_tasks = true;
+            if let Some(v) = adl_ui::widgets::segmented(ui, "max_tasks", self.s_max_tasks, &opts) {
+                self.s_max_tasks = v;
+            }
+            if self.s_max_tasks != was_max_tasks {
+                adl_ui::widgets::hint_was(ui, &format!("原：{}", was_max_tasks));
             }
             ui.add_space(6.0);
             adl_ui::widgets::hint(
@@ -3052,10 +3288,6 @@ impl App {
                  想先下某个文件，可以在任务列表里把它「继续」——它会被放回队首。",
             );
         });
-        if save_max_tasks {
-            // 调大上限之后，可能立刻就有空位了：推一把队列。
-            queue_fn::pump_queue(&self.gui);
-        }
 
         ui.add_space(12.0);
 
@@ -3067,12 +3299,15 @@ impl App {
         let mut fields = vec![
             adl_ui::Field::text("默认下载目录", &mut self.s_dir)
                 .hint("留空 = 系统的「下载」文件夹")
-                .action("选择…", "pick_dir"),
+                .action("选择…", "pick_dir")
+                .mark(was_dir.as_deref()),
             adl_ui::Field::text("HTTP 代理", &mut self.s_proxy)
-                .hint("http://127.0.0.1:7890（留空 = 直连）"),
+                .hint("http://127.0.0.1:7890（留空 = 直连）")
+                .mark(was_proxy.as_deref()),
             adl_ui::Field::text("User-Agent", &mut self.s_ua)
                 .hint("留空 = 内置的 Chrome 串（推荐）")
                 .action("填入 Chrome", "fill_ua")
+                .mark(was_ua.as_deref())
                 .note(
                     "有些站点只认特定客户端，可以在这里填整串 UA；\
                      单次覆盖在「新建下载」里填",
@@ -3097,13 +3332,21 @@ impl App {
             ("safe", "安全（只读观察 / 拦截）"),
             ("trusted", "信任（可改写请求 / 替换界面）"),
         ];
+        // 先算好"改没改"，再借 `self.s_mode`：写成
+        // `.mark((self.s_mode != was_mode).then_some(...))` 会和
+        // 同一个表达式里的 `&mut self.s_mode` 冲突（E0502）。
+        let mode_mark = (self.s_mode != was_mode).then_some(was_mode.as_str());
         let mut plug_fields = vec![
             adl_ui::Field::select("插件模式", &mut self.s_mode, &mode_opts)
+                .mark(mode_mark)
                 .note("信任模式下插件才能改写请求、注册按钮与替换内置页面"),
-            adl_ui::Field::text("插件目录", &mut self.s_plugin_dir)
-                .hint("留空 = exe 同级 plugins"),
         ];
         adl_ui::form(ui, "插件", &mut plug_fields);
+        // 插件目录不再可配（用户 m19629）：永远在 exe 同级的 plugins/ 下，
+        // 这里只说清楚位置，不给输入框。
+        if let Some(root) = plugins_root() {
+            adl_ui::widgets::hint(ui, &format!("插件目录：{}", root.display()));
+        }
 
         // ── 软件更新 ──
         // 只认 release 里挂的 .exe：没有 CI 的时候发布可能只带源码包，
@@ -3112,15 +3355,25 @@ impl App {
         let mut check_now = false;
         let mut download_now = false;
         let mut apply_now = false;
-        let mut toggle_check = false;
         adl_ui::widgets::card(ui, |ui| {
-            adl_ui::widgets::section_title(ui, "软件更新");
+            let dirty = self.s_check_update != was_check_update;
+            dirty_title(ui, "软件更新", dirty);
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
-                let mut on = self.gui.cfg.lock().unwrap().check_update;
+                let mut on = self.s_check_update;
                 if ui.checkbox(&mut on, "启动时检查更新").changed() {
-                    toggle_check = on;
+                    self.s_check_update = on;
+                }
+                if dirty {
+                    adl_ui::widgets::badge(
+                        ui,
+                        &format!(
+                            "原：{}",
+                            if was_check_update { "开启" } else { "关闭" }
+                        ),
+                        pal().warn,
+                    );
                 }
                 ui.add_space(6.0);
                 let busy = self.update_rx.is_some();
@@ -3219,11 +3472,6 @@ impl App {
                 }
             }
         });
-        if toggle_check {
-            let mut cfg = self.gui.cfg.lock().unwrap();
-            cfg.check_update = toggle_check;
-            let _ = cfg.save();
-        }
         if check_now {
             self.update_note = None;
             self.update_staged = None;
@@ -3259,28 +3507,32 @@ impl App {
         // ── 关闭行为 ──
         // 只有两个选项：问过一次之后就定下来了，"每次询问"不再是可选状态
         // （用户明确要求：选了就不能调回询问）。
+        //
+        // 从 m19629 起也是草稿：改动只动 `self.s_close_action`，点「保存设置」
+        // 才写进配置。真关窗口时的分派逻辑读的是配置，所以必须保存才生效 ——
+        // 这正是"先预演、再提交"该有的样子。
         ui.add_space(10.0);
         adl_ui::widgets::card(ui, |ui| {
-            adl_ui::widgets::section_title(ui, "关闭窗口时");
+            let dirty = self.s_close_action != was_close;
+            dirty_title(ui, "关闭窗口时", dirty);
             ui.add_space(6.0);
-            let cur = self.gui.cfg.lock().unwrap().close_action.clone();
-            let known = matches!(cur.as_str(), "tray" | "close");
-            let cur_s = if known { cur.clone() } else { "tray".to_string() };
+            let cfg_close = was_close.clone();
+            let known = matches!(cfg_close.as_str(), "tray" | "close");
             let opts: [(&str, &str); 2] = [("tray", "最小化到托盘"), ("close", "退出程序")];
-            let mut picked: Option<String> = None;
             ui.horizontal(|ui| {
                 for (v, l) in opts {
-                    if ui.selectable_label(cur_s == v, l).clicked() {
-                        picked = Some(v.to_string());
+                    if ui.selectable_label(self.s_close_action == v, l).clicked() {
+                        self.s_close_action = v.to_string();
                     }
                 }
             });
-            if let Some(v) = picked {
-                if !known || v != cur_s {
-                    let mut cfg = self.gui.cfg.lock().unwrap();
-                    cfg.close_action = v;
-                    let _ = cfg.save();
-                }
+            if dirty {
+                let was_label = if cfg_close == "close" {
+                    "退出程序"
+                } else {
+                    "最小化到托盘"
+                };
+                adl_ui::widgets::hint_was(ui, &format!("原：{was_label}"));
             }
             ui.add_space(6.0);
             adl_ui::widgets::hint(
@@ -3294,16 +3546,8 @@ impl App {
             );
         });
 
-        ui.add_space(14.0);
-        let mut save = false;
-        adl_ui::widgets::card(ui, |ui| {
-            if ui.button("保存设置").clicked() {
-                save = true;
-            }
-        });
-        if save {
-            self.do_save_settings();
-        }
+        // 底部不再放「保存设置」——它已经固定到页面顶部了（见 `settings_bar`）。
+        // 这里只留一点空白，和上面的插件设置区隔开。
 
         // 插件设置区
         let settings = self
@@ -4669,7 +4913,7 @@ fn run_pending_uninstall(gui: &Arc<Gui>) {
         if cfg.pending_uninstall.is_empty() {
             return;
         }
-        (cfg.pending_uninstall.clone(), plugins_root(&cfg))
+        (cfg.pending_uninstall.clone(), plugins_root())
     };
     let Some(root) = root else {
         return;
@@ -4717,7 +4961,7 @@ fn find_plugin_dir(root: &std::path::Path, id: &str) -> Option<PathBuf> {
 
 fn build_hooks(cfg: &Config) -> Arc<PluginHooks> {
     let mode = if cfg.mode_trusted() { Mode::Trusted } else { Mode::Safe };
-    match plugins_root(cfg) {
+    match plugins_root() {
         Some(dir) if dir.is_dir() => {
             let all = adl_plugin::load_dir(&dir, mode);
             let kept: Vec<_> = all
@@ -4812,10 +5056,14 @@ fn settings_json(cfg: &Config) -> Value {
         "dir": cfg.dir,
         "connections": cfg.connections,
         "limit": cfg.limit,
+        "limit_unit": cfg.limit_unit,
         "proxy": cfg.proxy,
         "mode": cfg.mode,
         "http1": cfg.http1,
-        "plugin_dir": cfg.plugin_dir,
+        "user_agent": cfg.user_agent,
+        "max_concurrent_tasks": cfg.max_concurrent_tasks,
+        "check_update": cfg.check_update,
+        "close_action": cfg.close_action,
     })
 }
 
@@ -4839,13 +5087,22 @@ fn set_settings(gui: &Arc<Gui>, args: &Value) -> Result<Value, String> {
     if let Some(h) = args.get("http1").and_then(|x| x.as_bool()) {
         cfg.http1 = h;
     }
-    if let Some(pd) = args.get("plugin_dir").and_then(|x| x.as_str()) {
-        cfg.plugin_dir = pd.to_string();
-    }
     // 空字符串表示"用内置默认 UA"，不是"没有 UA" —— 引擎侧
     // `user_agent_opt()` 会把空串当 None，再退回默认 Chrome 串。
     if let Some(ua) = args.get("user_agent").and_then(|x| x.as_str()) {
         cfg.user_agent = ua.trim().to_string();
+    }
+    if let Some(n) = args.get("max_concurrent_tasks").and_then(|x| x.as_u64()) {
+        cfg.max_concurrent_tasks = (n as usize).clamp(1, 16);
+    }
+    if let Some(b) = args.get("check_update").and_then(|x| x.as_bool()) {
+        cfg.check_update = b;
+    }
+    if let Some(a) = args.get("close_action").and_then(|x| x.as_str()) {
+        cfg.close_action = a.to_string();
+    }
+    if let Some(u) = args.get("limit_unit").and_then(|x| x.as_str()) {
+        cfg.limit_unit = u.to_string();
     }
     cfg.save().map_err(|e| format!("保存配置失败: {e}"))?;
     let snapshot = settings_json(&cfg);
@@ -4858,24 +5115,114 @@ fn set_settings(gui: &Arc<Gui>, args: &Value) -> Result<Value, String> {
 
 // ───────────────────────── 入口 ─────────────────────────
 
-fn make_icon() -> Option<Icon> {
-    let (w, h) = (32u32, 32u32);
-    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-    for y in 0..h {
-        for x in 0..w {
-            let edge = x < 2 || y < 2 || x >= w - 2 || y >= h - 2;
-            let px = if edge {
-                [0x2Eu8, 0x7D, 0x6B, 0xFF]
-            } else {
-                [0x4Au8, 0x9E, 0x9E, 0xFF]
-            };
-            rgba.extend_from_slice(&px);
+/// 画图标像素：圆角方块 + 中间一个向下的箭头。
+///
+/// 早先这里画的是**全不透明**的方块：alpha 恒 `0xFF`、从边到边铺满，于是
+/// 在托盘里就是一块纯色方砖 —— 用户报的"托盘还没有"，一半原因就是这个
+/// 形状根本看不出是个图标，另一半是下面 `build_tray` 把错误 `.ok()` 掉了，
+/// 就算注册失败界面上也毫无提示。
+///
+/// 现在按圆角矩形的符号距离场算覆盖率：圆角外是真透明（`alpha = 0`），
+/// 边缘留 1px 抗锯齿。托盘图标在 100% 缩放下实际只有 16×16，圆角给到 7
+/// 大了会糊成一个点，小了又和方砖没区别 —— 所以各尺寸都按边长比例算，
+/// 16、32、64 看起来才是同一个图标。
+fn icon_rgba(size: u32) -> Vec<u8> {
+    let n = size as f32;
+    let half = n * 0.5;
+    // 以下比例都从 32×32 的调参值折算而来，见函数上方注释。
+    let r = n * 0.21875;
+    let stem_hw = n * 0.08125;
+    let stem_top = -n * 0.21875;
+    let stem_bot = n * 0.03125;
+    let head_top = n * 0.015625;
+    let head_bot = n * 0.25;
+
+    // 底色用主题的青绿（#2E7D6B），箭头用白 —— 深色/浅色任务栏上都看得清。
+    const BG: [f32; 3] = [0x2E as f32, 0x7D as f32, 0x6B as f32];
+    const FG: [f32; 3] = [0xF2 as f32, 0xF7 as f32, 0xF6 as f32];
+
+    let mut rgba = Vec::with_capacity((size * size * 4) as usize);
+    for y in 0..size {
+        for x in 0..size {
+            // 像素中心，坐标系原点在图标正中。
+            let px = x as f32 + 0.5 - half;
+            let py = y as f32 + 0.5 - half;
+
+            // 圆角矩形 SDF：到"内缩 r 的矩形"的距离再减 r。
+            let qx = (px.abs() - (half - r)).max(0.0);
+            let qy = (py.abs() - (half - r)).max(0.0);
+            let d_rect = (qx * qx + qy * qy).sqrt() - r;
+            let cover = (0.5 - d_rect).clamp(0.0, 1.0);
+            if cover <= 0.0 {
+                rgba.extend_from_slice(&[0, 0, 0, 0]);
+                continue;
+            }
+
+            // 箭头 = 竖杆 + 三角头（两者取并集，即 SDF 取 min）。
+            let d_stem = (px.abs() - stem_hw).max(stem_top - py).max(py - stem_bot);
+            let head_hw = ((head_bot - py) * 0.95).max(0.0);
+            let d_head = (px.abs() - head_hw).max(head_top - py).max(py - head_bot);
+            let d_arrow = d_stem.min(d_head);
+            let arrow = (0.5 - d_arrow).clamp(0.0, 1.0);
+
+            let mut rgb = [0u8; 3];
+            for i in 0..3 {
+                rgb[i] = (BG[i] + (FG[i] - BG[i]) * arrow).round() as u8;
+            }
+            rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], (cover * 255.0).round() as u8]);
         }
     }
-    Icon::from_rgba(rgba, w, h).ok()
+    rgba
+}
+
+/// 托盘用的 32×32 图标。
+fn make_icon() -> Option<Icon> {
+    Icon::from_rgba(icon_rgba(32), 32, 32).ok()
+}
+
+/// 窗口图标（任务栏 / Alt+Tab 用）。
+///
+/// 和托盘图标同一套几何，但画大一点：`with_icon` 给的是原图，系统按需缩放，
+/// 32×32 直接放大到 150% 缩放的任务栏会发虚，给 64×64 更稳。
+fn make_window_icon() -> egui::IconData {
+    let size = 64;
+    egui::IconData {
+        rgba: icon_rgba(size),
+        width: size,
+        height: size,
+    }
 }
 
 fn build_tray() -> Option<TrayIcon> {
+    // 先按"带 GUID"建一次：GUID 能让 Windows 记住用户把图标摆在溢出区还是
+    // 钉在任务栏上。个别机器上 NIF_GUID 会注册失败（`rect()` 问不到位置），
+    // 那就退回不带 GUID 的老式 `hWnd + uID` 身份 —— 宁可下次启动图标归回
+    // 溢出区，也不要干脆没有图标。
+    match build_tray_inner(true) {
+        Some(t) if t.rect().is_some() => {
+            eprintln!("[tray] 托盘图标已注册（GUID 身份）");
+            return Some(t);
+        }
+        _ => {}
+    }
+    eprintln!("[tray] 带 GUID 没注册上，改试不带 GUID 的老式身份");
+    match build_tray_inner(false) {
+        Some(t) => {
+            if t.rect().is_some() {
+                eprintln!("[tray] 托盘图标已注册（hWnd + uID 身份）");
+            } else {
+                // 注册不上最常见的原因是本进程跑在 Low 完整性级别（沙箱/受限
+                // 令牌）：那种情况下 Shell_NotifyIconW 直接返回 FALSE + 5。
+                // 这里留一行，用户报"没有托盘图标"时至少能对上号。
+                eprintln!("[tray] 托盘图标没能注册到任务栏（进程被降权，或 explorer 未响应）");
+            }
+            Some(t)
+        }
+        None => None,
+    }
+}
+
+fn build_tray_inner(use_guid: bool) -> Option<TrayIcon> {
     let menu = Menu::new();
     let show = MenuItem::with_id("show", "显示主界面", true, None);
     let quit = MenuItem::with_id("quit", "退出", true, None);
@@ -4884,10 +5231,24 @@ fn build_tray() -> Option<TrayIcon> {
     let mut b = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip("ADL 下载器");
+    if use_guid {
+        // 固定身份：Windows 用 GUID 记住"固定到任务栏 / 收进溢出区"。
+        // 不给 GUID 时身份是「exe 路径 + 进程序号」，每次启动都是新图标，
+        // 用户把它拖出溢出区之后下次启动又回去了。
+        b = b.with_guid(TRAY_GUID);
+    }
     if let Some(ic) = make_icon() {
         b = b.with_icon(ic);
     }
-    b.build().ok()
+    match b.build() {
+        Ok(t) => Some(t),
+        Err(e) => {
+            // 以前这里是 `.ok()`：注册失败静默返回 None，界面上完全看不出
+            // 托盘没起来。至少留一行 stderr，排查时能知道是这一步挂的。
+            eprintln!("[tray] 托盘图标创建失败（use_guid={use_guid}）: {e}");
+            None
+        }
+    }
 }
 
 fn main() -> eframe::Result {
@@ -5005,6 +5366,9 @@ fn main() -> eframe::Result {
             .with_inner_size([1040.0, 700.0])
             .with_min_inner_size([760.0, 520.0])
             .with_title("ADL 下载器")
+            // 任务栏 / Alt+Tab 的窗口图标。exe 文件本身的图标在 PE 资源里
+            // （assets/adl.rc，由 build.rs 编译进去），两者是分开的两处。
+            .with_icon(make_window_icon())
             // 关掉系统标题栏，自己画（见 App::titlebar）。
             // 代价：系统不再提供边缘缩放，八向热区由 resize_borders() 铺。
             .with_decorations(false),

@@ -814,11 +814,13 @@ impl App {
                             cfg.proxy.clone()
                         },
                         cfg.mode,
-                        if cfg.plugin_dir.is_empty() {
-                            "exe 同级 plugins".to_string()
-                        } else {
-                            cfg.plugin_dir.clone()
-                        },
+                        // 插件目录固定为 exe 同级 plugins/（用户 m19629），
+                        // 这里只是把实际位置报出来，告诉用户插件装在哪儿。
+                        std::env::current_exe()
+                            .ok()
+                            .and_then(|p| p.parent().map(|d| d.join("plugins")))
+                            .map(|d| d.display().to_string().replace('\\', "/"))
+                            .unwrap_or_else(|| "exe 同级 plugins".to_string()),
                     ),
                 );
             }

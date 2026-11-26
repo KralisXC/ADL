@@ -48,10 +48,25 @@ adl config [--init]             # 查看/生成配置文件
 
 ### 配置文件
 
-`adl config --init` 会在 `%LOCALAPPDATA%\ADL\config.toml`（或 exe 同级 `config.toml`，若存在则优先）生成模板：
+所有运行时数据都放在 **exe 同级的 `data/`** 目录里（绿色版整个文件夹拷走即可）：
+
+| 文件 | 内容 |
+|---|---|
+| `data/config.toml` | 主配置 |
+| `data/tasks.json` | 任务列表（重启后自动恢复） |
+| `data/history.json` | 完成历史（主页热力图用它） |
+| `data/notices.json` | 消息中心 |
+| `data/plugin-settings/<id>.json` | 每个插件的独立设置 |
+| `data/cache/` | 插件市场下载的临时包 |
+| `data/update/` | 自动更新的新 exe |
+
+只有**默认下载目录**跟着系统走（Windows 是「下载」文件夹，Linux 读 `XDG_DOWNLOAD_DIR`）。
+`data/` 写不进去时（比如装在 `C:\Program Files`）会回退到 `%LOCALAPPDATA%\ADL` 并打印一行提示。
+
+`adl config --init` 生成的模板：
 
 ```toml
-dir = "."
+dir = ""              # 空 = 系统的「下载」文件夹
 connections = 16
 chunk_size = 0        # 0 = 按文件大小自动分配
 limit = 0             # 字节/秒，0 = 不限
@@ -59,12 +74,18 @@ user_agent = ""       # 空 = 内置浏览器 UA
 http1 = false
 proxy = ""            # 例如 "http://127.0.0.1:7890"
 mode = "safe"         # safe | trusted
-plugin_dir = ""       # 空 = exe 同级 plugins/
 history_enabled = true
-close_action = ""     # "" = 每次询问 | "tray" = 最小化到托盘 | "close" = 退出程序
+close_action = "tray" # "tray" = 最小化到托盘 | "close" = 退出程序
 limit_unit = "auto"   # auto | B/s | KB/s | MB/s | GB/s（只影响显示）
 sidebar_collapsed = false
+max_concurrent_tasks = 3   # 同时下载几条任务（1-16）
+task_sort = "status"       # status | added | name | size | progress
+task_filter = "all"        # all | downloading | queued | paused | completed | failed
+check_update = true        # 启动时检查 GitHub release
+market_url = ""            # 空 = 官方扩展中心的 index.json
 ```
+
+插件目录固定为 **exe 同级的 `plugins/`**（不再可配）。
 
 命令行的显式参数会覆盖配置里的同名项。
 
@@ -91,13 +112,13 @@ cargo build --release -p adl-gui
 - **左右式外壳**：标题栏（左上折叠键 + 右侧窗口三键）与左侧栏同色连成一整块；内容区浅灰底、**左上角圆角**浮在上面。**不画装饰性分隔线**，边界全靠底色差；只有表头下沿保留一条 0.6px 的极淡线（`palette.hair`），页面标题下用一条更浅的黑色细线（`widgets::rule`）。
 - **顶栏 chips**：`标准模式`/限速档位（不限速时显示"标准模式"，点开可选 不限速 / 1·2·5·10 MB/s 直接切换）· `N 条线路`（进行中任务的活跃连接数之和）· `完成 N 总计 M`（点开是任务卡片列表，每行可点直接跳任务列表，右上角可「清空已完成」）。三个 chip 带手画图标（表盘 / 服务器机架 / 菱形堆叠），不依赖字体符号。
 - **侧栏**：顶部只写 `ADL` 三个字（无方块图标）→ `+ 新建下载` → 主页 / 任务列表 / 插件 / 终端 → 插件页面（一条细线分隔后紧接，不再有小字分组标题）→ 底部「消息」在「设置」正上方，下面是模式胶囊。**可完全收起**（不留窄轨，收起时品牌字一起消失），收起/展开是 0.22 秒的宽度动画；折叠键图标固定为带竖线的圆角矩形，不随状态变化。
-- **常驻「插件」页**（`ADL_TAB=plugins`，代码在独立文件 `crates/adl-gui/src/plugins.rs`）：仿 DSH 布局 —— 顶部「刷新」，下面「已安装 / 插件市场」两个页签。已安装页先把插件分成**内置插件**（`com.adl.*`，程序自带、只展示不给开关 —— 这里面除了真插件，还**把终端也列进来**：它不是 QuickJS 插件、没有 `plugin.toml`，但属于程序自带能力，混在同一组里能一眼看全 ADL 有什么）和**已安装插件**（你自己放进目录的，右侧开关可启停），每项显示版本、描述、生效/被安全模式挡住的 hook、声明的权限；开关直接写回 `config.toml` 并立刻重建插件集合。停用的插件仍留在列表底部，随时能再启用。右上角「从压缩包安装…」直接选一个 zip 就能装（装完自动删包）。**插件市场目前是空壳**（只说明将来接官方源 `github.com/KralisXC/adl-extensions`，不做假列表）。
+- **常驻「插件」页**（`ADL_TAB=plugins`，代码在独立文件 `crates/adl-gui/src/plugins.rs`）：仿 DSH 布局 —— 顶部「刷新」，下面「已安装 / 插件市场」两个页签。已安装页先把插件分成**内置插件**（`com.adl.*`，程序自带、只展示不给开关 —— 这里面除了真插件，还**把终端也列进来**：它不是 QuickJS 插件、没有 `plugin.toml`，但属于程序自带能力，混在同一组里能一眼看全 ADL 有什么）和**已安装插件**（你自己放进目录的，右侧开关可启停），每项显示版本、描述、生效/被安全模式挡住的 hook、声明的权限；开关直接写回 `config.toml` 并立刻重建插件集合。停用的插件仍留在列表底部，随时能再启用。右上角「从压缩包安装…」直接选一个 zip 就能装（装完自动删包）。**插件市场页读扩展中心的 `index.json`**，列出可装的扩展，点「安装」就下载 → 比对 `sha256` → 解压 → 删包（详见下文「插件」节）。
 - **消息中心**：下载完成 / 失败 / 插件 `notify` 提醒都会落成一条消息（`notices.json`，最多 200 条），侧栏入口带未读数；每条消息是 **alert 样式**（级别底色块 + 左侧色条，绿=提示、橙=注意、红=失败），一眼分得清。同时右下角弹一个 4 秒的 toast，点它直接跳到「消息」页。支持「全部已读」「清空」。
 - **终端页**（`ADL_TAB=terminal`，Ctrl+K 直达，代码在独立文件 `crates/adl-gui/src/terminal.rs`）：仿 PowerShell 的深色控制台 —— 无描边、**启动只有一行用法提示**（原来照 PowerShell 摆的 `ADL 终端 <版本>` 那行已删）、**`PS ADL>` 提示符**（`PS` 青绿、`ADL>` 蓝；不再显示绝对路径 —— Windows 的 `canonicalize` 会返回 `\\?\E:\...`，屏幕上变成 `//?/E:/...`，而且长路径会把每行都挤断；目录用 `cd` 看）、**输入行就在日志末尾**（跟在最后一条输出后面接着打，不是钉在框底）、**输入的文字与提示符严格同基线**（`TextEdit` 显式 12.5 号 monospace + `Align2::LEFT_CENTER`，否则它会贴在自己 30px 高的框顶，比提示符高出一截）、**边打字边着色**（已识别的命令显绿、`-` 开头显黄、子命令显蓝）、滚动历史最多 500 行，`↑/↓` 翻历史、`Tab` 循环补全、`Esc` 清空输入。**敲过的行连提示符一起留在屏幕上**（`PS ADL> ver` 整条保留，和真 PowerShell 一样）、**`Tab` 补完光标跟到词尾**（补全/翻历史是整行替换，光标会手工复位，不会卡在原来那个字后面）、**空输入时光标不再偏低**（根因是空串的 `LayoutJob` 没有 section、galley 高度为 0，光标拿它居中后整体低半行；在 `term_layouter` 里给空串补一个零宽 section 并钉死 `line_height` 即可）。`help` 输出照 `Get-Help` 的形状排（主题 / 简短说明 / 详细说明 / 参数 / 联机帮助，两空格缩进、同色系，没有色块和卡片）。输出分六级（横幅 / 回显 / 正常 / 提示 / 警告 / 错误），警告单独一色是抄 PowerShell 的多流设计。命令：`help` / `clear` / `tasks` / `add <url> [文件名]` / `pause <id>|all` / `resume <id>` / `rm <id>` / `open <id>` / `cd [目录]` / `history` / `ver` / `settings` / `set dir|connections|limit` / `mode safe|trusted` / `plugin list` / `plugin run <插件> <命令>`。`help` 的命令表与 Tab 补全共用 `TERM_COMMANDS` 一份，不会出现"补得出来但 help 里没有"。
 
 ![插件管理页](docs/images/ui-plugins.png)
 
-![插件市场（空壳）](docs/images/ui-plugin-market.png)
+![插件市场](docs/images/ui-plugin-market.png)
 
 ![消息中心](docs/images/ui-notices.png)
 
@@ -120,6 +141,9 @@ cargo build --release -p adl-gui
 - 单实例（再次启动会唤醒已有窗口）、托盘（点托盘「显示主界面」恢复）、系统休眠自动暂停。
 - 与 CLI 共用 `adl-core` 引擎、`adl-plugin` 插件、`adl-app` 配置/历史；浏览器接管 API 同进程运行。
 - **设置项只给档位**：并发 7 档（1/2/4/8/16/32/64，本质仍是自适应）；限速 = 数值 + 单位（自动 / B/s / KB/s / MB/s / GB/s，用英文单位）；**同时下载** 7 档（1/2/3/5/8/12/16 条任务，与"一条任务开几条连接"是两个维度）。HTTP/1.1 不再由用户选（引擎自动）。
+- **设置改的是草稿，点「保存设置」才生效**：顶部固定一条「保存设置」栏（不随页面滚动），左边显示「没有未保存的更改」/「已更改 N 项」，右边「取消」（撤销全部改动）+「保存设置」。改过的卡片标题会变**绿**并挂「已修改」角标，被改的那一项下面用**黄字**标出「原：16」—— 一眼看得出将要改掉什么。取消把全部草稿退回已保存值。
+- **程序图标**：`assets/adl.ico`（7 个尺寸）通过 `build.rs` + `rc.exe` 嵌进 PE 资源，资源管理器 / 任务栏 / Alt+Tab 都是青绿圆角方块 + 白色下箭头；窗口图标另走 `ViewportBuilder::with_icon`。版本信息（`FileVersion` / `ProductName` / `CompanyName`）也一并写进资源。
+- **托盘图标**按 GUID 固定身份（Windows 记得用户把它摆在溢出区还是钉在任务栏上）；带 GUID 注册失败时自动退回老式 `hWnd + uID` 身份，并往 stderr 留一行日志。
 
 > **渲染后端可切换**（环境变量 `ADL_RENDERER`）：
 > - 不设 / `glow`：OpenGL，**默认**，兼容性最好（虚拟机、远程桌面、老核显都能开）。
@@ -319,6 +343,12 @@ adl.notify({ title: "下载完成", body: "report.pdf · 12.4 MB" });
 - ✅ **插件市场接通** `index.json`（列表 / 一键安装 / sha256 校验 / 装完删包，可换源）
 - ✅ **检查更新接 GitHub Releases**（启动时自动查，发现新版可下载并「重启并安装」；只认 asset 里的 `.exe`，换文件用改名再写回、失败自动回滚）
 - ✅ 删掉遗留的 `web/`（Vue）
+- ✅ **数据目录统一到 exe 同级 `data/`**（配置 / 任务表 / 历史 / 消息 / 插件设置 / 缓存 / 更新包；写不进去才回退 `%LOCALAPPDATA%`）
+- ✅ **插件目录固定为 exe 同级 `plugins/`**（不再可配，设置里只读显示路径）
+- ✅ **自动更新改走 GitHub API 端点**（网页端点对非浏览器请求回 406；零 release 时是 200 + 空数组，两种都给了人话提示）
+- ✅ **设置页草稿模式**：改动绿、原值黄、顶部「已更改 N 项」+ 取消，点「保存设置」才落盘
+- ✅ 修掉「并发上限」与「同时下载」两个分段控件交互 id 撞车（点一个另一个跟着动）
+- ✅ 程序图标（`.ico` 嵌 PE 资源 + 版本信息 + 窗口图标）；托盘图标按 GUID 固定身份并带兜底
 - ⛔ **剪贴板监听不做**（自动嗅探剪贴板里复制的 URL 太吵；Ctrl+V 粘贴一直在）
 
 设计文档见 [docs/DESIGN.md](docs/DESIGN.md)。

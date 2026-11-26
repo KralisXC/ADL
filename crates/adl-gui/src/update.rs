@@ -20,7 +20,12 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 /// 最新 release 的元数据接口。
-pub const DEFAULT_RELEASES_API: &str = "https://github.com/KralisXC/ADL/releases/latest";
+///
+/// 必须是 `api.github.com`，**不能**用 `github.com/<repo>/releases/latest`：
+/// 后者是给人看的网页端点，会 302 到带标签的 HTML 页，而我们发的是普通
+/// HTTP 请求（不是浏览器），GitHub 直接回 **406 Not Acceptable**。用户
+/// m19629 报的"获取的是返回 http 406"就是这个原因。
+pub const DEFAULT_RELEASES_API: &str = "https://api.github.com/repos/KralisXC/ADL/releases/latest";
 
 /// 当前版本（编进二进制的 crate 版本）。
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -138,14 +143,38 @@ pub async fn fetch_latest(client: &reqwest::Client, url: &str) -> Result<Release
         .send()
         .await
         .map_err(|e| format!("连不上 GitHub: {e}"))?;
-    if resp.status().as_u16() == 404 {
-        return Err("这个仓库还没有发布任何 release".to_string());
+    let code = resp.status().as_u16();
+    match code {
+        // `/releases/latest` 在仓库一个 release 都没有时就是 404（不是空数组）。
+        404 => return Err("这个仓库还没有发布任何 release".to_string()),
+        // 走成网页端点了（见 `DEFAULT_RELEASES_API` 的注释）。这是配置写错，
+        // 不是网络问题，所以给一句能直接改的话。
+        406 => {
+            return Err(
+                "GitHub 拒绝了这次请求（406）。请把发布接口改成 \
+                 https://api.github.com/repos/KralisXC/ADL/releases/latest"
+                    .to_string(),
+            )
+        }
+        // 未认证的 GitHub API 每小时 60 次；连着点会撞上。
+        403 | 429 => {
+            return Err("GitHub 接口调用太频繁了，过一会儿再试".to_string());
+        }
+        _ => {}
     }
     if !resp.status().is_success() {
-        return Err(format!("GitHub 返回 HTTP {}", resp.status().as_u16()));
+        return Err(format!("GitHub 返回 HTTP {code}"));
     }
     let text = resp.text().await.map_err(|e| format!("读取发布信息失败: {e}"))?;
-    parse_release(&text)
+    // 用 `/releases`（复数）当接口时，没有 release 会返回 `[]`，解析出来
+    // 是"没有 tag_name"。和 404 归成同一句话，别让用户看到技术细节。
+    parse_release(&text).map_err(|e| {
+        if e.contains("tag_name") {
+            "这个仓库还没有发布任何 release".to_string()
+        } else {
+            e
+        }
+    })
 }
 
 /// 更新文件放哪儿：`app_data/update/`。

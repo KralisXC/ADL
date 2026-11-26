@@ -26,11 +26,18 @@ adl-ui = { path = "../adl-ui" }
 # 下载地址、Ctrl+C 也拷不走文件路径，界面上完全没反应，看着像"输入框坏了"。
 # `links` 顺带开：插件页里将来会有文档链接。
 #
+# 🔴 `accesskit` 同样在 default 里、同样被关掉了 —— 它开着的时候 egui 会把整棵
+# 控件树通过 Windows UI Automation 暴露出去。少它的后果不是功能坏了，而是
+# **界面对自动化完全不可见**：按名字找按钮、读标签文字全都做不到，只能拿截图
+# 对比像素去猜坐标（本机 DPI 150%，窗口原点还会随启动变化，猜一次错一次）。
+# 打开之后 `mcp__windows__Snapshot` 能直接列出「保存设置」「并发上限 8」这类控件。
+#
 # 🔴 `x11` / `wayland` 也是 default 里的，同样被关掉了 —— 在 Linux 上
 # 少了它们 winit 建不出窗口，程序启动即 panic「no compatible backend」。
 # 这两个 feature 在 Windows/macOS 上是空操作（winit 内部按 cfg(unix) 才编
 # x11-dl / wayland-client），所以无条件开着最省心。
 eframe = { version = "0.37", default-features = false, features = [
+    "accesskit",
     "clipboard",
     "glow",
     "wgpu",
@@ -76,6 +83,9 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_UI_Controls",
     "Win32_UI_Controls_Dialogs",
 ] }
+
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3.0.12"
 # Linux / BSD：tray-icon 必须补一个后端，否则 lib.rs:128 直接 compile_error!
 # （`either the libappindicator or ksni feature must be enabled on Linux and BSD`）。
 # 选 ksni：纯 Rust + zbus，不依赖 GTK / AppIndicator 的 C 库，也不用装 libxdo。

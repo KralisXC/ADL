@@ -78,12 +78,17 @@ fn permission_labels(v: Option<&Value>) -> Vec<(String, bool)> {
     out
 }
 
-pub(crate) fn plugins_root(cfg: &Config) -> Option<PathBuf> {
-    cfg.plugin_dir_opt().or_else(|| {
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.join("plugins")))
-    })
+/// 插件根目录：**永远**是 exe 同级的 `plugins/`。
+///
+/// 用户 m19629：「插件储存位置还是直接固定吧（放在 exe 同根目录的 plugins
+/// 文件夹（每个插件记得分类））」。以前这里允许配置里改一个 `plugin_dir`，
+/// 结果同一个软件在两台机器上插件放在完全不同的地方，排错时还得先问
+/// "你的插件目录指哪儿了"。现在固定下来，每个插件占一个子目录，名字就是
+/// manifest 里的 id（安装器与卸载都按这个走）。
+pub(crate) fn plugins_root() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("plugins")))
 }
 
 /// 补上「已停用」的插件条目。
@@ -199,10 +204,7 @@ impl App {
         }));
 
         // 顶部：目录位置 + 两个动作
-        let root = {
-            let cfg = self.gui.cfg.lock().unwrap();
-            plugins_root(&cfg)
-        };
+        let root = plugins_root();
 
         // 停用的插件不在快照里（没被加载），得从目录补回来，否则停用一次
         // 就再也点不到「启用」了。
@@ -269,7 +271,7 @@ impl App {
             (PluginsTab::Installed, "已安装"),
             (PluginsTab::Market, "插件市场"),
         ];
-        if let Some(t) = adl_ui::widgets::segmented(ui, self.plugins_tab, &tabs) {
+        if let Some(t) = adl_ui::widgets::segmented(ui, "plugins_tab", self.plugins_tab, &tabs) {
             self.plugins_tab = t;
         }
         ui.add_space(12.0);

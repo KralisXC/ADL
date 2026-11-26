@@ -3,7 +3,9 @@
 //! 这里只放"长得不能只靠 `ui.add(...)` 一句话说清"的控件。
 //! 普通按钮、输入框不必包 —— 包的越多，反而离 egui 越远。
 
-use egui::{Align, Color32, CornerRadius, FontId, Layout, Rect, Response, Sense, Ui, vec2};
+use egui::{
+    Align, Color32, CornerRadius, FontId, Layout, Rect, Response, Role, Sense, Ui, WidgetInfo, vec2,
+};
 
 use super::theme::Theme;
 
@@ -276,6 +278,19 @@ pub fn hint(ui: &mut Ui, text: &str) {
         egui::RichText::new(text)
             .small()
             .color(th.palette.muted),
+    );
+}
+
+/// 草稿模式下"原值是多少"那行小字。
+///
+/// 用 `warn` 而不是 `muted`：这行的意思是"你将要改掉这个值"，
+/// 和普通说明文字不是一回事，灰色会被当成又一条 hint 略过。
+pub fn hint_was(ui: &mut Ui, text: &str) {
+    let th = Theme::from_ui(ui);
+    ui.label(
+        egui::RichText::new(text)
+            .small()
+            .color(th.palette.warn),
     );
 }
 
@@ -598,7 +613,18 @@ fn chip_impl(
 /// 分段选择器（并发档位、热力图范围切换）。
 ///
 /// 返回 `Some(值)` 表示本帧用户点选了另一个选项。
-pub fn segmented<T: PartialEq + Copy>(ui: &mut Ui, current: T, items: &[(T, &str)]) -> Option<T> {
+///
+/// `id_salt` 必须**每个调用点都不一样**：格子的交互 id 是
+/// `ui.scope_id().with((id_salt, i))`，而 `ui.scope_id()` 在同一张页面里
+/// 对所有卡片都是同一个值 —— 同页放两个分段控件（设置页的"并发上限"和
+/// "同时下载"）时 id 会逐格撞车，点前者的第 4 格后者的第 4 格也一起响应，
+/// 表现为"调同时下载把并发上限也改了，而且并发手动调不动"。
+pub fn segmented<T: PartialEq + Copy>(
+    ui: &mut Ui,
+    id_salt: &str,
+    current: T,
+    items: &[(T, &str)],
+) -> Option<T> {
     let th = Theme::from_ui(ui);
     let p = &th.palette;
     let font = FontId::proportional(th.text.small);
@@ -623,8 +649,12 @@ pub fn segmented<T: PartialEq + Copy>(ui: &mut Ui, current: T, items: &[(T, &str
     let mut x = bg_rect.left() + 2.0;
     for (i, (value, label)) in items.iter().enumerate() {
         let rect = Rect::from_min_size(egui::pos2(x, bg_rect.top() + 2.0), vec2(widths[i], h));
-        let resp = ui.interact(rect, ui.scope_id().with(("seg", i)), Sense::click());
+        let resp = ui.interact(rect, ui.scope_id().with((id_salt, i)), Sense::click());
         let on = *value == current;
+        // 自绘控件必须自己登记 WidgetInfo，否则屏幕阅读器（以及任何基于
+        // UI Automation 的自动化）看不到这一格 —— 界面上明明有"8"，
+        // 控件树里却什么都没有。
+        resp.widget_info(|| WidgetInfo::selected(Role::RadioButton, true, on, *label));
         if on {
             ui.painter()
                 .rect_filled(rect, CornerRadius::same(th.radius.pill), p.card);

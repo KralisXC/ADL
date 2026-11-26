@@ -1,0 +1,55 @@
+// 程序图标 + 版本信息。
+//
+// 这里**故意不 `#include <winres.h>`**：embed-resource 只在它自己去找
+// rc.exe 的那条路径上才会把 Windows SDK 的 Include 目录塞进 %INCLUDE%，
+// 一旦环境里已经有 `RC` 变量就走另一条分支、%INCLUDE% 仍是空的，
+// rc.exe 立刻报 `RC1015: cannot open include file 'winres.h'`。
+// winres.h 里我们实际只用到几个常量，直接写字面量最省事，也不再依赖 SDK 路径。
+//
+//   VS_FFI_FILEFLAGSMASK = 0x3F        VOS_NT_WINDOWS32 = 0x40004
+//   VFT_APP              = 0x1         FILESUBTYPE 用 0
+//
+// 下面这行是必须的：本文件是 UTF-8，而 rc.exe 默认按系统的 ANSI 代码页
+// （本机 936/GBK）读源文件，不声明就会把 "ADL 下载器" 这几个字读成乱码，
+// 更糟的是部分 UTF-8 字节序列会让它在 VERSIONINFO 块里解析失败。
+#pragma code_page(65001)
+
+// 资源 ID 用 1 —— Windows 在资源管理器 / Alt+Tab / 任务栏上取的就是
+// 序数最小的 ICON 资源，写成 IDI_ICON1 之类反而要多一步才能认出来。
+1 ICON "adl.ico"
+
+// 这里写 `1` 而不是 `VS_VERSION_INFO`：winver.h 里 `VS_VERSION_INFO` 就是
+// 宏 = 1，我们用字面量把 include 去掉之后就必须自己写 1。
+// 名字写成字符串 "VS_VERSION_INFO" 时 rc.exe 也照样收，但资源名就成了字符串，
+// version.dll 是按**整数 ID 1 + RT_VERSION** 去找的 —— 于是 GetFileVersionInfo
+// 直接返回 ERROR_RESOURCE_TYPE_NOT_FOUND(1813)，属性里所有版本字段都是空的。
+1 VERSIONINFO
+ FILEVERSION 0,1,0,0
+ PRODUCTVERSION 0,1,0,0
+ FILEFLAGSMASK 0x3FL
+ FILEFLAGS 0x0L
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        // 0409 = 英文(美国)，04B0 = Unicode。带中文的字段用 Unicode 块，
+        // 免得 rc.exe 按代码页转码时把字写坏。
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "KralisXC"
+            VALUE "FileDescription", "ADL 下载器"
+            VALUE "FileVersion", "0.1.0"
+            VALUE "InternalName", "adl-gui"
+            VALUE "LegalCopyright", "MIT License"
+            VALUE "OriginalFilename", "adl-gui.exe"
+            VALUE "ProductName", "ADL"
+            VALUE "ProductVersion", "0.1.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 0x4B0
+    END
+END

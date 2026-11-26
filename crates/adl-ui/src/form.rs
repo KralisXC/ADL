@@ -24,6 +24,8 @@ pub enum Field<'a> {
         /// 用来放"选择文件夹…"这类一次性动作 —— 它们和字段强相关，
         /// 单独在 form 外面再画一行反而会跟标签列对不齐。
         action: Option<(&'a str, &'a str)>,
+        /// 草稿模式下的"改动标记"：`Some(原值)` 表示这一项还没保存。
+        mark: Option<&'a str>,
     },
     /// 整数（拖动 / 键入）
     Number {
@@ -31,12 +33,14 @@ pub enum Field<'a> {
         value: &'a mut u64,
         range: std::ops::RangeInclusive<u64>,
         note: &'a str,
+        mark: Option<&'a str>,
     },
     /// 复选（右侧带说明）
     Check {
         label: &'a str,
         value: &'a mut bool,
         text: &'a str,
+        mark: Option<&'a str>,
     },
     /// 下拉选择
     Select {
@@ -44,6 +48,7 @@ pub enum Field<'a> {
         value: &'a mut String,
         options: &'a [(&'a str, &'a str)],
         note: &'a str,
+        mark: Option<&'a str>,
     },
 }
 
@@ -55,6 +60,7 @@ impl<'a> Field<'a> {
             hint: "",
             note: "",
             action: None,
+            mark: None,
         }
     }
 
@@ -68,11 +74,17 @@ impl<'a> Field<'a> {
             value,
             range,
             note: "",
+            mark: None,
         }
     }
 
     pub fn checkbox(label: &'a str, value: &'a mut bool, text: &'a str) -> Self {
-        Self::Check { label, value, text }
+        Self::Check {
+            label,
+            value,
+            text,
+            mark: None,
+        }
     }
 
     pub fn select(
@@ -85,6 +97,7 @@ impl<'a> Field<'a> {
             value,
             options,
             note: "",
+            mark: None,
         }
     }
 
@@ -122,6 +135,34 @@ impl<'a> Field<'a> {
             | Self::Select { label, .. } => label,
         }
     }
+
+    /// 草稿模式：标记这一项"改过但还没保存"，并把**原值**传进来。
+    ///
+    /// 传 `Some(原值)` 时标签换成强调色、控件下方多一行黄字「原：xxx」；
+    /// 传 `None` 表示和已保存的配置一致。调用方每帧现算即可 ——
+    /// 把值改回原值会自动变回普通样式，不需要自己维护脏标记。
+    pub fn mark(mut self, original: Option<&'a str>) -> Self {
+        match &mut self {
+            Self::Text { mark, .. }
+            | Self::Number { mark, .. }
+            | Self::Check { mark, .. }
+            | Self::Select { mark, .. } => *mark = original,
+        }
+        self
+    }
+
+    /// 这一项有没有未保存的改动（有则是原值）。
+    ///
+    /// 名字不能叫 `mark`：和上面那个链式构造器同名，`&mut Field` 上
+    /// 调用会优先解析到构造器（`E0599`）。
+    fn mark_of(&self) -> Option<&str> {
+        match self {
+            Self::Text { mark, .. }
+            | Self::Number { mark, .. }
+            | Self::Check { mark, .. }
+            | Self::Select { mark, .. } => *mark,
+        }
+    }
 }
 
 /// 画一个表单卡片。`title` 为空时不画分组标题。
@@ -146,13 +187,23 @@ pub fn form(ui: &mut Ui, title: &str, fields: &mut [Field<'_>]) -> Option<String
 
         for f in fields.iter_mut() {
             let label = f.label().to_string();
+            let mark = f.mark_of().map(|s| s.to_string());
             ui.horizontal(|ui| {
                 // 左：标签（固定宽度、左对齐、垂直居中）
                 ui.allocate_ui_with_layout(
                     vec2(label_w, field_h),
                     Layout::left_to_right(Align::Center),
                     |ui| {
-                        ui.label(&label);
+                        // 草稿里改过的项：标签用强调色，和"已保存"的一眼区分开。
+                        if mark.is_some() {
+                            ui.label(
+                                egui::RichText::new(&label)
+                                    .strong()
+                                    .color(th.palette.accent),
+                            );
+                        } else {
+                            ui.label(&label);
+                        }
                     },
                 );
 
@@ -179,6 +230,9 @@ pub fn form(ui: &mut Ui, title: &str, fields: &mut [Field<'_>]) -> Option<String
                                     }
                                 }
                             });
+                            if let Some(orig) = &mark {
+                                widgets::hint_was(ui, &format!("原：{orig}"));
+                            }
                             if !note.is_empty() {
                                 widgets::hint(ui, note);
                             }
@@ -198,12 +252,18 @@ pub fn form(ui: &mut Ui, title: &str, fields: &mut [Field<'_>]) -> Option<String
                                     widgets::hint(ui, note);
                                 }
                             });
+                            if let Some(orig) = &mark {
+                                widgets::hint_was(ui, &format!("原：{orig}"));
+                            }
                         });
                     }
                     Field::Check { value, text, .. } => {
                         ui.vertical(|ui| {
                             ui.add_space(3.0);
                             ui.checkbox(&mut **value, *text);
+                            if let Some(orig) = &mark {
+                                widgets::hint_was(ui, &format!("原：{orig}"));
+                            }
                         });
                     }
                     Field::Select {
@@ -226,6 +286,9 @@ pub fn form(ui: &mut Ui, title: &str, fields: &mut [Field<'_>]) -> Option<String
                                         ui.selectable_value(&mut **value, (*k).to_string(), *v);
                                     }
                                 });
+                            if let Some(orig) = &mark {
+                                widgets::hint_was(ui, &format!("原：{orig}"));
+                            }
                             if !note.is_empty() {
                                 widgets::hint(ui, note);
                             }

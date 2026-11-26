@@ -195,10 +195,11 @@ fn run_download(args: DownloadArgs) -> i32 {
     } else {
         Mode::Safe
     };
+    // 插件目录固定：命令行 `--plugin-dir` 只在开发/测试时可覆盖，
+    // 生产走 exe 同级的 plugins/（用户 m19629 明确要固定）。
     let plugin_root = args
         .plugin_dir
         .clone()
-        .or_else(|| cfg.plugin_dir_opt())
         .or_else(|| {
             std::env::current_exe()
                 .ok()

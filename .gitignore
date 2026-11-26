@@ -27,3 +27,9 @@ history.json
 /plugins/com.kralisxc.media-converter/bin/
 # 插件打包产物（走 adl-extensions 的 Releases）
 /dist
+
+# 运行时数据目录（默认就在 exe 同级 data/，绿色版拷走即可）
+/data/
+# rc.exe 的中间产物与自动更新留下的旧 exe
+*.res
+*.old

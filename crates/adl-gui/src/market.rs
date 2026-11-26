@@ -197,7 +197,7 @@ pub async fn download_and_install(
     }
 }
 
-/// 下载用的缓存目录（`%LOCALAPPDATA%/ADL/cache`）。
+/// 下载插件包用的缓存目录（`data/cache`，见 `adl_app::config::app_data_dir`）。
 ///
 /// 不能用 `std::env::temp_dir()`：本机受限令牌下 Rust 进程对 `%TEMP%` 是
 /// 拒绝访问的（`os error 5`），这一点在单测里已经踩过。

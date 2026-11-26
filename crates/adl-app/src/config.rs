@@ -1,8 +1,11 @@
 //! 配置文件（TOML）。
 //!
-//! 位置优先级：
-//! 1. exe 同级的 `config.toml`（便携模式：存在就用它）；
-//! 2. `%LOCALAPPDATA%\ADL\config.toml`（Windows）或 `$HOME/.local/share/adl/config.toml`。
+//! 全部数据都在 **exe 同级的 `data/`**，只有「默认下载目录」跟着系统的
+//! 「下载」文件夹走（用户 m21598）。取 exe 失败才退回旧的
+//! `%LOCALAPPDATA%\ADL` / `$HOME/.local/share/adl`。
+//!
+//! 另外兼容两种历史位置：exe 同级的 `config.toml`（早期便携模式，存在就用它）
+//! 和 `data/config.toml`。
 //!
 //! 命令行显式给出的参数总是覆盖配置里的同名项。
 
@@ -11,7 +14,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// 主配置里每个插件只写一小段（开关等），详细设置在各自的
-/// `%LOCALAPPDATA%\ADL\plugin-settings\<id>.json` 里，避免主配置膨胀。
+/// `data/plugin-settings/<id>.json` 里，避免主配置膨胀。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginCfg {
     #[serde(default = "default_true")]
@@ -28,19 +31,61 @@ impl Default for PluginCfg {
     }
 }
 
-/// 应用数据目录（历史记录、默认配置都放这）。
+/// 应用数据目录（配置、历史、任务表、消息、插件设置、缓存、更新包都放这）。
+///
+/// 位置是 **exe 同级的 `data/`**。用户 m21598：「除了默认下载位置是放在
+/// win 自动那边，其他的数据全都放我们自己的文件夹里面。」
+///
+/// 之前是 `%LOCALAPPDATA%\ADL`，问题有三个：
+/// 1. 用户找不到——程序装在 D 盘/E 盘，数据却飞到 C 盘用户目录里；
+/// 2. 绿色版拷走就丢配置，卸载也留一地垃圾；
+/// 3. 某些环境下往用户目录写会被拦（`os error 5`），而这跟"下载器"本身
+///    没关系，用户只会觉得软件坏了。
+///
+/// 但装在 `C:\Program Files` 这类地方时 exe 目录是只读的（非管理员写不进去），
+/// 所以这里**先探一下能不能写**：能写就用 `data/`，不能写才退回旧的
+/// `%LOCALAPPDATA%\ADL`。探测结果缓存住，不用每次调用都建文件。
 pub fn app_data_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("LOCALAPPDATA") {
-        if !p.trim().is_empty() {
-            return PathBuf::from(p).join("ADL");
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                let own = dir.join("data");
+                if dir_writable(&own) {
+                    return own;
+                }
+                eprintln!(
+                    "提示：{} 写不进去，数据改放用户目录（绿色版请放到有写权限的文件夹）",
+                    own.display()
+                );
+            }
         }
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.trim().is_empty() {
-            return PathBuf::from(home).join(".local").join("share").join("adl");
+        if let Ok(p) = std::env::var("LOCALAPPDATA") {
+            if !p.trim().is_empty() {
+                return PathBuf::from(p).join("ADL");
+            }
         }
+        if let Ok(home) = std::env::var("HOME") {
+            if !home.trim().is_empty() {
+                return PathBuf::from(home).join(".local").join("share").join("adl");
+            }
+        }
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    })
+    .clone()
+}
+
+/// 这个目录能不能写（不存在就先建）。用一个探针文件实测，
+/// 而不是只看 ACL —— 有 Deny ACE、只读卷、OneDrive 占位文件这些
+/// 光看权限位判断不出来的情况太多了。
+fn dir_writable(dir: &std::path::Path) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
     }
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    let probe = dir.join(".adl-write-probe");
+    let ok = std::fs::write(&probe, b"1").is_ok();
+    let _ = std::fs::remove_file(&probe);
+    ok
 }
 
 /// 系统默认的「下载」文件夹。
@@ -104,13 +149,18 @@ pub fn system_download_dir() -> Option<PathBuf> {
     }
 }
 
-/// 配置文件路径：优先 exe 同级的（便携），否则应用数据目录。
+/// 配置文件路径。
+///
+/// 兼容三种位置，按优先级：
+/// 1. exe 同级 `config.toml` —— 早期便携模式，**存在就用**（老用户升级不受影响）；
+/// 2. `data/config.toml` —— 现在写在这里（`app_data_dir()` 能写的时候）；
+/// 3. 兜底：`app_data_dir()/config.toml`（无法写 exe 目录时就是用户目录）。
 pub fn config_path() -> PathBuf {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let p = dir.join("config.toml");
-            if p.exists() {
-                return p;
+            let legacy = dir.join("config.toml");
+            if legacy.exists() {
+                return legacy;
             }
         }
     }
@@ -136,8 +186,6 @@ pub struct Config {
     pub proxy: String,
     /// 插件模式："safe"（默认）或 "trusted"
     pub mode: String,
-    /// 插件目录（空 = exe 同级 plugins/）
-    pub plugin_dir: String,
     /// 是否记录下载历史
     pub history_enabled: bool,
     /// 点窗口关闭按钮时的行为："" = 还没问过用户（下次关闭时弹窗问），
@@ -195,7 +243,6 @@ impl Default for Config {
             http1: false,
             proxy: String::new(),
             mode: "safe".to_string(),
-            plugin_dir: String::new(),
             history_enabled: true,
             close_action: String::new(),
             limit_unit: "auto".to_string(),
@@ -294,26 +341,46 @@ impl Config {
         }
     }
 
-    pub fn plugin_dir_opt(&self) -> Option<PathBuf> {
-        if self.plugin_dir.trim().is_empty() {
-            None
-        } else {
-            Some(PathBuf::from(&self.plugin_dir))
-        }
-    }
-
     /// 把当前配置写回配置文件（覆盖），用于 GUI 的设置页。
+    ///
+    /// 失败时把**具体路径**带进错误里：以前只回一个 `os error 5`，
+    /// 用户和我们都看不出它到底想写哪（用户 m21507 报过这个）。
+    ///
+    /// `rename` 在少数环境（目录有 Deny ACE 的"删除子项"权限、只读卷、
+    /// 杀软占用句柄）会失败，但直接覆盖写往往还是允许的 —— 所以改名失败
+    /// 时退回原地写，别让用户看到一个光秃秃的 `拒绝访问`。
     pub fn save(&self) -> std::io::Result<()> {
         let path = config_path();
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent).map_err(|e| {
+                std::io::Error::new(e.kind(), format!("建目录 {} 失败: {e}", parent.display()))
+            })?;
         }
         let text = toml::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         let tmp = path.with_extension("toml.tmp");
-        std::fs::write(&tmp, text)?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
+        std::fs::write(&tmp, &text).map_err(|e| {
+            std::io::Error::new(e.kind(), format!("写 {} 失败: {e}", tmp.display()))
+        })?;
+        match std::fs::rename(&tmp, &path) {
+            Ok(()) => Ok(()),
+            Err(rename_err) => {
+                // 退化路径：直接覆盖写目标文件。
+                match std::fs::write(&path, &text) {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(&tmp);
+                        Ok(())
+                    }
+                    Err(write_err) => Err(std::io::Error::new(
+                        write_err.kind(),
+                        format!(
+                            "保存到 {} 失败: {write_err}（改名也失败: {rename_err}）",
+                            path.display()
+                        ),
+                    )),
+                }
+            }
+        }
     }
 
     /// 把默认配置（带注释的模板）写到默认位置；已存在则不动。
@@ -361,9 +428,6 @@ proxy = ""
 
 # 插件模式："safe"（默认，只能观察/拦截）或 "trusted"（允许改写请求）。
 mode = "safe"
-
-# 插件目录。留空 = 使用 adl.exe 同级的 plugins/。
-plugin_dir = ""
 
 # 是否记录下载历史（history.json）。
 history_enabled = true
