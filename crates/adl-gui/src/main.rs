@@ -15,6 +15,7 @@
 
 mod api_server;
 mod install;
+mod logfile;
 mod market;
 mod notice;
 mod plugins;
@@ -5193,28 +5194,56 @@ fn make_window_icon() -> egui::IconData {
     }
 }
 
+/// 确认图标是不是真的进了任务栏。
+///
+/// 🔴 以前这里用 `TrayIcon::rect()` 当判据，那是**错的**：`rect()` 内部走
+/// `Shell_NotifyIconGetRect`，而图标被折叠进「溢出区」（任务栏那个 `^`
+/// 后面）时它会直接返 `E_FAIL`，于是注册明明成功却被判成失败 —— 接着
+/// `build_tray` 把刚建好的实例丢掉（`Drop` 会 `NIM_DELETE` 把图标删掉），
+/// 再建一个无 GUID 的，用户永远看不到图标。
+///
+/// 换成 `set_tooltip`：它走 `NIM_MODIFY`，图标没登记时必然返回
+/// `os error 5 (拒绝访问)`，登记了就一定成功，跟图标摆在哪无关。
+fn tray_registered(t: &TrayIcon) -> Result<(), String> {
+    t.set_tooltip(Some("ADL 下载器"))
+        .map_err(|e| format!("{e}"))
+}
+
 fn build_tray() -> Option<TrayIcon> {
     // 先按"带 GUID"建一次：GUID 能让 Windows 记住用户把图标摆在溢出区还是
-    // 钉在任务栏上。个别机器上 NIF_GUID 会注册失败（`rect()` 问不到位置），
-    // 那就退回不带 GUID 的老式 `hWnd + uID` 身份 —— 宁可下次启动图标归回
-    // 溢出区，也不要干脆没有图标。
+    // 钉在任务栏上。注册不上才退回不带 GUID 的老式 `hWnd + uID` 身份 ——
+    // 宁可下次启动图标归回溢出区，也不要干脆没有图标。
     match build_tray_inner(true) {
-        Some(t) if t.rect().is_some() => {
-            eprintln!("[tray] 托盘图标已注册（GUID 身份）");
-            return Some(t);
-        }
-        _ => {}
+        Some(t) => match tray_registered(&t) {
+            Ok(()) => {
+                logfile::log("[tray] 托盘图标已注册（GUID 身份）");
+                return Some(t);
+            }
+            Err(e) => {
+                logfile::log(&format!("[tray] GUID 身份没注册上（{e}），改试老式身份"));
+                // 先 drop，让它的 NIM_DELETE 把残留清掉，再建第二个。
+            }
+        },
+        None => logfile::log("[tray] GUID 身份创建失败，改试老式身份"),
     }
-    eprintln!("[tray] 带 GUID 没注册上，改试不带 GUID 的老式身份");
     match build_tray_inner(false) {
         Some(t) => {
-            if t.rect().is_some() {
-                eprintln!("[tray] 托盘图标已注册（hWnd + uID 身份）");
-            } else {
-                // 注册不上最常见的原因是本进程跑在 Low 完整性级别（沙箱/受限
-                // 令牌）：那种情况下 Shell_NotifyIconW 直接返回 FALSE + 5。
-                // 这里留一行，用户报"没有托盘图标"时至少能对上号。
-                eprintln!("[tray] 托盘图标没能注册到任务栏（进程被降权，或 explorer 未响应）");
+            match tray_registered(&t) {
+                Ok(()) => {
+                    // 注册成功但 rect() 仍可能问不到位置（在溢出区里），
+                    // 这条只作参考，不当失败判据。
+                    let where_at = match t.rect() {
+                        Some(_) => "任务栏可见",
+                        None => "可能在溢出区（点任务栏的 ^ 看看）",
+                    };
+                    logfile::log(&format!("[tray] 托盘图标已注册（hWnd + uID 身份，{where_at}）"));
+                }
+                Err(e) => {
+                    // 真正注册失败最常见的原因是本进程跑在 Low 完整性级别
+                    // （沙箱/受限令牌）：那种情况下 Shell_NotifyIconW 直接
+                    // 返回 FALSE + 5。把原始错误写进日志，别让用户猜。
+                    logfile::log(&format!("[tray] 托盘图标没能注册到任务栏（{e}）"));
+                }
             }
             Some(t)
         }
@@ -5244,20 +5273,31 @@ fn build_tray_inner(use_guid: bool) -> Option<TrayIcon> {
         Ok(t) => Some(t),
         Err(e) => {
             // 以前这里是 `.ok()`：注册失败静默返回 None，界面上完全看不出
-            // 托盘没起来。至少留一行 stderr，排查时能知道是这一步挂的。
-            eprintln!("[tray] 托盘图标创建失败（use_guid={use_guid}）: {e}");
+            // 托盘没起来。至少留一行日志，排查时能知道是这一步挂的。
+            logfile::log(&format!("[tray] 托盘图标创建失败（use_guid={use_guid}）: {e}"));
             None
         }
     }
 }
 
 fn main() -> eframe::Result {
+    // 日志最先初始化：release 版没有控制台，eprintln 全丢。写一份到
+    // data/startup.log，用户报"没有托盘图标"时能直接看是哪一步挂的。
+    logfile::init();
+    logfile::log("main 开始");
+    // 完整性级别：`Shell_NotifyIconW` 只在 Medium 及以上才肯登记图标，
+    // Low 完整性（沙箱、受限令牌）下恒定失败且错误码是 5。先记下来，
+    // 免得以后又把"环境限制"当成"代码 bug"查半天。
+    logfile::log(&format!("进程完整性级别: {}", platform::integrity_level()));
+
     // 单实例：已有实例则唤醒它并退出
     let _single = platform::acquire_single_instance();
     if _single.is_none() {
+        logfile::log("已有实例在运行，唤醒它并退出（本次不建窗口、不建托盘）");
         platform::signal_existing_instance();
         return Ok(());
     }
+    logfile::log("单实例锁已拿到");
 
     // 上一次自动更新留下的 `<exe>.old`：那一刻它还是正在运行的旧程序，
     // Windows 不让删；现在跑的是新 exe，可以清了。
@@ -5376,6 +5416,14 @@ fn main() -> eframe::Result {
     };
 
     let gui2 = gui.clone();
+    logfile::log(&format!(
+        "数据目录: {}",
+        adl_app::config::app_data_dir().display()
+    ));
+    logfile::log(&format!(
+        "插件目录: {}",
+        plugins_root().map(|p| p.display().to_string()).unwrap_or_else(|| "（无）".into())
+    ));
     let tray = build_tray();
     eframe::run_native(
         "ADL",

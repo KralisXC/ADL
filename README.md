@@ -143,7 +143,9 @@ cargo build --release -p adl-gui
 - **设置项只给档位**：并发 7 档（1/2/4/8/16/32/64，本质仍是自适应）；限速 = 数值 + 单位（自动 / B/s / KB/s / MB/s / GB/s，用英文单位）；**同时下载** 7 档（1/2/3/5/8/12/16 条任务，与"一条任务开几条连接"是两个维度）。HTTP/1.1 不再由用户选（引擎自动）。
 - **设置改的是草稿，点「保存设置」才生效**：顶部固定一条「保存设置」栏（不随页面滚动），左边显示「没有未保存的更改」/「已更改 N 项」，右边「取消」（撤销全部改动）+「保存设置」。改过的卡片标题会变**绿**并挂「已修改」角标，被改的那一项下面用**黄字**标出「原：16」—— 一眼看得出将要改掉什么。取消把全部草稿退回已保存值。
 - **程序图标**：`assets/adl.ico`（7 个尺寸）通过 `build.rs` + `rc.exe` 嵌进 PE 资源，资源管理器 / 任务栏 / Alt+Tab 都是青绿圆角方块 + 白色下箭头；窗口图标另走 `ViewportBuilder::with_icon`。版本信息（`FileVersion` / `ProductName` / `CompanyName`）也一并写进资源。
-- **托盘图标**按 GUID 固定身份（Windows 记得用户把它摆在溢出区还是钉在任务栏上）；带 GUID 注册失败时自动退回老式 `hWnd + uID` 身份，并往 stderr 留一行日志。
+- **托盘图标**按 GUID 固定身份（Windows 记得用户把它摆在溢出区还是钉在任务栏上）；带 GUID 注册失败时自动退回老式 `hWnd + uID` 身份。**是否注册成功用 `set_tooltip()` 判断**（走 `NIM_MODIFY`，失败必是 `os error 5`），不能用 `TrayIcon::rect()` —— 图标在溢出区时 `Shell_NotifyIconGetRect` 恒定返 `E_FAIL`，会把成功的注册误判成失败。
+- **启动日志**：release 版没有控制台，`eprintln!` 全丢，所以启动过程写到 `data/startup.log`（每次启动截断重写），第一行就是进程完整性级别（`S-1-16-4096 (Low)` / `S-1-16-8192 (Medium)`）。托盘不显示时先看这份日志：Low 是环境限制（`Shell_NotifyIconW` 在 Low 下恒失败），Medium 还失败才是代码问题。
+- **代码签名**：`scripts/new-codesign-cert.ps1` 生成自签证书（`CN=棱汐 Risk, O=KralisXC`，RSA 4096 / 10 年），`scripts/sign.ps1` 给 exe 签名并自校验。**自签名治不了 SmartScreen** —— 它看的是文件信誉而不是签名是否有效，自签名永远拿不到信誉；跨机器不弹只有 EV 证书或 SignPath。
 
 > **渲染后端可切换**（环境变量 `ADL_RENDERER`）：
 > - 不设 / `glow`：OpenGL，**默认**，兼容性最好（虚拟机、远程桌面、老核显都能开）。
@@ -349,6 +351,9 @@ adl.notify({ title: "下载完成", body: "report.pdf · 12.4 MB" });
 - ✅ **设置页草稿模式**：改动绿、原值黄、顶部「已更改 N 项」+ 取消，点「保存设置」才落盘
 - ✅ 修掉「并发上限」与「同时下载」两个分段控件交互 id 撞车（点一个另一个跟着动）
 - ✅ 程序图标（`.ico` 嵌 PE 资源 + 版本信息 + 窗口图标）；托盘图标按 GUID 固定身份并带兜底
+- ✅ 托盘注册判据改用 `set_tooltip()`（`rect()` 在溢出区恒返 `E_FAIL`，会把成功误判成失败，导致图标被删掉）
+- ✅ 启动日志 `data/startup.log`（含进程完整性级别，托盘排查用）
+- ✅ 自签名代码签名脚本（`scripts/new-codesign-cert.ps1` / `scripts/sign.ps1`；本机不弹，跨机器仍需 EV 或 SignPath）
 - ⛔ **剪贴板监听不做**（自动嗅探剪贴板里复制的 URL 太吵；Ctrl+V 粘贴一直在）
 
 设计文档见 [docs/DESIGN.md](docs/DESIGN.md)。

@@ -2723,16 +2723,26 @@ window "ADL 下载器"
   托盘图标（32）与窗口图标（64）共用同一套几何。
 - 🔴 **`tray-icon 0.25.1` 会把 `NIM_ADD` 的失败完全吞掉**（`platform_impl/windows/mod.rs:159-162`：
   `if !register_tray_icon(...) { /* 等 TaskbarCreated 重注册 */ }`），所以 `build()`
-  永远返回 `Ok`。`build_tray()` 因此拆成两层：先带 GUID 建一次，用
-  `TrayIcon::rect()`（内部 `Shell_NotifyIconGetRect`）确认真的注册上了；问不到位置就
-  退回不带 GUID 的老式 `hWnd + uID` 身份再试一次。两路都问不到就打印
-  「没能注册到任务栏（进程被降权，或 explorer 未响应）」。
+  永远返回 `Ok`。`build_tray()` 因此拆成两层：先带 GUID 建一次，确认真的注册上了就返回；
+  没注册上才退回不带 GUID 的老式 `hWnd + uID` 身份再试一次。
+- 🔴 **判据不能用 `TrayIcon::rect()`**（踩过：这一版让图标彻底消失）。`rect()` 内部走
+  `Shell_NotifyIconGetRect`，而图标被折叠进**溢出区**（任务栏那个 `^` 后面）时它恒定返
+  `E_FAIL`。于是注册成功也被判失败 → `build_tray()` 丢掉刚建好的实例（`Drop` 里
+  `NIM_DELETE` 把图标删掉）→ 再建一个无 GUID 的 → 用户永远看不到图标。
+  **正确判据是 `set_tooltip()`**：它走 `NIM_MODIFY`，图标没登记时必然
+  `os error 5 (拒绝访问)`，登记了就一定成功，跟图标摆在哪无关。见 `fn tray_registered()`。
+  `rect()` 只在注册成功后用来"猜"图标是不是在溢出区（写进日志给人看，不当判据）。
 - **为什么注册会失败**（实测结论，对排查同类问题有用）：`Shell_NotifyIconW(NIM_ADD)`
   在 **Low 完整性级别**（`S-1-16-4096`）的进程里返回 `FALSE` + `GetLastError() = 5`
   （`ERROR_ACCESS_DENIED`）；同样的代码在 Medium（`S-1-16-8192`）下成功。
   与 GUID、图标像素、ACL、Job 的 `uiRestrictions` 都无关 —— 同一个 Job 里的 pwsh
   明明 `uiRestrictions = 0x00003FFE` 却注册成功，唯一差别就是完整性级别。
   > 这条也是「受限沙箱里看不到托盘图标」的通用解释：不是软件 bug。
+- **诊断手段**：release 版 `windows_subsystem = "windows"` 没有控制台，`eprintln!` 全丢。
+  `crates/adl-gui/src/logfile.rs` 把启动过程写进 `data/startup.log`（每次启动截断重写），
+  第一行就记 `进程完整性级别: S-1-16-xxxx (Medium/Low)`（`platform::integrity_level()`，
+  `OpenProcessToken` + `TokenIntegrityLevel` + `GetSidSubAuthority`）。用户报"没有托盘图标"
+  时先看这份日志：Low 就是环境限制，Medium 还失败才是代码问题。
 
 #### 13.19.7 程序图标（PE 资源 + 窗口图标）
 
@@ -2762,6 +2772,34 @@ window "ADL 下载器"
 - 验证方法（不用打开资源管理器）：
   `[System.Drawing.Icon]::ExtractAssociatedIcon($exe)` 看像素、
   `[System.Diagnostics.FileVersionInfo]::GetVersionInfo($exe)` 看版本字段。
+
+#### 13.19.8 代码签名（自签名，仅供本机）
+
+用户 m22170：「我看运行的时候 win 一直说没签名，要不先签个名？棱汐 risk？」
+
+- 主体 `CN=棱汐 Risk, O=KralisXC`，RSA 4096 / SHA256 / 10 年，EKU = Code Signing。
+  `scripts/new-codesign-cert.ps1` 一次生成证书并导出 `certs/adl-codesign.{cer,pfx}`
+  （`.pfx` 含私钥，`.gitignore` 已挡 `/certs/` 与 `*.pfx`）。
+- 🔴 **装 Root 不能用 `Import-Certificate`**：PS 5.1 在非交互会话报
+  `UI is not allowed in this operation.`（该 cmdlet 走 UI 型导入）。
+  改用 `certutil.exe -user -addstore Root <cer>`（TrustedPublisher 同理，各一次）。
+- 🔴 **`.ps1` 带中文注释必须写 UTF-8 BOM**：PS 5.1 按系统 ANSI（本机 936）读，
+  没 BOM 的 UTF-8 中文变乱码 → `Unexpected token ... in expression or statement.`。
+  与早前"`.ps1` 只写纯 ASCII"是同一条坑的两种解法。
+- 🔴 调脚本必须 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File script.ps1`；
+  直接 `& script.ps1` 报「未对文件进行数字签名…UnauthorizedAccess」。
+- `scripts/sign.ps1`：从注册表 `KitsRoot10` 拼 `bin\<最新>\x64\signtool.exe`
+  （本机 SDK 在 D 盘，写死 C 盘路径找不到）；签完自校验 `Status -ne 'Valid'` 就 throw。
+  变量名不能叫 `$args`（PS 自动变量）。
+- 时间戳服务器会抖：`timestamp.digicert.com` 偶报
+  `The specified timestamp server either could not be reached or returned an invalid response.`，
+  重试或换 sectigo/globalsign 即可，不是配置错。
+- **自签名治不了 SmartScreen**：SmartScreen 的判据是「文件有没有信誉」而不是「签名有效」。
+  截图里已经显示「发行者: KralisXC, 棱汐 Risk」（说明签名链被认出）却仍然拦，
+  因为自签名永远拿不到信誉。信誉按文件哈希累积、微软没有人工提交通道；
+  真要不弹只有 EV 证书（即时信誉）或 SignPath（免费但要走 CI 且审批自由裁量）。
+  当前只有 `CurrentUser` 三个存储，`LocalMachine` 没有 —— SmartScreen 以 SYSTEM 跑、
+  看机器级存储，装到机器级也许有一点用，但换机器仍归零。
 
 ### 13.20 待续
 - macOS / Linux 的**真机**构建验证仍未做（本机只有 Windows；M 芯片 Mac 无法在本机测）。

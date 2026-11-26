@@ -22,6 +22,81 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+// ───────────────────────── 完整性级别（诊断用） ─────────────────────────
+
+/// 报告本进程的完整性级别，形如 `S-1-16-8192 (Medium)`。
+///
+/// 为什么需要：`Shell_NotifyIconW` 在 **Low 完整性**（`S-1-16-4096`）的进程里
+/// 恒定返回 FALSE + `GetLastError()=5`（拒绝访问）—— 托盘图标注册不上，但
+/// 代码本身没有 bug。我在这台机器上用脚本启动的每个进程都被降成了 Low，
+/// 于是"托盘有没有"这件事只能在用户的真实会话里验证；把 IL 写进启动日志，
+/// 从此不用再猜。
+#[cfg(windows)]
+pub fn integrity_level() -> String {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenIntegrityLevel,
+        TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return format!("查询失败（OpenProcessToken err={}）", std::io::Error::last_os_error());
+        }
+
+        // 先问需要多大缓冲，再分配。
+        let mut needed: u32 = 0;
+        GetTokenInformation(token, TokenIntegrityLevel, std::ptr::null_mut(), 0, &mut needed);
+        if needed == 0 {
+            CloseHandle(token);
+            return "查询失败（GetTokenInformation 没给出长度）".to_string();
+        }
+
+        let mut buf = vec![0u8; needed as usize];
+        let ok = GetTokenInformation(
+            token,
+            TokenIntegrityLevel,
+            buf.as_mut_ptr() as *mut c_void,
+            needed,
+            &mut needed,
+        );
+        CloseHandle(token);
+        if ok == 0 {
+            return format!("查询失败（GetTokenInformation err={}）", std::io::Error::last_os_error());
+        }
+
+        let label = &*(buf.as_ptr() as *const TOKEN_MANDATORY_LABEL);
+        let sid = label.Label.Sid;
+        if sid.is_null() {
+            return "查询失败（SID 为空）".to_string();
+        }
+        let count_ptr = GetSidSubAuthorityCount(sid);
+        if count_ptr.is_null() || *count_ptr == 0 {
+            return "查询失败（SID 没有子授权）".to_string();
+        }
+        // 完整性级别的 RID 永远在最后一个子授权里。
+        let rid = *GetSidSubAuthority(sid, (*count_ptr - 1) as u32);
+
+        let name = match rid {
+            0x0000 => "Untrusted",
+            0x1000 => "Low",
+            0x2000 => "Medium",
+            0x2100 => "Medium Plus",
+            0x3000 => "High",
+            0x4000 => "System",
+            _ => "未知",
+        };
+        format!("S-1-16-{rid} ({name})")
+    }
+}
+
+#[cfg(not(windows))]
+pub fn integrity_level() -> String {
+    "非 Windows，不适用".to_string()
+}
+
 // ───────────────────────── 单实例 ─────────────────────────
 
 #[cfg(windows)]

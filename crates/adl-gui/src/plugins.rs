@@ -271,8 +271,17 @@ impl App {
             (PluginsTab::Installed, "已安装"),
             (PluginsTab::Market, "插件市场"),
         ];
+        let mut enter_market = false;
         if let Some(t) = adl_ui::widgets::segmented(ui, "plugins_tab", self.plugins_tab, &tabs) {
+            // 切进「插件市场」时自动拉一次清单：市场页本来就是"给我看有什么可装的"，
+            // 进来还空着让人再点一次「刷新清单」是多余的。只在这一刻触发，
+            // 不每帧拉（否则每帧都打 GitHub）。
+            enter_market = t == PluginsTab::Market && self.plugins_tab != t;
             self.plugins_tab = t;
+        }
+        if enter_market && self.market_rx.is_none() {
+            self.market_note = None;
+            self.market_rx = Some(market::start_fetch(&self.gui, self.market_url.clone()));
         }
         ui.add_space(12.0);
 

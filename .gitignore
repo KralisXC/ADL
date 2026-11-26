@@ -33,3 +33,7 @@ history.json
 # rc.exe 的中间产物与自动更新留下的旧 exe
 *.res
 *.old
+
+# 代码签名证书：.pfx 里是**私钥**，绝不能进仓库
+/certs/
+*.pfx
