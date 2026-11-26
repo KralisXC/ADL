@@ -517,3 +517,135 @@ pub fn pick_file(_title: &str, _filter: (&str, &str)) -> Option<std::path::PathB
 pub fn pick_file(_title: &str, _filter: (&str, &str)) -> Option<std::path::PathBuf> {
     None
 }
+
+// ───────────────────────── 开机自启动 ─────────────────────────
+
+/// 自启动的注册表值名。固定成 `ADL`：用户关掉自启时我们才能准确删掉那一条，
+/// 而不是把 `HKCU\...\Run` 里的其它软件项一起扫一遍。
+pub const AUTO_START_VALUE: &str = "ADL";
+
+/// 开机自启命令行：带引号的 exe 绝对路径 + `--auto-start`。
+///
+/// 路径里的空格必须用引号包住（`"C:\Program Files\ADL\adl-gui.exe"`），
+/// 否则 Windows 会把 `C:\Program` 当程序、把剩下的当参数。
+/// 带上 `--auto-start` 是为了让启动时能区分"用户双击"和"开机自动拉起"——
+/// 开机那次不该弹主窗口，缩到托盘里安静地接着下就行。
+#[cfg(windows)]
+fn auto_start_command() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    Some(format!("\"{}\" --auto-start", exe.display()))
+}
+
+/// 读当前是否已经登记了自启动（以注册表实际内容为准，不看配置项）。
+///
+/// 为什么以注册表为准：用户可能用别的工具（任务管理器「启动」页、
+/// CCleaner 之类）把它关了，那些工具只删注册表、不会改我们的 config.toml。
+/// 如果只信配置，设置页会显示"开着"但实际不会自启，比不知道更糟。
+#[cfg(windows)]
+pub fn auto_start_enabled() -> bool {
+    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ};
+
+    let sub = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+    let name = wide(AUTO_START_VALUE);
+    let mut size: u32 = 0;
+
+    unsafe {
+        // 第一次只问长度；返回值不是 ERROR_SUCCESS 就说明这一项不存在。
+        let rc = RegGetValueW(
+            HKEY_CURRENT_USER,
+            sub.as_ptr(),
+            name.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut size,
+        );
+        rc == 0 && size > 2
+    }
+}
+
+/// 写 / 删自启动项。`None` = 失败原因，`Some(())` = 成功。
+///
+/// 只动 `HKCU`，不需要管理员权限。
+#[cfg(windows)]
+pub fn set_auto_start(on: bool) -> Result<(), String> {
+    use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
+        KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ,
+    };
+
+    let sub = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+    let name = wide(AUTO_START_VALUE);
+
+    unsafe {
+        let mut key: HKEY = std::ptr::null_mut();
+        let rc = RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            sub.as_ptr(),
+            0,
+            std::ptr::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_WRITE,
+            std::ptr::null(),
+            &mut key,
+            std::ptr::null_mut(),
+        );
+        if rc != 0 {
+            return Err(format!(
+                "打不开注册表 Run 项（错误码 {rc}）"
+            ));
+        }
+
+        let result = if on {
+            let Some(cmd) = auto_start_command() else {
+                RegCloseKey(key);
+                return Err("拿不到本程序的路径，没法登记自启动".to_string());
+            };
+            // REG_SZ 要连结尾的 NUL 一起写，长度按字节算。
+            let data = wide(&cmd);
+            let bytes = data.len() * std::mem::size_of::<u16>();
+            let rc = RegSetValueExW(
+                key,
+                name.as_ptr(),
+                0,
+                REG_SZ,
+                data.as_ptr() as *const u8,
+                bytes as u32,
+            );
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(format!("写自启动项失败（错误码 {rc}）"))
+            }
+        } else {
+            let rc = RegDeleteValueW(key, name.as_ptr());
+            // 本来就没有这一项也算成功 —— 用户要的是"结果是关的"。
+            if rc == 0 || rc == ERROR_FILE_NOT_FOUND {
+                Ok(())
+            } else {
+                Err(format!("删自启动项失败（错误码 {rc}）"))
+            }
+        };
+
+        RegCloseKey(key);
+        result
+    }
+}
+
+#[cfg(not(windows))]
+pub fn auto_start_enabled() -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+pub fn set_auto_start(_on: bool) -> Result<(), String> {
+    Err("这个平台还没有实现开机自启动".to_string())
+}
+
+/// 本次是不是被开机自启动拉起的（`--auto-start`）。
+///
+/// 用于决定要不要"静默起"：开机那次不该把主窗口盖到用户脸上。
+pub fn launched_by_auto_start() -> bool {
+    std::env::args().any(|a| a == "--auto-start")
+}

@@ -194,6 +194,10 @@ struct App {
     s_max_tasks: u64,
     // 启动时检查更新 —— 草稿值
     s_check_update: bool,
+    // 开机自启动 —— 草稿值。真相在注册表里（用户可能用任务管理器的
+    // 「启动」页关掉它，那种工具只删注册表、不改我们的配置），
+    // 所以这个值每次都从 `platform::auto_start_enabled()` 读回来。
+    s_auto_start: bool,
     // 关闭窗口时的行为 —— 草稿值（"tray" / "close"）
     s_close_action: String,
     // 限速显示单位（"auto" 或固定单位）
@@ -293,6 +297,20 @@ struct App {
     update_downloading: bool,
     /// 已下好的新 exe，等用户点「重启并安装」。
     update_staged: Option<std::path::PathBuf>,
+
+    /// 托盘图标的注册结果，一句话（"已注册（任务栏可见）" / "没注册上：…"）。
+    ///
+    /// 用户 m22507 报"没有托盘"，而 release 版是 `windows_subsystem="windows"`，
+    /// stderr 全丢、界面上又什么都不说 —— 只能让用户去翻 startup.log。
+    /// 现在把这句话原样显示在设置页「启动」卡里。
+    tray_status: String,
+
+    /// 本次是被开机自启拉起的（`--auto-start`）。第一帧要悄悄缩到托盘。
+    ///
+    /// 单独存一个字段而不是每帧读 `args()`：一来重复解析命令行没必要，
+    /// 二来这个动作只该做一次（做完置 false），否则用户点托盘"显示主界面"
+    /// 之后下一帧又会被自己藏回去。
+    boot_hidden: bool,
 }
 
 /// 首次点关闭时问用户"退出还是最小化"。
@@ -468,6 +486,7 @@ impl App {
         suspend: Arc<AtomicBool>,
         resume: Arc<AtomicBool>,
         tray: Option<TrayIcon>,
+        tray_status: String,
     ) -> Self {
         install_cjk_font(&cc.egui_ctx);
         // 主题令牌与全局 Visuals 全部由 adl-ui 提供：这里不再手工赋值颜色，
@@ -531,6 +550,9 @@ impl App {
             s_mode: if cfg.mode_trusted() { "trusted".into() } else { "safe".into() },
             s_max_tasks: cfg.max_concurrent_tasks as u64,
             s_check_update: cfg.check_update,
+            // 自启动以注册表为准，不信配置：用户可能在任务管理器的「启动」
+            // 页把它关了，那种操作只删注册表项、不会改 config.toml。
+            s_auto_start: platform::auto_start_enabled(),
             s_close_action: if cfg.close_action.trim().is_empty() {
                 "tray".to_string()
             } else {
@@ -556,6 +578,8 @@ impl App {
             term: TerminalState::default(),
             plugins_tab: PluginsTab::Installed,
             _tray: tray,
+            tray_status,
+            boot_hidden: platform::launched_by_auto_start(),
             maximized: false,
             closing: false,
             fade: Fade::default(),
@@ -710,16 +734,24 @@ impl App {
             "limit_unit": self.limit_unit,
             // 空字符串 = 回到内置默认 UA（引擎侧 user_agent_opt() 返回 None）
             "user_agent": self.s_ua,
-            // 下面三项以前是"一改就落盘"，现在和别的设置一样走草稿
+            // 下面几项以前是"一改就落盘"，现在和别的设置一样走草稿
             "max_concurrent_tasks": self.s_max_tasks,
             "check_update": self.s_check_update,
+            "auto_start": self.s_auto_start,
             "close_action": self.s_close_action,
         });
         match set_settings(&self.gui, &args) {
             Ok(_) => {
+                // 自启动真正的动作在注册表里，配置项只是个记录。写失败
+                // （组策略禁用 Run 项、注册表被锁）必须当场说出来，
+                // 否则用户以为开了、重启一看没自启。
+                if let Err(e) = platform::set_auto_start(self.s_auto_start) {
+                    self.set_status(format!("设置已保存，但自启动没改成: {e}"), true);
+                } else {
+                    self.set_status("已保存设置", false);
+                }
                 // 队列上限可能被调大了，立刻看一眼有没有空位可以补。
                 queue_fn::pump_queue(&self.gui);
-                self.set_status("已保存设置", false);
                 self.plugin_snapshot_at = Instant::now() - Duration::from_secs(3600);
             }
             Err(e) => self.set_status(e, true),
@@ -741,6 +773,9 @@ impl App {
         };
         self.s_max_tasks = cfg.max_concurrent_tasks as u64;
         self.s_check_update = cfg.check_update;
+        // 「取消」把自启动也退回注册表的当前实际状态（不是配置里的值）：
+        // 用户改了开关但没保存，取消就该回到"现在真的会怎样"。
+        self.s_auto_start = platform::auto_start_enabled();
         self.s_close_action = if cfg.close_action.trim().is_empty() {
             "tray".to_string()
         } else {
@@ -800,6 +835,11 @@ impl App {
             n += 1;
         }
         if self.s_check_update != cfg.check_update {
+            n += 1;
+        }
+        // 自启动跟**注册表实际状态**比，不跟配置比：任务管理器里关掉自启动
+        // 只删注册表项，配置里还留着 true，拿配置比会永远显示"已更改"。
+        if self.s_auto_start != platform::auto_start_enabled() {
             n += 1;
         }
         if self.s_close_action != cfg_close {
@@ -1065,6 +1105,24 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+
+        // 开机自启拉起的那一次：缩到托盘、不弹主窗口。
+        //
+        // 只在第一帧做一次（`boot_hidden` 立刻置 false），否则用户从托盘点
+        // "显示主界面"之后下一帧又会被这里藏回去。
+        //
+        // 🔴 前提是托盘真的注册上了：托盘没起来的时候藏窗口 = 用户从此
+        // 再也叫不出界面（任务管理器里才找得到）。所以这里必须看
+        // `_tray` 在不在，不在就当普通双击处理，宁可弹窗。
+        if self.boot_hidden {
+            self.boot_hidden = false;
+            if self._tray.is_some() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                logfile::log("[boot] 已缩到托盘");
+            } else {
+                logfile::log("[boot] 托盘不可用，取消静默启动、正常显示主窗口");
+            }
+        }
 
         // 处理唤醒 / 电源事件
         if self.wake.swap(false, Ordering::SeqCst) {
@@ -3150,6 +3208,9 @@ impl App {
                 },
             )
         };
+        // 自启动的"原值"不取配置，取注册表实际状态（任务管理器关掉后
+        // 配置里还是 true，拿配置比会永远显示"已更改"）。
+        let was_auto_start = platform::auto_start_enabled();
         // 字符串项的原值只在真的改过时才传给 `Field::mark`（`None` = 没改，
         // 不画那一行黄字）。空串也算一个合法原值，所以不能拿"非空"当条件。
         let was_dir = (self.s_dir.trim() != was_dir.trim()).then_some(was_dir);
@@ -3385,7 +3446,6 @@ impl App {
                     check_now = true;
                 }
             });
-            ui.add_space(4.0);
             adl_ui::widgets::hint(
                 ui,
                 &format!(
@@ -3504,6 +3564,54 @@ impl App {
                 }
             }
         }
+
+        // ── 启动 ──
+        // 用户 m22520：「记得加一个是否自启动的设置」。刻意做成设置项而不是
+        // 安装器选项 —— 绿色版用户根本没机会看到安装界面。
+        //
+        // 真相在注册表：这个开关的当前状态每次都从 `HKCU\...\Run` 读，
+        // 不信 config.toml。任务管理器「启动」页关掉自启时只删注册表项，
+        // 只信配置的话界面会显示"开着"但实际不会自启。
+        ui.add_space(10.0);
+        adl_ui::widgets::card(ui, |ui| {
+            let dirty = self.s_auto_start != was_auto_start;
+            dirty_title(ui, "启动", dirty);
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                let mut on = self.s_auto_start;
+                if ui.checkbox(&mut on, "开机自动启动").changed() {
+                    self.s_auto_start = on;
+                }
+                if dirty {
+                    adl_ui::widgets::badge(
+                        ui,
+                        &format!("原：{}", if was_auto_start { "开启" } else { "关闭" }),
+                        pal().warn,
+                    );
+                }
+            });
+            ui.add_space(4.0);
+            adl_ui::widgets::hint(
+                ui,
+                "开机那次直接缩到托盘、不弹主窗口，接着下上次没下完的。\
+                 不想让它开机跑，也可以在任务管理器的「启动」页关掉。",
+            );
+            // 托盘状态：注册失败时用户只知道"没有图标"，不知道原因。
+            // 这一行直接摊开说，免得再走"翻 startup.log"那一步。
+            let tray_ok = self._tray.is_some() && !self.tray_status.contains("没注册上")
+                && !self.tray_status.contains("创建失败");
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let color = if tray_ok { pal().muted } else { pal().danger };
+                ui.label(
+                    egui::RichText::new(format!("托盘图标：{}", self.tray_status))
+                        .size(12.0)
+                        .color(color),
+                );
+            });
+        });
 
         // ── 关闭行为 ──
         // 只有两个选项：问过一次之后就定下来了，"每次询问"不再是可选状态
@@ -5064,6 +5172,7 @@ fn settings_json(cfg: &Config) -> Value {
         "user_agent": cfg.user_agent,
         "max_concurrent_tasks": cfg.max_concurrent_tasks,
         "check_update": cfg.check_update,
+        "auto_start": cfg.auto_start,
         "close_action": cfg.close_action,
     })
 }
@@ -5098,6 +5207,12 @@ fn set_settings(gui: &Arc<Gui>, args: &Value) -> Result<Value, String> {
     }
     if let Some(b) = args.get("check_update").and_then(|x| x.as_bool()) {
         cfg.check_update = b;
+    }
+    // 注意：这里只记下用户的意愿，真正的动作（写/删注册表 Run 项）由
+    // 调用方 `do_save_settings` 做 —— 因为 `set_settings` 也走命令行/API，
+    // 而命令行改配置不该悄悄动注册表。
+    if let Some(b) = args.get("auto_start").and_then(|x| x.as_bool()) {
+        cfg.auto_start = b;
     }
     if let Some(a) = args.get("close_action").and_then(|x| x.as_str()) {
         cfg.close_action = a.to_string();
@@ -5209,15 +5324,19 @@ fn tray_registered(t: &TrayIcon) -> Result<(), String> {
         .map_err(|e| format!("{e}"))
 }
 
-fn build_tray() -> Option<TrayIcon> {
+fn build_tray() -> (Option<TrayIcon>, String) {
     // 先按"带 GUID"建一次：GUID 能让 Windows 记住用户把图标摆在溢出区还是
     // 钉在任务栏上。注册不上才退回不带 GUID 的老式 `hWnd + uID` 身份 ——
     // 宁可下次启动图标归回溢出区，也不要干脆没有图标。
+    //
+    // 顺便把结论返回给界面：用户 m22507 报"没有托盘"，而 release 版没有
+    // 控制台、stderr 全丢，界面上又什么都不说 —— 只能在日志里找。现在
+    // 设置页直接显示这一行状态。
     match build_tray_inner(true) {
         Some(t) => match tray_registered(&t) {
             Ok(()) => {
                 logfile::log("[tray] 托盘图标已注册（GUID 身份）");
-                return Some(t);
+                return (Some(t), "已注册（固定在任务栏的位置会被记住）".to_string());
             }
             Err(e) => {
                 logfile::log(&format!("[tray] GUID 身份没注册上（{e}），改试老式身份"));
@@ -5237,17 +5356,24 @@ fn build_tray() -> Option<TrayIcon> {
                         None => "可能在溢出区（点任务栏的 ^ 看看）",
                     };
                     logfile::log(&format!("[tray] 托盘图标已注册（hWnd + uID 身份，{where_at}）"));
+                    (Some(t), format!("已注册（{where_at}）"))
                 }
                 Err(e) => {
                     // 真正注册失败最常见的原因是本进程跑在 Low 完整性级别
                     // （沙箱/受限令牌）：那种情况下 Shell_NotifyIconW 直接
-                    // 返回 FALSE + 5。把原始错误写进日志，别让用户猜。
+                    // 返回 FALSE + 5。把原始错误写进日志和界面，别让用户猜。
                     logfile::log(&format!("[tray] 托盘图标没能注册到任务栏（{e}）"));
+                    (
+                        Some(t),
+                        format!("没注册上：{e}（进程完整性级别低时会被系统拒绝）"),
+                    )
                 }
             }
-            Some(t)
         }
-        None => None,
+        None => (
+            None,
+            "创建失败，托盘不可用（详细原因见 data/startup.log）".to_string(),
+        ),
     }
 }
 
@@ -5414,9 +5540,7 @@ fn main() -> eframe::Result {
             .with_decorations(false),
         ..Default::default()
     };
-
-    let gui2 = gui.clone();
-    logfile::log(&format!(
+    let gui2 = gui.clone();    logfile::log(&format!(
         "数据目录: {}",
         adl_app::config::app_data_dir().display()
     ));
@@ -5424,10 +5548,21 @@ fn main() -> eframe::Result {
         "插件目录: {}",
         plugins_root().map(|p| p.display().to_string()).unwrap_or_else(|| "（无）".into())
     ));
-    let tray = build_tray();
+    let (tray, tray_status) = build_tray();
+    logfile::log(&format!("[tray] {tray_status}"));
     eframe::run_native(
         "ADL",
         opts,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, gui2, wake, suspend, resume, tray)))),
+        Box::new(move |cc| {
+            Ok(Box::new(App::new(
+                cc,
+                gui2,
+                wake,
+                suspend,
+                resume,
+                tray,
+                tray_status,
+            )))
+        }),
     )
 }

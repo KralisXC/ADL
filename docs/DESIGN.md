@@ -2801,6 +2801,42 @@ window "ADL 下载器"
   当前只有 `CurrentUser` 三个存储，`LocalMachine` 没有 —— SmartScreen 以 SYSTEM 跑、
   看机器级存储，装到机器级也许有一点用，但换机器仍归零。
 
+#### 13.19.9 开机自启动与托盘状态回显
+
+用户 m22520：「记得加一个是否自启动的设置」。用户 m22554：「我使用了管理员权限
+打开就有图标了…我的想法是在我们安装的时候就使用管理员权限」。
+
+- **托盘不显示的真正根因：目录被打了 Low 完整性标签。**
+  `E:\ADL` 及整个子树的 ACL 里带一条 `Mandatory Label\Low Mandatory Level:(OI)(CI)(NW)`，
+  Windows 创建新进程时会**继承父目录的完整性标签**，于是从那里启动的 `adl-gui.exe`
+  一律是 `S-1-16-4096 (Low)`。而 `Shell_NotifyIconW(NIM_ADD)` 在 Low 完整性下
+  恒定失败并返回 `ERROR_ACCESS_DENIED(5)`，`tray-icon` 又把这条错误吞掉了。
+  修法：`icacls E:\ADL /setintegritylevel '(OI)(CI)Medium'`（子项自动继承）。
+  改完 `startup.log` 立刻变成 `S-1-16-8192 (Medium)` + `托盘图标已注册（任务栏可见）`。
+  🔴 排查这类问题的顺序：先看 `startup.log` 里的完整性级别，再看 `[tray]` 那几行；
+  不要一上来怀疑图标格式/GUID/ACL —— 那三样都试过，全不是原因。
+- **自启动开关只在 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 写一个值**
+  （值名 `ADL`，数据 `"<exe 绝对路径>" --auto-start`）。不需要管理员权限：
+  开机自启是每个用户自己的事，写到 HKLM 反而让普通用户改不动、还逼软件提权。
+- **状态以注册表为准，配置项只记"意愿"**。`platform::auto_start_enabled()` 用
+  `RegGetValueW` 现读；`settings_dirty_count()` 也拿它比，不跟 `cfg.auto_start` 比 ——
+  任务管理器「启动」页关掉自启动时只删注册表项、不改 `config.toml`，
+  只信配置的话界面会显示"开着"但实际不会自启。
+- **`--auto-start` 决定要不要静默起**：出现该参数时第一帧 `ViewportCommand::Visible(false)`
+  缩到托盘，不弹主窗口。🔴 前提是 `_tray.is_some()`：托盘没起来还藏窗口 = 用户
+  再也叫不出界面（只能进任务管理器）。所以托盘不可用时宁可弹窗。
+- **托盘状态回显到设置页**：`build_tray()` 返回 `(Option<TrayIcon>, String)`，
+  那句话（`已注册（任务栏可见）` / `没注册上：…（进程完整性级别低时会被系统拒绝）`）
+  直接显示在「启动」卡最底下。release 版是 `windows_subsystem = "windows"`，
+  stderr 全丢，不这么做用户只能自己去翻 `data/startup.log`。
+- `data/startup.log`（`crates/adl-gui/src/logfile.rs`）每次启动截断重写，
+  记 `main 开始` / `进程完整性级别` / 单实例锁 / 数据目录 / 插件目录 / `[tray]` 判定 / `[boot]` 静默起。
+- **GitHub Actions**（`.github/workflows/release.yml`）：打 `v*` tag 时
+  `windows-latest` 上 `cargo build --release -p adl-gui` + `-p adl-app` + 冒烟测试
+  → 产物作为 release asset 上传（自动更新只认 asset 里的 `.exe`）。
+  同一个 workflow 里留了 SignPath 签名 job（`if: false` 占位）—— SignPath Foundation
+  的免费签名**只对 CI 构建产物**签发，没有这条流水线连申请都没法填。
+
 ### 13.20 待续
 - macOS / Linux 的**真机**构建验证仍未做（本机只有 Windows；M 芯片 Mac 无法在本机测）。
   交叉编译也不能替代：`eframe` 的 glow/wgpu 后端要链接平台图形库。

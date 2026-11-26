@@ -145,6 +145,9 @@ cargo build --release -p adl-gui
 - **程序图标**：`assets/adl.ico`（7 个尺寸）通过 `build.rs` + `rc.exe` 嵌进 PE 资源，资源管理器 / 任务栏 / Alt+Tab 都是青绿圆角方块 + 白色下箭头；窗口图标另走 `ViewportBuilder::with_icon`。版本信息（`FileVersion` / `ProductName` / `CompanyName`）也一并写进资源。
 - **托盘图标**按 GUID 固定身份（Windows 记得用户把它摆在溢出区还是钉在任务栏上）；带 GUID 注册失败时自动退回老式 `hWnd + uID` 身份。**是否注册成功用 `set_tooltip()` 判断**（走 `NIM_MODIFY`，失败必是 `os error 5`），不能用 `TrayIcon::rect()` —— 图标在溢出区时 `Shell_NotifyIconGetRect` 恒定返 `E_FAIL`，会把成功的注册误判成失败。
 - **启动日志**：release 版没有控制台，`eprintln!` 全丢，所以启动过程写到 `data/startup.log`（每次启动截断重写），第一行就是进程完整性级别（`S-1-16-4096 (Low)` / `S-1-16-8192 (Medium)`）。托盘不显示时先看这份日志：Low 是环境限制（`Shell_NotifyIconW` 在 Low 下恒失败），Medium 还失败才是代码问题。
+- **开机自启动**：设置页「启动」卡里有一个开关，只写 `HKCU\...\Run` 的 `ADL` 值（不需要管理员权限），带着 `--auto-start` 参数。开机那次直接缩到托盘、不弹主窗口；托盘不可用时会取消静默启动（否则用户再也叫不出界面）。开关的实际状态**每次从注册表读**，所以在任务管理器「启动」页关掉它之后，界面会如实显示"关闭"。同一张卡最底下还显示托盘图标的注册结论，不用再去翻日志。
+- **代码签名**：`scripts/new-codesign-cert.ps1` 生成自签证书（`CN=棱汐 Risk, O=KralisXC`，RSA 4096 / 10 年），`scripts/sign.ps1` 给 exe 签名并自校验。**自签名治不了 SmartScreen** —— 它看的是文件信誉而不是签名是否有效，自签名永远拿不到信誉；跨机器不弹只有 EV 证书或 SignPath。
+- **CI**：`.github/workflows/release.yml` 在打 `v*` tag 时于 `windows-latest` 构建 GUI + CLI、跑冒烟测试、把 `.exe` 作为 release asset 上传（自动更新只认 asset 里的 exe）。SignPath 的签名 job 已留占位。
 - **代码签名**：`scripts/new-codesign-cert.ps1` 生成自签证书（`CN=棱汐 Risk, O=KralisXC`，RSA 4096 / 10 年），`scripts/sign.ps1` 给 exe 签名并自校验。**自签名治不了 SmartScreen** —— 它看的是文件信誉而不是签名是否有效，自签名永远拿不到信誉；跨机器不弹只有 EV 证书或 SignPath。
 
 > **渲染后端可切换**（环境变量 `ADL_RENDERER`）：
@@ -354,6 +357,9 @@ adl.notify({ title: "下载完成", body: "report.pdf · 12.4 MB" });
 - ✅ 托盘注册判据改用 `set_tooltip()`（`rect()` 在溢出区恒返 `E_FAIL`，会把成功误判成失败，导致图标被删掉）
 - ✅ 启动日志 `data/startup.log`（含进程完整性级别，托盘排查用）
 - ✅ 自签名代码签名脚本（`scripts/new-codesign-cert.ps1` / `scripts/sign.ps1`；本机不弹，跨机器仍需 EV 或 SignPath）
+- ✅ 开机自启动开关（只写 `HKCU\...\Run`，开机那次静默缩到托盘）+ 设置页回显托盘注册状态
+- ✅ GitHub Actions 发版流水线（`v*` tag → 构建 + 冒烟测试 + exe 作为 release asset；SignPath 签名 job 已留占位）
+- ✅ 查清托盘不显示的真正原因：目录带 Low 完整性标签 → 子进程继承 → `Shell_NotifyIconW` 被拒（`icacls /setintegritylevel Medium` 修好）
 - ⛔ **剪贴板监听不做**（自动嗅探剪贴板里复制的 URL 太吵；Ctrl+V 粘贴一直在）
 
 设计文档见 [docs/DESIGN.md](docs/DESIGN.md)。

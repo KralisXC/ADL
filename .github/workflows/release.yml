@@ -1,0 +1,98 @@
+name: release
+
+# 打 tag（v0.1.0 / v1.2.3）时构建 Windows 二进制并发版。
+#
+# 这个 workflow 除了发版，还有个硬性用途：SignPath Foundation 的免费签名
+# **只在 CI 里签**（他们校验构建产物的来源 workflow），所以必须先有这条
+# 可复现的构建流程，才能去申请。签名那一步是占位，等 SignPath 批下来
+# 再把 `SIGNPATH_*` secret 填上、把 `sign` job 的 if 条件打开。
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_TARGET_DIR: target
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 cargo
+        uses: Swatinem/rust-cache@v2
+
+      # 仓库里没提交 target/ 和 data/，构建是干净的。
+      # 🔴 不要在这里开 LTO 的 profile 覆盖：release profile 已在 Cargo.toml
+      # 里定好（opt-level="z", lto="fat", panic="abort", strip=true）。
+      - name: 构建（GUI + CLI）
+        run: |
+          cargo build --release -p adl-gui
+          cargo build --release -p adl-app
+
+      - name: 冒烟测试
+        run: cargo test --release -p adl-core -p adl-plugin -p adl-app
+
+      # 签名前的产物：既给自动更新用（release asset），也是 SignPath 的输入。
+      - name: 收集产物
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/release/adl-gui.exe dist/adl-gui.exe
+          Copy-Item target/release/adl.exe dist/adl.exe
+          Get-ChildItem dist | Format-Table Name, Length
+
+      - name: 上传未签名产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned
+          path: dist/*.exe
+
+      # ── 以下是 SignPath 占位 ──
+      # 申请通过后：
+      #   1. 在仓库 secret 里配 SIGNPATH_API_TOKEN / SIGNPATH_ORGANIZATION_ID
+      #   2. 把 `if: false` 去掉
+      #   3. artifact-configuration 用 SignPath 后台生成的那份 slug
+      - name: 提交 SignPath 签名请求
+        if: false
+        id: sign
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: adl
+          signing-policy-slug: release-signing
+          artifact-configuration-slug: exe
+          github-artifact-id: ${{ steps.upload.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: signed
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 取回产物
+        uses: actions/download-artifact@v4
+        with:
+          name: unsigned
+          path: dist
+
+      # 自动更新只认 release 里挂的 .exe（见 crates/adl-gui/src/update.rs），
+      # 所以这里必须把 adl-gui.exe 作为 asset 传上去，不能只传源码包。
+      - name: 发版
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.exe
+          generate_release_notes: true
+          draft: true

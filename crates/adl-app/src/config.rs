@@ -218,6 +218,14 @@ pub struct Config {
     pub task_filter: String,
     /// 是否自动检查更新（GitHub Releases）。
     pub check_update: bool,
+    /// 是否开机自动启动（Windows 写 `HKCU\...\Run`，值名 `ADL`）。
+    ///
+    /// 用户 m22520：「记得加一个是否自启动的设置」。刻意不做成安装器的
+    /// 选项 —— 用户可能一直用绿色版，"装的时候勾一下"根本没机会出现。
+    ///
+    /// 只在 `HKCU` 下写，**不需要管理员权限**：开机自启是每个用户自己的事，
+    /// 写到 HKLM 反而会让普通用户改不动、也让软件被迫提权。
+    pub auto_start: bool,
     /// 插件市场索引地址（`index.json` 的完整 URL）。空 = 用内置官方源。
     ///
     /// 之所以做成可配置：官方源是 GitHub raw，国内直连经常抽风；用户
@@ -254,6 +262,7 @@ impl Default for Config {
             task_sort: "status".to_string(),
             task_filter: "all".to_string(),
             check_update: true,
+            auto_start: false,
             market_url: String::new(),
         }
     }
@@ -456,6 +465,9 @@ task_filter = "all"
 # 启动时自动检查 GitHub 新版本
 check_update = true
 
+# 开机自动启动（写 HKCU 下的 Run 项，不需要管理员权限）
+auto_start = false
+
 # 插件市场索引地址（index.json 的完整 URL）。留空 = 用内置官方源：
 #   https://raw.githubusercontent.com/KralisXC/adl-extensions/main/index.json
 # 官方源走 GitHub raw，连不上时可以换成镜像或自己 fork 的仓库。
@@ -482,6 +494,7 @@ mod tests {
         assert_eq!(c.max_concurrent_tasks, 3);
         assert_eq!(c.task_sort, "status");
         assert!(c.check_update);
+        assert!(!c.auto_start);
         assert!(c.market_url.is_empty());
     }
 
