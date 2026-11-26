@@ -49,6 +49,7 @@ jobs:
           Get-ChildItem dist | Format-Table Name, Length
 
       - name: 上传未签名产物
+        id: upload
         uses: actions/upload-artifact@v4
         with:
           name: unsigned

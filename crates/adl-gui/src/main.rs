@@ -5360,12 +5360,16 @@ fn build_tray() -> (Option<TrayIcon>, String) {
                 }
                 Err(e) => {
                     // 真正注册失败最常见的原因是本进程跑在 Low 完整性级别
-                    // （沙箱/受限令牌）：那种情况下 Shell_NotifyIconW 直接
-                    // 返回 FALSE + 5。把原始错误写进日志和界面，别让用户猜。
-                    logfile::log(&format!("[tray] 托盘图标没能注册到任务栏（{e}）"));
+                    // （目录带了 Low 完整性标签，子进程会继承；沙箱/受限令牌
+                    // 同理）：那种情况下 Shell_NotifyIconW 直接返回 FALSE + 5。
+                    // 把原始错误和当前完整性级别一起写出来，别让用户猜。
+                    let il = platform::integrity_level();
+                    logfile::log(&format!(
+                        "[tray] 托盘图标没能注册到任务栏（{e}，当前完整性级别 {il}）"
+                    ));
                     (
                         Some(t),
-                        format!("没注册上：{e}（进程完整性级别低时会被系统拒绝）"),
+                        format!("没注册上：{e}（当前 {il}；Low 会被系统拒绝，见 data/startup.log）"),
                     )
                 }
             }
