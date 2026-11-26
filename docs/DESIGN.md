@@ -2837,6 +2837,28 @@ window "ADL 下载器"
   同一个 workflow 里留了 SignPath 签名 job（`if: false` 占位）—— SignPath Foundation
   的免费签名**只对 CI 构建产物**签发，没有这条流水线连申请都没法填。
 
+#### 13.19.10 托盘三种点击语义与「启动后显示主界面」
+
+用户 m23062：「单击还是双击都是弹右键菜单，我想的是双击左键可以唤醒这个软件，
+右键就是菜单，单击左键没反应」。
+
+- **根因**：`tray-icon` 的 `TrayIconAttributes` 默认 `menu_on_left_click: true`
+  且 `menu_on_right_click: true`，Windows 后端在收到 `WM_LBUTTONUP` 时无条件
+  `show_tray_menu(...)`（`platform_impl/windows/mod.rs:501-507`），于是单击、双击都弹菜单。
+- **修法三处**：
+  1. `build_tray_inner` 里 `.with_menu_on_left_click(false)` —— 左键不再绑菜单，
+     单击因此自然"没反应"，不需要在别处吞事件。
+  2. `fn ui` 里读 `TrayIconEvent::receiver()`，只认
+     `TrayIconEvent::DoubleClick { button: MouseButton::Left, .. }` →
+     `Visible(true)` + `Minimized(false)` + `Focus`。
+  3. `use tray_icon::{MouseButton, TrayIconEvent, ...}`。
+- 🔴 `TrayIconEvent::DoubleClick` 是 **Windows Only**（`lib.rs:614-667`）。
+- **`show_on_auto_start`**（配置项）：`true` = 开机那次照常弹窗，`false`（默认）=
+  缩到托盘后台跑。只在带 `--auto-start` 参数时生效 —— 手动双击永远开窗口，
+  否则用户会以为程序没启动。UI 上这项放在「启动」卡第二行，且用
+  `add_enabled_ui(self.s_auto_start, ..)` 在"不自启"时灰掉，省得用户以为
+  勾这个就能开机弹窗。
+
 ### 13.20 待续
 - macOS / Linux 的**真机**构建验证仍未做（本机只有 Windows；M 芯片 Mac 无法在本机测）。
   交叉编译也不能替代：`eframe` 的 glow/wgpu 后端要链接平台图形库。

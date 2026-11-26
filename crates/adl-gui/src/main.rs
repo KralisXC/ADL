@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use serde_json::{json, Value};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+use tray_icon::{Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use adl_app::config::Config;
 use adl_plugin::{Mode, PluginHooks};
@@ -198,6 +198,8 @@ struct App {
     // 「启动」页关掉它，那种工具只删注册表、不改我们的配置），
     // 所以这个值每次都从 `platform::auto_start_enabled()` 读回来。
     s_auto_start: bool,
+    // 开机自启动后是否显示主界面 —— 草稿值（用户 m23062）
+    s_show_on_boot: bool,
     // 关闭窗口时的行为 —— 草稿值（"tray" / "close"）
     s_close_action: String,
     // 限速显示单位（"auto" 或固定单位）
@@ -553,6 +555,7 @@ impl App {
             // 自启动以注册表为准，不信配置：用户可能在任务管理器的「启动」
             // 页把它关了，那种操作只删注册表项、不会改 config.toml。
             s_auto_start: platform::auto_start_enabled(),
+            s_show_on_boot: cfg.show_on_auto_start,
             s_close_action: if cfg.close_action.trim().is_empty() {
                 "tray".to_string()
             } else {
@@ -579,7 +582,7 @@ impl App {
             plugins_tab: PluginsTab::Installed,
             _tray: tray,
             tray_status,
-            boot_hidden: platform::launched_by_auto_start(),
+            boot_hidden: platform::launched_by_auto_start() && !cfg.show_on_auto_start,
             maximized: false,
             closing: false,
             fade: Fade::default(),
@@ -738,6 +741,7 @@ impl App {
             "max_concurrent_tasks": self.s_max_tasks,
             "check_update": self.s_check_update,
             "auto_start": self.s_auto_start,
+            "show_on_auto_start": self.s_show_on_boot,
             "close_action": self.s_close_action,
         });
         match set_settings(&self.gui, &args) {
@@ -776,6 +780,7 @@ impl App {
         // 「取消」把自启动也退回注册表的当前实际状态（不是配置里的值）：
         // 用户改了开关但没保存，取消就该回到"现在真的会怎样"。
         self.s_auto_start = platform::auto_start_enabled();
+        self.s_show_on_boot = cfg.show_on_auto_start;
         self.s_close_action = if cfg.close_action.trim().is_empty() {
             "tray".to_string()
         } else {
@@ -840,6 +845,9 @@ impl App {
         // 自启动跟**注册表实际状态**比，不跟配置比：任务管理器里关掉自启动
         // 只删注册表项，配置里还留着 true，拿配置比会永远显示"已更改"。
         if self.s_auto_start != platform::auto_start_enabled() {
+            n += 1;
+        }
+        if self.s_show_on_boot != cfg.show_on_auto_start {
             n += 1;
         }
         if self.s_close_action != cfg_close {
@@ -1160,6 +1168,24 @@ impl eframe::App for App {
                         self.close_ask = Some(CloseAsk { remember: true });
                     }
                 }
+            }
+        }
+
+        // 托盘左键双击 = 唤醒窗口（用户 m23062：「双击左键可以唤醒这个软件，
+        // 右键就是菜单，单击左键没反应」）。
+        //
+        // 菜单本身由 `with_menu_on_left_click(false)` 关掉左键绑定，所以
+        // 左键单击不会再弹菜单、也不用在这里"吞掉"它 —— tray-icon 会把
+        // 单击作为 `Click { button: Left, .. }` 送进来，我们什么都不做即可。
+        while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
+            if let TrayIconEvent::DoubleClick {
+                button: MouseButton::Left,
+                ..
+            } = ev
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
         }
 
@@ -3181,6 +3207,7 @@ impl App {
             was_max_tasks,
             was_check_update,
             was_close,
+            was_show_on_boot,
         ) = {
             let cfg = self.gui.cfg.lock().unwrap();
             (
@@ -3206,6 +3233,7 @@ impl App {
                 } else {
                     cfg.close_action.clone()
                 },
+                cfg.show_on_auto_start,
             )
         };
         // 自启动的"原值"不取配置，取注册表实际状态（任务管理器关掉后
@@ -3574,7 +3602,8 @@ impl App {
         // 只信配置的话界面会显示"开着"但实际不会自启。
         ui.add_space(10.0);
         adl_ui::widgets::card(ui, |ui| {
-            let dirty = self.s_auto_start != was_auto_start;
+            let dirty = self.s_auto_start != was_auto_start
+                || self.s_show_on_boot != was_show_on_boot;
             dirty_title(ui, "启动", dirty);
             ui.add_space(6.0);
             ui.horizontal(|ui| {
@@ -3583,7 +3612,7 @@ impl App {
                 if ui.checkbox(&mut on, "开机自动启动").changed() {
                     self.s_auto_start = on;
                 }
-                if dirty {
+                if self.s_auto_start != was_auto_start {
                     adl_ui::widgets::badge(
                         ui,
                         &format!("原：{}", if was_auto_start { "开启" } else { "关闭" }),
@@ -3591,11 +3620,36 @@ impl App {
                     );
                 }
             });
+            // 第二项只在真的会自启时才有意义，关着就灰掉，省得用户以为
+            // "勾了这个就能开机弹窗" —— 开机根本不跑，弹什么窗。
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                let mut show = self.s_show_on_boot;
+                let resp = ui.add_enabled_ui(self.s_auto_start, |ui| {
+                    ui.checkbox(&mut show, "启动后显示主界面")
+                });
+                if resp.inner.changed() {
+                    self.s_show_on_boot = show;
+                }
+                if self.s_show_on_boot != was_show_on_boot {
+                    adl_ui::widgets::badge(
+                        ui,
+                        &format!("原：{}", if was_show_on_boot { "显示" } else { "静默" }),
+                        pal().warn,
+                    );
+                }
+            });
             ui.add_space(4.0);
             adl_ui::widgets::hint(
                 ui,
-                "开机那次直接缩到托盘、不弹主窗口，接着下上次没下完的。\
-                 不想让它开机跑，也可以在任务管理器的「启动」页关掉。",
+                if self.s_show_on_boot {
+                    "开机那次会照常弹出主窗口。手动双击启动永远会开窗口，不受这里影响。"
+                } else {
+                    "开机那次缩到托盘后台跑，不弹主窗口，接着下上次没下完的。\
+                     手动双击启动永远会开窗口，不受这里影响。\
+                     不想让它开机跑，也可以在任务管理器的「启动」页关掉。"
+                },
             );
             // 托盘状态：注册失败时用户只知道"没有图标"，不知道原因。
             // 这一行直接摊开说，免得再走"翻 startup.log"那一步。
@@ -5173,6 +5227,7 @@ fn settings_json(cfg: &Config) -> Value {
         "max_concurrent_tasks": cfg.max_concurrent_tasks,
         "check_update": cfg.check_update,
         "auto_start": cfg.auto_start,
+        "show_on_auto_start": cfg.show_on_auto_start,
         "close_action": cfg.close_action,
     })
 }
@@ -5213,6 +5268,9 @@ fn set_settings(gui: &Arc<Gui>, args: &Value) -> Result<Value, String> {
     // 而命令行改配置不该悄悄动注册表。
     if let Some(b) = args.get("auto_start").and_then(|x| x.as_bool()) {
         cfg.auto_start = b;
+    }
+    if let Some(b) = args.get("show_on_auto_start").and_then(|x| x.as_bool()) {
+        cfg.show_on_auto_start = b;
     }
     if let Some(a) = args.get("close_action").and_then(|x| x.as_str()) {
         cfg.close_action = a.to_string();
@@ -5389,6 +5447,11 @@ fn build_tray_inner(use_guid: bool) -> Option<TrayIcon> {
     let _ = menu.append(&quit);
     let mut b = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
+        // 🔴 `tray-icon` 默认把左键和右键**都**绑到菜单上
+        // （`menu_on_left_click: true` / `menu_on_right_click: true`），
+        // 所以不关掉的话单击、双击都会弹菜单。用户 m23062 要的是
+        // 左键双击唤醒窗口、右键弹菜单、左键单击没反应。
+        .with_menu_on_left_click(false)
         .with_tooltip("ADL 下载器");
     if use_guid {
         // 固定身份：Windows 用 GUID 记住"固定到任务栏 / 收进溢出区"。

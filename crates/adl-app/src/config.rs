@@ -226,6 +226,15 @@ pub struct Config {
     /// 只在 `HKCU` 下写，**不需要管理员权限**：开机自启是每个用户自己的事，
     /// 写到 HKLM 反而会让普通用户改不动、也让软件被迫提权。
     pub auto_start: bool,
+    /// 开机自启动之后要不要把主界面露出来。
+    ///
+    /// 用户 m23062：「自动启动的话添加多一个设置就是启动之后要不要打开这个界面，
+    /// 还是说静默启动在后台」。`true` = 开机那次照常弹窗；`false`（默认）=
+    /// 缩到托盘后台跑，不打扰正在开机的人。
+    ///
+    /// 只在**开机那次**（带 `--auto-start` 参数）有意义：手动双击永远会开窗口，
+    /// 否则用户会以为程序没启动起来。
+    pub show_on_auto_start: bool,
     /// 插件市场索引地址（`index.json` 的完整 URL）。空 = 用内置官方源。
     ///
     /// 之所以做成可配置：官方源是 GitHub raw，国内直连经常抽风；用户
@@ -263,6 +272,7 @@ impl Default for Config {
             task_filter: "all".to_string(),
             check_update: true,
             auto_start: false,
+            show_on_auto_start: false,
             market_url: String::new(),
         }
     }
@@ -468,6 +478,9 @@ check_update = true
 # 开机自动启动（写 HKCU 下的 Run 项，不需要管理员权限）
 auto_start = false
 
+# 开机自启动时是否把主界面露出来。false = 静默缩到托盘后台跑
+show_on_auto_start = false
+
 # 插件市场索引地址（index.json 的完整 URL）。留空 = 用内置官方源：
 #   https://raw.githubusercontent.com/KralisXC/adl-extensions/main/index.json
 # 官方源走 GitHub raw，连不上时可以换成镜像或自己 fork 的仓库。
@@ -495,6 +508,7 @@ mod tests {
         assert_eq!(c.task_sort, "status");
         assert!(c.check_update);
         assert!(!c.auto_start);
+        assert!(!c.show_on_auto_start);
         assert!(c.market_url.is_empty());
     }
 
