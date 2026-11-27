@@ -806,3 +806,205 @@ pub fn schedule_force_show() {
         ));
     });
 }
+
+// ── adl:// 协议（浏览器扩展把 ADL 拉起来用） ───────────────────────────
+//
+// 用户 m24107：「如果我没开软件但是浏览器插件开了接管可以直接打开我们的软件」。
+// 走自注册的 URL 协议是最省事的做法：扩展只要 `chrome.tabs.create({url:"adl://open"})`
+// 就能把程序叫起来，不必知道 exe 装在哪（Web 页面无法启动本地程序，浏览器
+// 只认已注册的协议）。
+//
+// 只写 `HKCU`：不需要管理员，也不影响别的用户。
+// 🔴 绿色版 / 免安装版必须调一次才会生效 —— 安装器里会调。
+
+/// 协议名（不含 `://`）。
+pub const URL_SCHEME: &str = "adl";
+
+/// 这个进程是不是被浏览器（`adl://` 协议）拉起的。
+///
+/// 和 `--auto-start` 分开判断：被浏览器拉起时不该弹主窗口抢焦点，
+/// 用户此时正在浏览器里点下载，ADL 只该在后台开好本地接口。
+pub fn launched_by_browser() -> bool {
+    std::env::args().any(|a| a == "--from-browser")
+}
+
+#[cfg(windows)]
+pub fn url_scheme_registered() -> bool {
+    use windows_sys::Win32::System::Registry::{
+        RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ,
+    };
+    let sub = wide(&format!("Software\\Classes\\{}", URL_SCHEME));
+    let mut size = 0u32;
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            sub.as_ptr(),
+            std::ptr::null(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut size,
+        )
+    };
+    rc == 0 && size > 2
+}
+
+/// 把 `adl://` 注册到当前用户（写 `HKCU\Software\Classes\adl`）。
+///
+/// 幂等：已注册成同一个 exe 就直接返回 Ok，不重复写。
+#[cfg(windows)]
+pub fn register_url_scheme() -> Result<(), String> {
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY_CURRENT_USER, KEY_WRITE,
+        REG_OPTION_NON_VOLATILE, REG_SZ,
+    };
+
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("拿不到自己的路径: {e}"))?
+        .display()
+        .to_string();
+    // %1 会被 shell 替换成实际 URL；不加引号的话带空格的路径会被拆开。
+    let cmd = format!("\"{exe}\" --from-browser \"%1\"");
+
+    // 已经指对了就不动注册表（省一次写，也少一次被安全软件拦的机会）。
+    if url_scheme_registered() {
+        if let Some(cur) = scheme_command() {
+            if cur == cmd {
+                return Ok(());
+            }
+        }
+    }
+
+    let root = wide(&format!("Software\\Classes\\{}", URL_SCHEME));
+    let mut key = std::ptr::null_mut();
+    let rc = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            root.as_ptr(),
+            0,
+            std::ptr::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_WRITE,
+            std::ptr::null(),
+            &mut key,
+            std::ptr::null_mut(),
+        )
+    };
+    if rc != 0 {
+        return Err(format!("建不了 adl:// 的注册表项（错误码 {rc}）"));
+    }
+
+    // 1) 标记这是个 URL 协议（值为空字符串）
+    let url_protocol = wide("URL Protocol");
+    unsafe {
+        RegSetValueExW(
+            key,
+            url_protocol.as_ptr(),
+            0,
+            REG_SZ,
+            b"\0".as_ptr(),
+            2,
+        );
+    }
+
+    // 2) shell\open\command = "exe" --from-browser "%1"
+    let cmd_key_path = wide(&format!(
+        "Software\\Classes\\{}\\shell\\open\\command",
+        URL_SCHEME
+    ));
+    let mut cmd_key = std::ptr::null_mut();
+    let rc2 = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            cmd_key_path.as_ptr(),
+            0,
+            std::ptr::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_WRITE,
+            std::ptr::null(),
+            &mut cmd_key,
+            std::ptr::null_mut(),
+        )
+    };
+    let result = if rc2 != 0 {
+        Err(format!("建不了 adl:// 的 command 项（错误码 {rc2}）"))
+    } else {
+        let data = wide(&cmd);
+        let bytes = data.len() * std::mem::size_of::<u16>();
+        let rc3 = unsafe {
+            RegSetValueExW(
+                cmd_key,
+                std::ptr::null(),
+                0,
+                REG_SZ,
+                data.as_ptr() as *const u8,
+                bytes as u32,
+            )
+        };
+        if rc3 == 0 {
+            Ok(())
+        } else {
+            Err(format!("写 adl:// 的启动命令失败（错误码 {rc3}）"))
+        }
+    };
+
+    unsafe {
+        RegCloseKey(cmd_key);
+        RegCloseKey(key);
+    }
+    result
+}
+
+/// 读回当前注册的启动命令（用于判断要不要重写）。
+#[cfg(windows)]
+fn scheme_command() -> Option<String> {
+    use windows_sys::Win32::System::Registry::{
+        RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ,
+    };
+    let sub = wide(&format!(
+        "Software\\Classes\\{}\\shell\\open\\command",
+        URL_SCHEME
+    ));
+    let mut size = 0u32;
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            sub.as_ptr(),
+            std::ptr::null(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut size,
+        )
+    };
+    if rc != 0 || size < 4 {
+        return None;
+    }
+    let mut buf = vec![0u16; (size as usize) / 2 + 1];
+    let rc2 = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            sub.as_ptr(),
+            std::ptr::null(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr() as *mut core::ffi::c_void,
+            &mut size,
+        )
+    };
+    if rc2 != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(String::from_utf16_lossy(&buf[..end]))
+}
+
+#[cfg(not(windows))]
+pub fn url_scheme_registered() -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+pub fn register_url_scheme() -> Result<(), String> {
+    Err("这个平台还没有实现 adl:// 协议注册".to_string())
+}

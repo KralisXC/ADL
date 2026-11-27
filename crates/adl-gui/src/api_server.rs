@@ -2,9 +2,12 @@
 //!
 //! 安全模型（缺一即漏洞）：
 //!   1. 只绑 127.0.0.1，外部网络不可达；
-//!   2. 会改变状态的接口（/add /probe /check）必须带正确 token；
+//!   2. 会改变状态的接口（/add /probe /check /notify）必须带正确 token；
 //!   3. 校验 Origin：空（MV3 Service Worker 直发不带 Origin）或 chrome-extension://
 //!      / moz-extension:// 才放行；普通网页无法省略 Origin，因此拿不到 token、也调不动。
+//!
+//! 只读的 `/ping` `/bridge` 不要 token：扩展刚启动、ADL 刚被拉起时还不知道
+//! token，但那时候正需要这两个接口来"问地址、问配置"。
 //!
 //! 注意：token 由 `/auto-token` 下发给扩展，该接口同样做 Origin 校验。
 
@@ -20,6 +23,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_PORT: u16 = 17800;
 
+/// `/bridge` 的接口版本。扩展拿这个判断自己还能不能用，
+/// 将来协议不兼容时加一，扩展发现版本过大就只保留"浏览器原生下载"。
+pub const BRIDGE_API: u32 = 1;
+
 fn gen_token() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -34,12 +41,58 @@ fn gen_token() -> String {
     format!("{:016x}{:016x}", a.finish(), b.finish())
 }
 
+/// `/bridge` 里报给扩展的那几项配置快照。
+///
+/// 单独拷一份而不是每次请求都读 `gui.cfg`：扩展问 bridge 是热路径（每次
+/// 下载都会问），而 `cfg` 是 Mutex，没必要为几个 bool 去抢锁。
+#[derive(Clone)]
+struct BridgeCfg {
+    real_port: u16,
+    send_cookies: bool,
+    min_mb: u64,
+    notify_fail: bool,
+    allow_launch: bool,
+}
+
 /// 启动 API 服务，返回实际监听端口。
+///
+/// 除了配置端口，端口不是 17800 时还会在 17800 上再绑一个"发现端口"：
+/// 浏览器扩展是硬编码往 17800 问的，用户改了端口之后它得能问出真实端口。
+/// 两个端口共用同一套 handler，只有 `/bridge` 里报的 `port` 可能不同。
 pub fn start(gui: Arc<Gui>, port: u16) -> std::io::Result<u16> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     let actual = listener.local_addr()?.port();
     let token = Arc::new(gen_token());
-    thread::Builder::new()
+    let bridge = {
+        let cfg = gui.cfg.lock().unwrap();
+        BridgeCfg {
+            real_port: actual,
+            send_cookies: cfg.browser_send_cookies,
+            min_mb: cfg.browser_min_mb,
+            notify_fail: cfg.browser_notify_fail,
+            allow_launch: cfg.browser_allow_launch,
+        }
+    };
+    spawn_listener(listener, gui.clone(), token.clone(), bridge.clone());
+    if actual != DEFAULT_PORT {
+        match TcpListener::bind(("127.0.0.1", DEFAULT_PORT)) {
+            Ok(alias) => spawn_listener(alias, gui, token, bridge),
+            // 端口被别的程序占了不算致命：用户手动把扩展指到真实端口也能用。
+            Err(e) => eprintln!(
+                "[api] {DEFAULT_PORT} 上绑不上发现端口（{e}），扩展需要手动填端口 {actual}"
+            ),
+        }
+    }
+    Ok(actual)
+}
+
+fn spawn_listener(
+    listener: TcpListener,
+    gui: Arc<Gui>,
+    token: Arc<String>,
+    bridge: BridgeCfg,
+) {
+    let _ = thread::Builder::new()
         .name("adl-api".into())
         .spawn(move || {
             for stream in listener.incoming() {
@@ -47,17 +100,17 @@ pub fn start(gui: Arc<Gui>, port: u16) -> std::io::Result<u16> {
                     Ok(s) => {
                         let g = gui.clone();
                         let t = token.clone();
+                        let b = bridge.clone();
                         let _ = thread::Builder::new()
                             .name("adl-api-conn".into())
                             .spawn(move || {
-                                let _ = handle_conn(s, &g, &t);
+                                let _ = handle_conn(s, &g, &t, &b);
                             });
                     }
                     Err(_) => continue,
                 }
             }
-        })?;
-    Ok(actual)
+        });
 }
 
 struct Req {
@@ -141,7 +194,12 @@ fn origin_allowed(origin: &str) -> bool {
         || origin.starts_with("moz-extension://")
 }
 
-fn handle_conn(mut stream: TcpStream, gui: &Arc<Gui>, token: &str) -> std::io::Result<()> {
+fn handle_conn(
+    mut stream: TcpStream,
+    gui: &Arc<Gui>,
+    token: &str,
+    bridge: &BridgeCfg,
+) -> std::io::Result<()> {
     let req = match read_req(&mut stream) {
         Ok(r) => r,
         Err(_) => return Ok(()),
@@ -157,6 +215,29 @@ fn handle_conn(mut stream: TcpStream, gui: &Arc<Gui>, token: &str) -> std::io::R
     let (status, body): (u16, String) = match (req.method.as_str(), req.path.as_str()) {
         ("OPTIONS", _) => (204, String::new()),
         ("GET", "/ping") => (200, json!({"ok": true, "pong": true}).to_string()),
+        // 扩展的"问路"接口：不要 token（ADL 刚被拉起来时扩展还没拿到 token），
+        // 但要校验 Origin —— 普通网页拿不到这个响应里的任何敏感信息，
+        // 最多知道"这台机器上装了 ADL"。
+        ("GET", "/bridge") => {
+            if !origin_allowed(&origin) {
+                (403, json!({"ok": false, "error": "forbidden origin"}).to_string())
+            } else {
+                (
+                    200,
+                    json!({
+                        "ok": true,
+                        "api": BRIDGE_API,
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "port": bridge.real_port,
+                        "send_cookies": bridge.send_cookies,
+                        "min_mb": bridge.min_mb,
+                        "notify_fail": bridge.notify_fail,
+                        "allow_launch": bridge.allow_launch,
+                    })
+                    .to_string(),
+                )
+            }
+        }
         ("GET", "/status") => (
             200,
             json!({
@@ -173,12 +254,32 @@ fn handle_conn(mut stream: TcpStream, gui: &Arc<Gui>, token: &str) -> std::io::R
                 (403, json!({"ok": false, "error": "forbidden origin"}).to_string())
             }
         }
-        ("POST", "/add") | ("POST", "/probe") | ("GET", "/check") => {
+        ("POST", "/add") | ("POST", "/probe") | ("POST", "/notify") | ("GET", "/check") => {
             if !origin_allowed(&origin) {
                 (403, json!({"ok": false, "error": "forbidden origin"}).to_string())
             } else if tok != token {
                 (401, json!({"ok": false, "error": "bad token"}).to_string())
             } else if req.path == "/check" {
+                (200, json!({"ok": true}).to_string())
+            } else if req.path == "/notify" {
+                // 扩展接管失败（连不上、ADL 太旧、参数被拒）时让桌面端弹一条
+                // 消息，而不是只在扩展的 console 里 warn —— 用户根本看不到
+                // console。`cfg.browser_notify_fail` 关掉时静默丢弃。
+                let v: Value = serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}));
+                let msg = v.get("message").and_then(|x| x.as_str()).unwrap_or("");
+                let err = v.get("error").and_then(|x| x.as_bool()).unwrap_or(true);
+                if bridge.notify_fail && !msg.is_empty() {
+                    crate::push_notice(
+                        gui,
+                        if err {
+                            crate::notice::Level::Warn
+                        } else {
+                            crate::notice::Level::Info
+                        },
+                        "浏览器接管".to_string(),
+                        msg.to_string(),
+                    );
+                }
                 (200, json!({"ok": true}).to_string())
             } else if req.path == "/add" {
                 let v: Value = serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}));

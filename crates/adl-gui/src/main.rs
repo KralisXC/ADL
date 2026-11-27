@@ -153,6 +153,10 @@ enum Tab {
     /// 页面显示"任务已删除"而不是崩。
     TaskDetail(u64),
     Settings,
+    /// 浏览器接管：扩展端的全部配置都在这里调，浏览器里只留一个开关。
+    ///
+    /// 用户 m24075：「浏览器上只有开启关闭，其他的我想能在我们的软件里调」。
+    Browser,
     Plugin(String, String),
 }
 
@@ -200,6 +204,14 @@ struct App {
     s_auto_start: bool,
     // 开机自启动后是否显示主界面 —— 草稿值（用户 m23062）
     s_show_on_boot: bool,
+    // 浏览器接管的几项 —— 都是草稿值，点「保存设置」才落盘（用户 m24075：
+    // 「浏览器上只有开启关闭，其他的我想能在我们的软件里调」）。
+    // 端口用 u64 存，方便直接喂 DragValue。
+    s_browser_port: u64,
+    s_browser_cookies: bool,
+    s_browser_min_mb: u64,
+    s_browser_notify_fail: bool,
+    s_browser_allow_launch: bool,
     // 关闭窗口时的行为 —— 草稿值（"tray" / "close"）
     s_close_action: String,
     // 限速显示单位（"auto" 或固定单位）
@@ -519,6 +531,7 @@ impl App {
             "notices" => Tab::Notices,
             "terminal" => Tab::Terminal,
             "settings" => Tab::Settings,
+            "browser" => Tab::Browser,
             s if s.starts_with("plugin:") => {
                 let mut it = s.trim_start_matches("plugin:").splitn(2, ':');
                 let p = it.next().unwrap_or("").to_string();
@@ -556,6 +569,11 @@ impl App {
             // 页把它关了，那种操作只删注册表项、不会改 config.toml。
             s_auto_start: platform::auto_start_enabled(),
             s_show_on_boot: cfg.show_on_auto_start,
+            s_browser_port: cfg.browser_port as u64,
+            s_browser_cookies: cfg.browser_send_cookies,
+            s_browser_min_mb: cfg.browser_min_mb,
+            s_browser_notify_fail: cfg.browser_notify_fail,
+            s_browser_allow_launch: cfg.browser_allow_launch,
             s_close_action: if cfg.close_action.trim().is_empty() {
                 "tray".to_string()
             } else {
@@ -582,7 +600,11 @@ impl App {
             plugins_tab: PluginsTab::Installed,
             _tray: tray,
             tray_status,
-            boot_hidden: platform::launched_by_auto_start() && !cfg.show_on_auto_start,
+            // 静默起的两种来源：开机自启（且用户没要求显示界面）、
+            // 被浏览器扩展通过 adl:// 拉起来。后者必须静默 —— 用户正在浏览器
+            // 里点下载，这时候弹一个主窗口盖上来是纯打扰。
+            boot_hidden: (platform::launched_by_auto_start() && !cfg.show_on_auto_start)
+                || platform::launched_by_browser(),
             maximized: false,
             closing: false,
             fade: Fade::default(),
@@ -743,6 +765,12 @@ impl App {
             "auto_start": self.s_auto_start,
             "show_on_auto_start": self.s_show_on_boot,
             "close_action": self.s_close_action,
+            // 浏览器接管：端口/规则都在桌面端调，扩展只留一个开关（m24075）
+            "browser_port": self.s_browser_port,
+            "browser_send_cookies": self.s_browser_cookies,
+            "browser_min_mb": self.s_browser_min_mb,
+            "browser_notify_fail": self.s_browser_notify_fail,
+            "browser_allow_launch": self.s_browser_allow_launch,
         });
         match set_settings(&self.gui, &args) {
             Ok(_) => {
@@ -781,6 +809,11 @@ impl App {
         // 用户改了开关但没保存，取消就该回到"现在真的会怎样"。
         self.s_auto_start = platform::auto_start_enabled();
         self.s_show_on_boot = cfg.show_on_auto_start;
+        self.s_browser_port = cfg.browser_port as u64;
+        self.s_browser_cookies = cfg.browser_send_cookies;
+        self.s_browser_min_mb = cfg.browser_min_mb;
+        self.s_browser_notify_fail = cfg.browser_notify_fail;
+        self.s_browser_allow_launch = cfg.browser_allow_launch;
         self.s_close_action = if cfg.close_action.trim().is_empty() {
             "tray".to_string()
         } else {
@@ -848,6 +881,21 @@ impl App {
             n += 1;
         }
         if self.s_show_on_boot != cfg.show_on_auto_start {
+            n += 1;
+        }
+        if self.s_browser_port != cfg.browser_port as u64 {
+            n += 1;
+        }
+        if self.s_browser_cookies != cfg.browser_send_cookies {
+            n += 1;
+        }
+        if self.s_browser_min_mb != cfg.browser_min_mb {
+            n += 1;
+        }
+        if self.s_browser_notify_fail != cfg.browser_notify_fail {
+            n += 1;
+        }
+        if self.s_browser_allow_launch != cfg.browser_allow_launch {
             n += 1;
         }
         if self.s_close_action != cfg_close {
@@ -1582,7 +1630,8 @@ impl eframe::App for App {
                 //
                 // 必须放在页面级 ScrollArea **外面**：设置页有十来张卡片，
                 // 保存按钮原来在页面最底部，改完靠上的某项还得一路滚下去。
-                if self.tab == Tab::Settings {
+                // 「浏览器接管」页也是同一套草稿机制，共用这条 bar。
+                if matches!(self.tab, Tab::Settings | Tab::Browser) {
                     if self.settings_bar(ui) {
                         self.do_save_settings();
                     }
@@ -1626,6 +1675,7 @@ impl eframe::App for App {
                                 Tab::Home => self.page_home(ui),
                                 Tab::Plugins => self.page_plugins(ui),
                                 Tab::Settings => self.page_settings(ui),
+                                Tab::Browser => self.page_browser(ui),
                                 Tab::Plugin(_, _) => self.page_plugin(ui),
                                 Tab::TaskDetail(id) => self.page_task_detail(ui, id),
                                 // 上面已经 return 了，这里只是让 match 穷尽。
@@ -1743,6 +1793,11 @@ impl App {
         if track(ui, self.tab == Tab::Terminal, "终端") {
             self.tab = Tab::Terminal;
             self.term.focus = true;
+        }
+        ui.add_space(2.0);
+        // 浏览器接管：扩展那边只有一个开关，其余设置全在这一页（m24075）。
+        if track(ui, self.tab == Tab::Browser, "浏览器接管") {
+            self.tab = Tab::Browser;
         }
 
         // ── 插件：页面 + 最多 5 个设置入口，超出的走"更多设置" ──
@@ -1918,6 +1973,7 @@ impl App {
             Tab::Terminal => "终端".to_string(),
             Tab::TaskDetail(id) => format!("任务 #{id}"),
             Tab::Settings => "设置".to_string(),
+            Tab::Browser => "浏览器接管".to_string(),
             Tab::Plugin(plugin, page) => {
                 // 插件设置伪页面：`adl` + `settings:<pluginId>`
                 if plugin == "adl" {
@@ -3859,6 +3915,237 @@ impl App {
         }
     }
 
+    /// 浏览器接管页：扩展端的一切配置都在这里调。
+    ///
+    /// 用户 m24075：「我们的浏览器插件我想的是特别简洁的，意思就是在浏览器上
+    /// 只有开启接管和关闭接管和获取页面的这些，就如同 idm，只有开启关闭……
+    /// 其他的我想能在我们的软件插件连接浏览器插件调整」。所以浏览器里只剩
+    /// 一个开关，端口、Cookie、大小阈值、失败提示全搬到这一页。
+    ///
+    /// 这一页和「设置」共用顶部那条 `settings_bar`（草稿 + 已更改 N 项 + 取消），
+    /// 因为两者改的都是同一份 `Config`，各留一套保存按钮只会让人搞不清存了没。
+    fn page_browser(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(2.0);
+
+        // 「原值」一次抄出来，下面按项比。端口/阈值都是 u64 草稿值。
+        let (was_port, was_cookies, was_min_mb, was_notify, was_launch, mode_name) = {
+            let cfg = self.gui.cfg.lock().unwrap();
+            (
+                cfg.browser_port as u64,
+                cfg.browser_send_cookies,
+                cfg.browser_min_mb,
+                cfg.browser_notify_fail,
+                cfg.browser_allow_launch,
+                if cfg.mode_trusted() {
+                    "信任模式"
+                } else {
+                    "安全模式"
+                }
+                .to_string(),
+            )
+        };
+
+        // ── 1. 状态 ──
+        adl_ui::widgets::card(ui, |ui| {
+            adl_ui::widgets::section_title(ui, "本地接口");
+            ui.add_space(4.0);
+            // 端口是不是真的在听：直接连一下最快，别让用户去猜"配了但没生效"。
+            let listening = {
+                let addr = std::net::SocketAddr::from(([127, 0, 0, 1], self.s_browser_port as u16));
+                std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(120)).is_ok()
+            };
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let color = if listening { pal().accent } else { pal().danger };
+                ui.label(egui::RichText::new("●").size(11.0).color(color));
+                ui.label(
+                    egui::RichText::new(format!("127.0.0.1:{}", self.s_browser_port))
+                        .font(egui::FontId::monospace(12.5))
+                        .color(ink()),
+                );
+                if listening {
+                    adl_ui::widgets::badge(ui, "正在监听", pal().accent);
+                } else {
+                    adl_ui::widgets::badge(ui, "没在监听", pal().danger);
+                }
+            });
+            if self.s_browser_port != was_port {
+                ui.add_space(6.0);
+                adl_ui::widgets::hint_was(
+                    ui,
+                    &format!("原：{}，改端口要重启 ADL 才生效", was_port),
+                );
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                ui.label("端口");
+                let mut p = self.s_browser_port;
+                if ui
+                    .add(egui::DragValue::new(&mut p).range(1024..=65535).speed(1.0))
+                    .changed()
+                {
+                    self.s_browser_port = p;
+                }
+                adl_ui::widgets::hint(ui, "改了之后扩展仍能从 17800 问出新端口");
+            });
+        });
+
+        ui.add_space(10.0);
+
+        // ── 2. 接管行为 ──
+        adl_ui::widgets::card(ui, |ui| {
+            let dirty = self.s_browser_cookies != was_cookies
+                || self.s_browser_notify_fail != was_notify
+                || self.s_browser_allow_launch != was_launch;
+            dirty_title(ui, "接管行为", dirty);
+            ui.add_space(6.0);
+
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                let mut on = self.s_browser_cookies;
+                if ui.checkbox(&mut on, "把页面 Cookie 一起交给下载器").changed() {
+                    self.s_browser_cookies = on;
+                }
+                if self.s_browser_cookies != was_cookies {
+                    adl_ui::widgets::badge(
+                        ui,
+                        &format!("原：{}", if was_cookies { "开启" } else { "关闭" }),
+                        pal().warn,
+                    );
+                }
+            });
+            adl_ui::widgets::hint(
+                ui,
+                "需要登录才能下的站点必须开（比如网盘、论坛附件）。关掉之后站点会认为你没登录。",
+            );
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                let mut on = self.s_browser_notify_fail;
+                if ui.checkbox(&mut on, "接管失败时在消息中心提醒").changed() {
+                    self.s_browser_notify_fail = on;
+                }
+                if self.s_browser_notify_fail != was_notify {
+                    adl_ui::widgets::badge(
+                        ui,
+                        &format!("原：{}", if was_notify { "开启" } else { "关闭" }),
+                        pal().warn,
+                    );
+                }
+            });
+            adl_ui::widgets::hint(
+                ui,
+                "扩展那边只会在自己的控制台里留一行警告，用户根本看不到，所以由桌面端来说。",
+            );
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                let mut on = self.s_browser_allow_launch;
+                if ui
+                    .checkbox(&mut on, "ADL 没开时允许浏览器把它拉起来")
+                    .changed()
+                {
+                    self.s_browser_allow_launch = on;
+                }
+                if self.s_browser_allow_launch != was_launch {
+                    adl_ui::widgets::badge(
+                        ui,
+                        &format!("原：{}", if was_launch { "开启" } else { "关闭" }),
+                        pal().warn,
+                    );
+                }
+            });
+            // 用户 m24107：「如果我没开软件但是浏览器插件开了接管可以直接打开
+            // 我们的软件」。实现走自注册的 adl:// 协议 —— 但协议注册是写注册表，
+            // 得等安装器/首次运行时做，这里先如实说清当前状态。
+            adl_ui::widgets::hint(
+                ui,
+                "靠 adl:// 协议把程序拉起来，拉起后静默缩到托盘、只开本地接口。\
+                 协议要由安装器注册，绿色版需要手动关联一次。",
+            );
+        });
+
+        ui.add_space(10.0);
+
+        // ── 3. 哪些下载交给浏览器自己下 ──
+        adl_ui::widgets::card(ui, |ui| {
+            dirty_title(ui, "接管范围", self.s_browser_min_mb != was_min_mb);
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                ui.label("小于");
+                let mut mb = self.s_browser_min_mb;
+                if ui
+                    .add(egui::DragValue::new(&mut mb).range(0..=10240).speed(1.0))
+                    .changed()
+                {
+                    self.s_browser_min_mb = mb;
+                }
+                ui.label("MB 的下载不接管");
+                if self.s_browser_min_mb != was_min_mb {
+                    adl_ui::widgets::badge(ui, &format!("原：{was_min_mb}"), pal().warn);
+                }
+            });
+            adl_ui::widgets::hint(
+                ui,
+                "0 = 全部接管。小文件走浏览器原生下载更快 —— 不用起引擎、不用建断点续传的控制文件。",
+            );
+        });
+
+        ui.add_space(10.0);
+
+        // ── 4. 怎么装扩展 ──
+        adl_ui::widgets::card(ui, |ui| {
+            adl_ui::widgets::section_title(ui, "浏览器扩展");
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(
+                    "扩展在仓库的 browser-extension/ 目录里，浏览器里只需一个「接管」开关。",
+                )
+                .size(12.5)
+                .color(ink()),
+            );
+            ui.add_space(6.0);
+            let mut open_dir = false;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                if ui.button("打开扩展目录").clicked() {
+                    open_dir = true;
+                }
+                adl_ui::widgets::hint(
+                    ui,
+                    &format!("当前插件模式：{mode_name}。扩展只把网址和 Cookie 交给本地接口，不碰别的。"),
+                );
+            });
+            ui.add_space(4.0);
+            adl_ui::widgets::hint(
+                ui,
+                "Edge/Chrome 里打开扩展管理页 → 开发者模式 → 加载解压缩的扩展 → 选这个目录。",
+            );
+            // 扩展源码在仓库里、不在 exe 旁边；找不到就只报状态，别弹不存在的路径。
+            if open_dir {
+                let dir = std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                    .map(|d| d.join("browser-extension"));
+                match dir {
+                    Some(d) if d.exists() => {
+                        if let Err(e) = platform::open_path(&d) {
+                            self.set_status(format!("打开目录失败: {e}"), true);
+                        }
+                    }
+                    _ => self.set_status(
+                        "开发版没有带扩展目录；装好的版本会在程序目录下放 browser-extension/",
+                        true,
+                    ),
+                }
+            }
+        });
+    }
+
     /// 消息中心：下载完成 / 失败 / 插件通知留档在这里。
     ///
     /// 时间倒序（新的在上面）：追事件的时候人总是想知道"刚才发生了什么"。
@@ -5262,6 +5549,16 @@ pub(crate) fn gui_snapshot(gui: &Arc<Gui>) -> Value {
     json!(arr)
 }
 
+/// 从非 UI 线程往消息中心塞一条通知（界面每帧取走并弹 toast）。
+///
+/// 和下载任务、插件走同一条通道；`api_server` 用它把"浏览器接管失败"
+/// 报给桌面端 —— 扩展那边的 `console.warn` 用户是看不到的。
+pub(crate) fn push_notice(gui: &Arc<Gui>, level: notice::Level, title: String, body: String) {
+    if let Ok(mut q) = gui.pending_notices.lock() {
+        q.push((level, title, body));
+    }
+}
+
 fn settings_json(cfg: &Config) -> Value {
     json!({
         "dir": cfg.dir,
@@ -5277,6 +5574,11 @@ fn settings_json(cfg: &Config) -> Value {
         "auto_start": cfg.auto_start,
         "show_on_auto_start": cfg.show_on_auto_start,
         "close_action": cfg.close_action,
+        "browser_port": cfg.browser_port,
+        "browser_send_cookies": cfg.browser_send_cookies,
+        "browser_min_mb": cfg.browser_min_mb,
+        "browser_notify_fail": cfg.browser_notify_fail,
+        "browser_allow_launch": cfg.browser_allow_launch,
     })
 }
 
@@ -5325,6 +5627,25 @@ fn set_settings(gui: &Arc<Gui>, args: &Value) -> Result<Value, String> {
     }
     if let Some(u) = args.get("limit_unit").and_then(|x| x.as_str()) {
         cfg.limit_unit = u.to_string();
+    }
+    // ── 浏览器接管 ──
+    // 端口改成 0 没意义，直接拒绝比绑到随机端口再让扩展猜好。
+    if let Some(p) = args.get("browser_port").and_then(|x| x.as_u64()) {
+        if p > 0 && p < 65536 {
+            cfg.browser_port = p as u16;
+        }
+    }
+    if let Some(b) = args.get("browser_send_cookies").and_then(|x| x.as_bool()) {
+        cfg.browser_send_cookies = b;
+    }
+    if let Some(m) = args.get("browser_min_mb").and_then(|x| x.as_u64()) {
+        cfg.browser_min_mb = m.min(1024 * 64);
+    }
+    if let Some(b) = args.get("browser_notify_fail").and_then(|x| x.as_bool()) {
+        cfg.browser_notify_fail = b;
+    }
+    if let Some(b) = args.get("browser_allow_launch").and_then(|x| x.as_bool()) {
+        cfg.browser_allow_launch = b;
     }
     cfg.save().map_err(|e| format!("保存配置失败: {e}"))?;
     let snapshot = settings_json(&cfg);
@@ -5545,6 +5866,15 @@ fn main() -> eframe::Result {
     update::cleanup_old();
 
     let cfg = Config::load();
+
+    // adl:// 协议：浏览器扩展靠它把 ADL 拉起来（用户 m24107）。
+    // 写失败了不影响使用，只是"没开 ADL 时点下载不会自动拉起"，说一声就行。
+    if !platform::url_scheme_registered() {
+        match platform::register_url_scheme() {
+            Ok(()) => logfile::log("[browser] 已注册 adl:// 协议"),
+            Err(e) => logfile::log(&format!("[browser] 注册 adl:// 协议失败: {e}")),
+        }
+    }
     let gui = Arc::new(Gui {
         tasks: Mutex::new(Vec::new()),
         next_id: AtomicU64::new(1),
@@ -5579,13 +5909,16 @@ fn main() -> eframe::Result {
     }
 
     // 浏览器接管用的本地 API（与 UI 同进程共享状态）
+    //
+    // 端口优先取环境变量（测试用），否则取配置里的 `browser_port`；
+    // 两者都是 17800 时不额外绑定发现端口。
     let api_port = std::env::var("ADL_API_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(api_server::DEFAULT_PORT);
+        .unwrap_or_else(|| gui.cfg.lock().unwrap().browser_port);
     match api_server::start(gui.clone(), api_port) {
-        Ok(p) => eprintln!("[api] 浏览器接管 API 监听 127.0.0.1:{p}"),
-        Err(e) => eprintln!("[api] 启动失败: {e}"),
+        Ok(p) => logfile::log(&format!("[api] 浏览器接管 API 监听 127.0.0.1:{p}")),
+        Err(e) => logfile::log(&format!("[api] 启动失败: {e}")),
     }
 
     // 把上次退出时的任务表读回来。未完成的（含上次还在下的、排队的、

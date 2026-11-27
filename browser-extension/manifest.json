@@ -1,11 +1,38 @@
 {
   "manifest_version": 3,
-  "name": "ADL Download Bridge",
-  "version": "0.1.0",
-  "description": "把浏览器里的下载转交给 ADL 下载器（走本机 127.0.0.1 的 API）。",
-  "permissions": ["downloads", "cookies", "storage", "contextMenus"],
-  "host_permissions": ["<all_urls>", "http://127.0.0.1/*", "http://localhost/*"],
-  "background": { "service_worker": "background.js" },
-  "action": { "default_title": "ADL 下载桥", "default_popup": "popup.html" },
-  "options_page": "options.html"
+  "name": "ADL 下载桥",
+  "version": "0.2.0",
+  "description": "把浏览器下载交给 ADL。浏览器里只有一个开关，其余设置都在 ADL 桌面端的「浏览器接管」页。",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnB3J1xA/LNnsoY5YS3YJS3Jam5b2ZjDJBqbBqArIBBE4rFarFaWWCn2zuXkX0WOXuiiSWDPeP9QIsu4BR6tZR+Rh+IERspFu6323DBsCv30R6nC1mxfErrM075PZ9sUbRpVD16MgY/2mwcTU+LKlFi3rjp6kNGj3p5DyU6zqFP2Mntyvw2lL107e8QERMcp9+3sz+Bu0AvNZoHTXywIUeXJTThMSlr0WqdNKNrS+FbEzYp7U65+QQIaHTehJPDk2VG9QVeg6Lh+oxpfYZMnzyO9z9bPPzthi91NS/IxFrutd5gHM0UkcA6iSZ9FmQWrUMKaX+NwcW+QEQ66qHASgAQIDAQAB",
+  "permissions": [
+    "downloads",
+    "cookies",
+    "storage",
+    "contextMenus",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>",
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "ADL 下载桥",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
 }

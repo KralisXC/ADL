@@ -1,43 +1,72 @@
-# ADL Download Bridge（浏览器扩展）
+# ADL 下载桥（浏览器扩展）
 
-把浏览器里的下载转交给 ADL 下载器。支持 Edge / Chrome（都是 Chromium MV3）。
+把浏览器里点到的下载交给本机的 ADL 下载器接管。
 
-## 原理
+**浏览器里只有一个开关。** 端口、Cookie 转发、大小阈值、失败提醒这些全在
+ADL 桌面端的「浏览器接管」页里调 —— 这是刻意的分工：扩展管"要不要接管"，
+ADL 管"怎么接管"。
+
+## 装上试试
+
+1. 打开 `edge://extensions`（Chrome 是 `chrome://extensions`）
+2. 打开「开发人员模式」
+3. 「加载解压缩的扩展」→ 选这个 `browser-extension` 目录
+
+上架版直接把 zip 传给商店，不需要第 2、3 步。
+
+## 怎么工作的
 
 ```
-浏览器下载链接
-   │  chrome.downloads.onCreated
-   ▼
-Service Worker ──POST http://127.0.0.1:17800/add──▶ ADL 桌面程序
-   │                                                   │
-   │◀───────────── 200 {"ok":true} ────────────────────┘
-   ▼
-chrome.downloads.cancel() + erase()   // 取消浏览器原生下载
+浏览器发起下载
+   ↓  chrome.downloads.onCreated
+扩展问桌面端要配置   GET  http://127.0.0.1:17800/bridge
+   ↓  拿到真实端口 + 策略（Cookie/阈值/失败提醒/是否允许拉起）
+扩展投递             POST http://127.0.0.1:<真实端口>/add
+   ↓  成功后
+取消浏览器的下载      chrome.downloads.cancel + erase
 ```
 
-- 若 ADL 没运行 / 接管开关关闭 / 请求失败 → **不取消**，浏览器照常下载（不会丢链接）。
-- 需要登录的站：扩展会把该 URL 的 Cookie 一起转发给 ADL。
+端口发现这块值得说一句：**ADL 永远会在 17800 上应一声**。即使你在桌面端把
+端口改成了别的（比如 17841），它也会在 17800 上再绑一个别名监听器，`/bridge`
+返回的 `port` 是真实端口。所以扩展不需要你告诉它端口，改端口也不会失联。
 
-## 安全（三道防护，缺一即漏洞）
+### ADL 没开的时候
 
-1. ADL 的本地 API **只绑 127.0.0.1**，外网不可达。
-2. 会改状态的接口（`/add` `/probe` `/check`）必须带**随机 token**（启动时生成，经 `/auto-token` 下发给扩展）。
-3. 校验 **Origin**：只接受空 Origin（MV3 后台直发）或 `chrome-extension://` / `moz-extension://`；普通网页无法省略 Origin，因此拿不到 token、也调不动。
+如果你在扩展里开着接管、但 ADL 没运行：
 
-## 安装（Edge / Chrome）
+1. 扩展先试着连一下已知端口，问不到就 `chrome.tabs.create({url:"adl://open"})`
+2. Windows 认出 `adl://` 协议（ADL 启动时会自己注册，见下），把 ADL 拉起来
+3. ADL 带着 `--from-browser` 参数启动 → 静默缩到托盘、只开本地接口，不弹窗口
+4. 扩展每 500ms 轮询一次 `/bridge`，最多 12 秒，通了就投递
 
-1. 先启动 ADL 桌面程序（默认监听 `127.0.0.1:17800`）。
-2. 打开 `edge://extensions`（Edge）或 `chrome://extensions`（Chrome）。
-3. 打开右上角「开发人员模式 / Developer mode」。
-4. 点「加载解压缩的扩展 / Load unpacked」，选择本目录 `browser-extension/`。
-5. 点扩展图标 → 勾选「接管浏览器下载」→「测试连接」应显示 ✅。
+`adl://` 协议写在 `HKCU\Software\Classes\adl`（当前用户，不需要管理员）。
+ADL 每次启动都会检查一遍，没注册就注册；装好后第一次运行就生效。
+如果桌面端把「允许浏览器拉起」关掉，扩展不会试这一步。
 
-## 设置
+## 权限说明（上架要写）
 
-- **接管开关**：关掉后浏览器完全自己下载。
-- **端口**：默认 17800，需与 ADL 一致（ADL 侧可用环境变量 `ADL_API_PORT` 修改）。
+| 权限 | 为什么需要 |
+|---|---|
+| `downloads` | 拦截浏览器下载、确认交给 ADL 后取消它 |
+| `cookies` | 有些站点（网盘、论坛附件）必须带登录态才能下。可以在桌面端关掉 |
+| `storage` | 只存两样东西：接管开关、上次问到的端口 |
+| `contextMenus` | 右键「用 ADL 下载这个链接」 |
+| `tabs` | `adl://` 拉起 ADL、读当前页地址 |
 
-## 注意
+`host_permissions` 里 `<all_urls>` 是为了在新标签页/任何站点上都能右键投递；
+真正会发出去的请求只有两个：`127.0.0.1` 上的 `/bridge` 和 `/add`。
+扩展**不保存、不上传**任何页面内容 —— Cookie 只在投递给本机 ADL 时拼一次。
 
-- ADL 必须处于运行状态（当前版本关闭窗口即退出，未做「关闭到托盘」）。
-- 文件权限仅 `downloads / cookies / storage / contextMenus` + `host_permissions`，不注入页面脚本。
+## 安全
+
+- 本地接口只绑 `127.0.0.1`，不监听外部地址
+- 改状态的接口要 token（`GET /auto-token` 拿，30 分钟缓存）
+- 服务端只认空 Origin 或 `chrome-extension://` / `moz-extension://`
+- 只读的 `/ping` `/bridge` 不要 token —— 扩展刚启动、ADL 刚被拉起时
+  还不知道 token，那时候正需要这两个接口问地址和配置
+
+## 出问题了看哪儿
+
+接管失败会在 ADL 的「消息中心」里留一条（桌面端「浏览器接管」页可以关掉这个提醒）。
+扩展自己的控制台（`edge://extensions` → 该扩展 → 检查视图 → Service Worker）
+里有更细的日志。

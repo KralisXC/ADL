@@ -240,6 +240,30 @@ pub struct Config {
     /// 之所以做成可配置：官方源是 GitHub raw，国内直连经常抽风；用户
     /// 换成镜像或自己 fork 的仓库时不用改代码。
     pub market_url: String,
+    /// 浏览器接管：ADL 本地 API 监听的端口。
+    ///
+    /// 默认 17800。改了之后扩展靠 17800 上那个"发现端口"（同一套代码绑的
+    /// 第二个监听器）问出真实端口，所以不需要用户去扩展里同步改。
+    pub browser_port: u16,
+    /// 浏览器接管：是否把页面 Cookie 一起转交给 ADL。
+    ///
+    /// 用户 m24075：「浏览器上只有开启关闭，其他的我想能在我们的软件里调」。
+    /// 关掉之后扩展不再读 Cookie（`cookies` 权限还在 manifest 里，因为
+    /// 权限是安装时一次性授予的、运行期不能要），需要登录的站点会下载失败。
+    pub browser_send_cookies: bool,
+    /// 浏览器接管：小于这个大小（MB）的下载不接管，交给浏览器自己下。
+    ///
+    /// 0 = 全部都接管。小文件走浏览器原生下载更快（不用起引擎、不用建控制
+    /// 文件），用户也不希望点一个 20KB 的图标就跳进下载器。
+    pub browser_min_mb: u64,
+    /// 浏览器接管失败时（ADL 没开/接口不通）是否弹通知。
+    pub browser_notify_fail: bool,
+    /// 允许浏览器扩展在 ADL 没运行时把它拉起来。
+    ///
+    /// 实现方式是注册 `adl://` 协议：扩展 `chrome.tabs.create({url:"adl://ping"})`，
+    /// 浏览器拉起 `adl-gui.exe --from-browser`，后者静默缩到托盘只起 API。
+    /// 关掉之后扩展连不上就老老实实让浏览器自己下。
+    pub browser_allow_launch: bool,
 }
 
 impl Default for Config {
@@ -274,6 +298,11 @@ impl Default for Config {
             auto_start: false,
             show_on_auto_start: false,
             market_url: String::new(),
+            browser_port: 17800,
+            browser_send_cookies: true,
+            browser_min_mb: 0,
+            browser_notify_fail: true,
+            browser_allow_launch: true,
         }
     }
 }
@@ -485,6 +514,20 @@ show_on_auto_start = false
 #   https://raw.githubusercontent.com/KralisXC/adl-extensions/main/index.json
 # 官方源走 GitHub raw，连不上时可以换成镜像或自己 fork 的仓库。
 market_url = ""
+
+# ── 浏览器接管 ────────────────────────────────────────────────
+# 浏览器扩展自己只有一个「接管开关」，其余行为都在这里调。
+#
+# ADL 本地 API 端口（默认 17800）。改了之后扩展仍能从 17800 上问出新端口。
+browser_port = 17800
+# 是否把页面的 Cookie 一起转交（需要登录的站点必须开）。
+browser_send_cookies = true
+# 小于这个大小（MB）的下载不接管，交给浏览器自己下。0 = 全部接管。
+browser_min_mb = 0
+# 接管失败时（ADL 没开 / 接口不通）是否弹通知。
+browser_notify_fail = true
+# 允许浏览器扩展在 ADL 没运行时把它拉起来（注册 adl:// 协议）。
+browser_allow_launch = true
 "#;
 
 #[cfg(test)]
@@ -510,6 +553,11 @@ mod tests {
         assert!(!c.auto_start);
         assert!(!c.show_on_auto_start);
         assert!(c.market_url.is_empty());
+        assert_eq!(c.browser_port, 17800);
+        assert!(c.browser_send_cookies);
+        assert_eq!(c.browser_min_mb, 0);
+        assert!(c.browser_notify_fail);
+        assert!(c.browser_allow_launch);
     }
 
     #[test]

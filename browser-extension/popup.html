@@ -1,22 +1,107 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="zh-CN">
-  <head>
-    <meta charset="utf-8" />
-    <style>
-      body { font: 13px/1.5 system-ui, sans-serif; width: 280px; padding: 12px; margin: 0; color: #1b2b29; background: #f0f7f7; }
-      h1 { font-size: 14px; margin: 0 0 8px; color: #2b7a70; }
-      label { display: flex; align-items: center; gap: 6px; margin: 6px 0; }
-      input[type="number"] { width: 80px; padding: 2px 4px; }
-      button { margin-top: 8px; padding: 4px 10px; border: 0; border-radius: 8px; background: #2b9a8a; color: #fff; cursor: pointer; }
-      #status { margin-top: 8px; white-space: pre-wrap; word-break: break-all; color: #456; font-size: 12px; }
-    </style>
-  </head>
-  <body>
-    <h1>ADL 下载桥</h1>
-    <label><input type="checkbox" id="enabled" /> 接管浏览器下载</label>
-    <label>本机端口 <input type="number" id="port" min="1" max="65535" /></label>
-    <button id="test">测试连接</button>
-    <div id="status">就绪</div>
-    <script src="popup.js"></script>
-  </body>
+<head>
+  <meta charset="utf-8" />
+  <style>
+    :root {
+      --ink: #1c2726;
+      --muted: #5e6d6b;
+      --accent: #2e7d6b;
+      --bg: #f6f8f7;
+      --card: #ffffff;
+      --line: #e3eae8;
+      --danger: #b03030;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      width: 260px;
+      font: 13px/1.5 "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+      color: var(--ink);
+      background: var(--bg);
+    }
+    .wrap { padding: 12px 14px 14px; }
+    .row { display: flex; align-items: center; gap: 8px; }
+    .title { font-weight: 600; font-size: 13.5px; }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex: none; }
+    .dot.on { background: var(--accent); }
+    .dot.off { background: var(--danger); }
+    .hint { color: var(--muted); font-size: 11.5px; margin-top: 3px; }
+
+    .card {
+      margin-top: 10px;
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px 11px;
+    }
+
+    /* 开关：一个方框 + 文字，做成整块可点，别让人对着小圆圈点 */
+    .switch {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      cursor: pointer;
+      user-select: none;
+    }
+    .track {
+      width: 38px; height: 21px; border-radius: 11px;
+      background: #cdd6d4; position: relative; flex: none;
+      transition: background .15s ease;
+    }
+    .track.on { background: var(--accent); }
+    .knob {
+      position: absolute; top: 3px; left: 3px; width: 15px; height: 15px;
+      border-radius: 50%; background: #fff;
+      transition: left .15s ease;
+    }
+    .track.on .knob { left: 20px; }
+
+    button {
+      width: 100%;
+      margin-top: 8px;
+      padding: 7px 10px;
+      font: inherit;
+      color: #fff;
+      background: var(--accent);
+      border: 0;
+      border-radius: 7px;
+      cursor: pointer;
+    }
+    button:disabled { background: #a9c3bd; cursor: default; }
+    button.ghost {
+      color: var(--ink);
+      background: transparent;
+      border: 1px solid var(--line);
+    }
+    .foot { margin-top: 10px; color: var(--muted); font-size: 11px; }
+    .foot a { color: var(--accent); text-decoration: none; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="row">
+      <span class="dot" id="dot"></span>
+      <span class="title">ADL 下载桥</span>
+    </div>
+    <div class="hint" id="status">正在连接 ADL…</div>
+
+    <div class="card">
+      <div class="switch" id="toggle">
+        <span>接管浏览器下载</span>
+        <span class="track" id="track"><span class="knob"></span></span>
+      </div>
+      <div class="hint" id="toggleHint">关掉之后，浏览器下载不再交给 ADL。</div>
+    </div>
+
+    <button id="dlPage">用 ADL 下载当前页</button>
+    <button id="openAdl" class="ghost">打开 ADL</button>
+
+    <div class="foot">
+      端口、Cookie、大小阈值等都在 ADL 的「浏览器接管」页设置。
+    </div>
+  </div>
+  <script src="popup.js"></script>
+</body>
 </html>

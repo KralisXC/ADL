@@ -180,10 +180,15 @@ npm run build          # 产出 web/dist（index.html + assets）
 
 ADL 启动后会监听本机 `127.0.0.1:17800`（可用环境变量 `ADL_API_PORT` 改），配合 `browser-extension/` 里的 MV3 扩展，把浏览器下载转交给 ADL。
 
+**浏览器里只有一个开关，其余设置都在 ADL 的「浏览器接管」页** —— 端口、Cookie 转发、大小阈值、失败提醒、是否允许拉起，全在桌面端调。扩展管"要不要接管"，ADL 管"怎么接管"。
+
 - 安装：`edge://extensions` 或 `chrome://extensions` → 开启开发者模式 → 「加载解压缩的扩展」→ 选 `browser-extension/` 目录。
-- 浏览器产生下载时，扩展调用本地 API `/add`；成功则取消浏览器原生下载，失败（ADL 未运行/接管关闭）则原样放行，不会丢链接。
-- 需要登录的站：扩展会转发该 URL 的 Cookie。
-- 安全：本地 API 只绑 127.0.0.1 + 随机 token + Origin 校验；细节见 `browser-extension/README.md`。
+- 浏览器产生下载时，扩展先 `GET /bridge` 问桌面端要端口和策略，再 `POST /add`；成功则取消浏览器原生下载，失败（ADL 未运行/接管关闭）则原样放行，不会丢链接。
+- **端口可以随便改**：ADL 永远会在 17800 上再绑一个别名监听器，`/bridge` 返回真实端口，所以改了端口扩展也不会失联。
+- **ADL 没开也能接管**：扩展会通过自注册的 `adl://` 协议把 ADL 拉起来（静默缩到托盘，不弹窗口），然后轮询等它绑定端口。
+- 需要登录的站：扩展会转发该 URL 的 Cookie（桌面端可关）。
+- 小事交给浏览器：可以设「小于 N MB 的下载不接管」，小文件走原生更快。
+- 安全：本地 API 只绑 127.0.0.1 + 随机 token + Origin 校验；只读的 `/ping` `/bridge` 不要 token（扩展刚起来时还不知道 token）。细节见 `browser-extension/README.md`。
 - 注意：ADL 需保持运行；支持**关闭到托盘**（关闭窗口不退出进程，托盘里点「显示主界面」可唤回）。未做剪贴板监听。
 
 ## 桌面集成（单实例 / 关闭到托盘 / 休眠唤醒）
@@ -363,6 +368,10 @@ adl.notify({ title: "下载完成", body: "report.pdf · 12.4 MB" });
 - ✅ 查清托盘不显示的真正原因：目录带 Low 完整性标签 → 子进程继承 → `Shell_NotifyIconW` 被拒（`icacls /setintegritylevel Medium` 修好）
 - ✅ 托盘点击语义：左键单击无反应、**左键双击唤醒主界面**、右键弹菜单（`with_menu_on_left_click(false)` + `TrayIconEvent::DoubleClick`）
 - ✅ 「启动后显示主界面」开关（`show_on_auto_start`）：开机那次可以静默缩托盘，也可以照常弹窗；手动双击永远开窗口
+- ✅ 浏览器扩展改成单开关（`browser-extension/`）：端口/Cookie/大小阈值/失败提醒全搬到 ADL「浏览器接管」页
+- ✅ `/bridge` 接口 + 17800 别名监听器：改了端口扩展也不失联
+- ✅ `adl://` 协议自注册（`HKCU\Software\Classes\adl`）：ADL 没开时扩展能把它拉起来，静默缩托盘
+- ✅ 扩展补 `icons`（16/32/48/128）与固定 `key`（扩展 ID `dkeainpjalodpfokkgaffnceplclfcdi`），可上架
 - ⛔ **剪贴板监听不做**（自动嗅探剪贴板里复制的 URL 太吵；Ctrl+V 粘贴一直在）
 
 设计文档见 [docs/DESIGN.md](docs/DESIGN.md)。

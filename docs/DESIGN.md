@@ -2909,7 +2909,87 @@ winit 记的状态和 Windows 实际状态常对不上，于是命令发了、`l
 - 三条 egui 命令**仍然保留**，让 winit 内部状态跟着同步，否则它下次自己发
   `SW_MINIMIZE` 时会因为"觉得已经是最小化"而什么都不做。
 
-### 13.20 待续
+### 13.21 浏览器接管：单开关扩展 + 桌面端配置 + `adl://` 拉起
+
+用户 m24075：「我们的浏览器插件我想的是特别简洁的，意思就是在浏览器上只有
+开启接管和关闭接管和获取页面的这些，就如同 idm，只有开启关闭……其他的我想能
+在我们的软件插件连接浏览器插件调整」。用户 m24107：「如果我没开软件但是浏览器
+插件开了接管可以直接打开我们的软件」。
+
+分工就一句话：**扩展管"要不要接管"，ADL 管"怎么接管"**。
+
+#### 13.21.1 端口发现：17800 永远应声
+
+`api_server::start()` 先绑配置端口（`cfg.browser_port`，默认 17800）；如果实际
+绑到的不是 17800，**再在 17800 上绑一个别名监听器**（绑不上只 `eprintln!`，不致命）。
+两个监听器共用同一个 `Arc<Gui>`、同一个 token、同一份 `BridgeCfg`。
+
+`GET /bridge` 返回 `{ok, api, version, port, send_cookies, min_mb, notify_fail, allow_launch}`，
+其中 `port` 是**真实端口**。所以：
+
+- 扩展不需要用户填端口；
+- 用户把端口改成 17841 之后扩展也不失联 —— 它先问 17800，拿到 17841 再去投递；
+- `BRIDGE_API = 1`，将来接口不兼容就 +1，扩展发现值过大只保留浏览器原生下载。
+
+`/bridge` **不要 token**（只读 + 校验 Origin）：扩展刚启动、ADL 刚被拉起时还不知道
+token，而那时候正需要它来问地址和配置。
+
+#### 13.21.2 桌面端「浏览器接管」页
+
+`Tab::Browser`（`crates/adl-gui/src/main.rs::page_browser`），四张卡：
+
+1. **本地接口** —— `TcpStream::connect_timeout(127.0.0.1:<草稿端口>, 120ms)` 实测探活
+   （不要猜"配了但没生效"），圆点 + `127.0.0.1:port` + 「正在监听 / 没在监听」badge；
+   端口 `DragValue(1024..=65535)`，改了就提示「要重启 ADL 才生效」。
+2. **接管行为** —— Cookie 转发 / 失败提醒 / 允许拉起，三张 checkbox。
+3. **接管范围** —— 「小于 N MB 的下载不接管」，0 = 全部接管。
+4. **浏览器扩展** —— 说明 + 「打开扩展目录」按钮 + 当前插件模式。
+
+这一页和「设置」**共用同一条顶部 `settings_bar`**（草稿 + 已更改 N 项 + 取消）：
+两者改的是同一份 `Config`，各留一套保存按钮只会让人搞不清存了没。
+`Config` 新增五个字段：`browser_port: u16` / `browser_send_cookies: bool` /
+`browser_min_mb: u64` / `browser_notify_fail: bool` / `browser_allow_launch: bool`。
+
+#### 13.21.3 `adl://` 协议（扩展拉起 ADL）
+
+`platform::register_url_scheme()` 写 `HKCU\Software\Classes\adl`：
+默认值空串 + `"URL Protocol"` 空值 + `shell\open\command = "<exe>" --from-browser "%1"`。
+**只写 HKCU**：不需要管理员、不影响别的用户；绿色版首次运行就注册上。
+`main()` 里每次启动检查 `url_scheme_registered()`，没注册才写（幂等，也少一次被
+安全软件拦的机会）。
+
+`--from-browser` 与 `--auto-start` 分开判断：`boot_hidden = (launched_by_auto_start()
+&& !cfg.show_on_auto_start) || launched_by_browser()` —— 被浏览器拉起时**必须静默**
+（用户正在浏览器里点下载，弹个主窗口盖上来是纯打扰）。
+
+#### 13.21.4 扩展侧
+
+`browser-extension/` 从"能用的 demo"改成真能上架的东西：
+
+- **极简 popup**：状态圆点 + 一个接管开关 + 「用 ADL 下载当前页」+ 「打开 ADL」。
+  端口输入、`测试连接` 全部删掉（搬到桌面端了）。
+- 删掉 `options.html` / `options.js` —— 没有可配的东西，留着只会和桌面端打架。
+- `manifest.json` 加 `icons`（16/32/48/128，由 `probe/make_ext_icons.py` 从
+  `crates/adl-gui/assets/adl.ico` **按尺寸抽帧**，不重新缩放 —— 重缩会把 16×16 的箭头糊掉）
+  和 `key`（固定扩展 ID `dkeainpjalodpfokkgaffnceplclfcdi`，便于原生消息通信）。
+- `background.js` 的 `getBridge()` 是唯一配置来源，`chrome.storage.local` 只存
+  `enabled` 和 `lastPort`（后者只省一次探测，不作数）。
+- `chrome.downloads.onCreated` 里按 `min_mb` 决定接不接管；投递失败
+  `POST /notify` 让用户在 ADL 消息中心看见（扩展控制台的 `console.warn` 没人会翻）。
+- ADL 没在跑：先 `GET /bridge` 问策略，`allow_launch` 不为 false 才
+  `chrome.tabs.create({url:"adl://open"})`，然后 **500ms × 24 次**轮询等它绑定端口。
+
+#### 13.21.5 实测
+
+- `GET :17800/bridge` 与 `:17841/bridge` 都返回 `"port":17841`（别名监听生效）。
+- `Start-Process 'adl://open'` → ADL 被拉起，`startup.log` 出现
+  `[browser] 已注册 adl:// 协议` + `[boot] 已缩到托盘`，API 绑在 17800。
+- 注册表确认：`HKCU\Software\Classes\adl\shell\open\command` =
+  `"E:\ADL\target\release\adl-gui.exe" --from-browser "%1"`。
+- 从 17800 用 token `POST /add` → `{"id":1,"ok":true}` → `completed` 325754 B。
+
+### 13.22 待续
+
 - macOS / Linux 的**真机**构建验证仍未做（本机只有 Windows；M 芯片 Mac 无法在本机测）。
   交叉编译也不能替代：`eframe` 的 glow/wgpu 后端要链接平台图形库。
   用户 m18452 已明确「只做 win 先」，这条暂时搁置。
