@@ -27,6 +27,28 @@ cargo build --release --target x86_64-pc-windows-msvc
 
 体积优化已在 `Cargo.toml` 里配好（`opt-level="z"` + `lto="fat"` + `panic="abort"` + `strip`）。默认静态链接 CRT，不依赖 VC++ 运行库。
 
+### 打安装包
+
+有 [Inno Setup](https://jrsoftware.org/isinfo.php) 就能一键出 Windows 安装程序：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build-installer.ps1
+# 产物：dist\ADL-Setup-<版本>.exe
+```
+
+脚本依次做：编译 → 拷到 `dist\stage\`（白名单，不带 `.pdb` 和中间产物）→ 给
+`adl-gui.exe` / `adl.exe` 签名 → 调 `ISCC.exe`。常用开关：`-NoBuild`（跳过编译）、
+`-NoSign`（跳过签名）、`-SignSetup`（连安装程序一起签）、`-Iscc <路径>`。
+
+安装是**按当前用户**装到 `%LOCALAPPDATA%\Programs\ADL`，全程不弹 UAC —— 因为
+配置和任务表都放在 exe 同级的 `data\` 里，装进 `Program Files` 反而会因为写不进去
+而回退到 `%LOCALAPPDATA%\ADL`。要点机器级安装就改 `installer\adl.iss` 顶部的
+`#define InstallScope "machine"`。卸载会删程序但**保留 `data\`**（那是你的任务表和配置）。
+
+安装包还会写 `adl://` 协议注册表项，所以装完立刻能从浏览器拉起 ADL，不必先手动开
+一次；Edge 扩展的强制安装项在 `adl.iss` 里由 `EdgeExtPublished` 开关控制，等扩展
+上架后置 1 才生效（未上架时指向商店只会让 Edge 报错）。
+
 ## 用法
 
 ```bash
@@ -371,7 +393,8 @@ adl.notify({ title: "下载完成", body: "report.pdf · 12.4 MB" });
 - ✅ 浏览器扩展改成单开关（`browser-extension/`）：端口/Cookie/大小阈值/失败提醒全搬到 ADL「浏览器接管」页
 - ✅ `/bridge` 接口 + 17800 别名监听器：改了端口扩展也不失联
 - ✅ `adl://` 协议自注册（`HKCU\Software\Classes\adl`）：ADL 没开时扩展能把它拉起来，静默缩托盘
-- ✅ 扩展补 `icons`（16/32/48/128）与固定 `key`（扩展 ID `dkeainpjalodpfokkgaffnceplclfcdi`），可上架
+- ✅ 扩展补 `icons`（16/32/48/128），可上架（扩展 ID 由 Edge 商店分配，不写死 `key`）
+- ✅ Inno Setup 安装包（`scripts\build-installer.ps1` + `installer\adl.iss`）：按用户装到 `%LOCALAPPDATA%\Programs\ADL`、零 UAC、随包装六个插件与扩展、写 `adl://` 协议、卸载保留 `data\`
 - ⛔ **剪贴板监听不做**（自动嗅探剪贴板里复制的 URL 太吵；Ctrl+V 粘贴一直在）
 
 设计文档见 [docs/DESIGN.md](docs/DESIGN.md)。

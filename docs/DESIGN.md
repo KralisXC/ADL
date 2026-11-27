@@ -2970,8 +2970,10 @@ token，而那时候正需要它来问地址和配置。
   端口输入、`测试连接` 全部删掉（搬到桌面端了）。
 - 删掉 `options.html` / `options.js` —— 没有可配的东西，留着只会和桌面端打架。
 - `manifest.json` 加 `icons`（16/32/48/128，由 `probe/make_ext_icons.py` 从
-  `crates/adl-gui/assets/adl.ico` **按尺寸抽帧**，不重新缩放 —— 重缩会把 16×16 的箭头糊掉）
-  和 `key`（固定扩展 ID `dkeainpjalodpfokkgaffnceplclfcdi`，便于原生消息通信）。
+  `crates/adl-gui/assets/adl.ico` **按尺寸抽帧**，不重新缩放 —— 重缩会把 16×16 的箭头糊掉）。
+  🔴 **不写 `key`**：扩展要发到 Edge 商店（用户 m24576 已在合作伙伴中心建了草稿），
+  商店自己会给扩展分配公钥和 ID；本地塞一个 `key` 反而和商店版本冲突，
+  导致"加载解压缩的扩展"和商店安装是两套 ID、storage 不互通。
 - `background.js` 的 `getBridge()` 是唯一配置来源，`chrome.storage.local` 只存
   `enabled` 和 `lastPort`（后者只省一次探测，不作数）。
 - `chrome.downloads.onCreated` 里按 `min_mb` 决定接不接管；投递失败
@@ -2988,7 +2990,121 @@ token，而那时候正需要它来问地址和配置。
   `"E:\ADL\target\release\adl-gui.exe" --from-browser "%1"`。
 - 从 17800 用 token `POST /add` → `{"id":1,"ok":true}` → `completed` 325754 B。
 
-### 13.22 待续
+### 13.22 安装包（Inno Setup）
+
+用户 m23062 说「Inno Setup 我是有的在 D:\Inno Setup 7 这个地方」，m24576 又说
+「到时候安装自动安装到 edge 这个插件」。两块合起来就是一个正经的 Windows 安装器。
+
+#### 13.22.1 为什么按当前用户装，而不是 Program Files
+
+`PrivilegesRequired=lowest` + `DefaultDirName={localappdata}\Programs\ADL`。
+用户 m22554 当时的想法是「安装的时候用一次管理员权限」，这确实是装到
+`Program Files` 的常规做法，但我们不能这么做，原因在 `data/`：
+
+程序把配置、任务表、`startup.log`、插件设置、市场缓存、更新包全放在
+**exe 同级的 `data/`** 里（用户 m21598 明确要求「其他的数据全都放我们自己
+的文件夹里面」）。装到 `Program Files` 的话普通用户写不进去，
+`config::app_data_dir()` 里的写探针会失败 → 回退到 `%LOCALAPPDATA%\ADL`
+→ 用户刚要求的「数据放自己文件夹」当场被破坏，而且界面上不会有任何提示。
+
+按用户装还顺带省掉 UAC：装的时候一次都不弹。代价是不能被多个用户共享 ——
+对这个软件（单用户下载器）来说不是问题。
+
+想改成机器级安装：把 `adl.iss` 顶部的 `#define InstallScope "user"` 改成
+`"machine"`，脚本里对应的 `[Setup]` 分支会自动切到 `PrivilegesRequired=admin`
++ `DefaultDirName={autopf}\ADL`。
+
+#### 13.22.2 打包用白名单，不打包 `target\release`
+
+`scripts\build-installer.ps1` 把东西先拷到一个干净的 `dist\stage\`，只放：
+`adl-gui.exe`、`adl.exe`、`LICENSE`、`README.md`、`plugins\`（六个随程序分发的
+插件，含 media-converter 自带的 68 MB ffmpeg）、`browser-extension\`。
+然后清掉 `*.pdb` / `*.bak` / `*.tmp` / `*.old`，再让 ISCC 从这个目录取文件。
+
+直接把 `target\release` 塞进安装包的坏处：里面有几万个中间文件、几个 GB 的
+`deps`，还混着 `.pdb` 和早前的测试残留（`config.toml.tmp`、`_mv2.txt` 就是
+这么来的）。白名单还有个好处 —— 加文件必须改脚本，不会不知不觉把调试产物
+发给用户。
+
+#### 13.22.3 `.iss` 里的三个坑
+
+1. 🔴 **`UninstallDisplaySize=0` 不是合法值**。ISCC 7 报
+   `Value of [Setup] section directive "UninstallDisplaySize" is invalid`。
+   这个指令只接受"字节数"或"带单位的字符串"，0 不在白名单里。要改显示大小
+   就干脆去掉它（Inno 会自己算）。
+2. 🔴 **`Tasks: xxx` 参数引用的任务必须真实存在**。`[Tasks]` 里的 `edgeext`
+   被 `#if EdgeExtPublished 0` 关掉之后，`[Registry]` 里两行还写着
+   `Tasks: edgeext` → `Directive or parameter "Tasks" expression error:
+   Parameter "Tasks" includes an unknown task`。**条件编译要把任务定义和
+   引用一起包住**，不能只关一边。
+3. 🔴 **`.iss` 是 UTF-8 无 BOM 存的，中文没问题**，但 `.ps1` 必须带 BOM
+   （同 §13.19.8 那条教训）。`build-installer.ps1` 里因此专门写了
+   `[System.IO.File]::WriteAllText($f, $t, (New-Object Text.UTF8Encoding($true)))`。
+
+#### 13.22.4 Edge 扩展的自动安装
+
+用 **`ExtensionSettings`**（按扩展 ID 做子键）而不是 `ExtensionInstallForcelist`：
+
+```
+HKCU\Software\Policies\Microsoft\Edge\ExtensionSettings\<扩展ID>
+    installation_mode = force_installed
+    update_url        = https://edge.microsoft.com/extensionwebstorebase/v1/crx
+```
+
+`ExtensionInstallForcelist` 靠 `"1"`/`"2"`/`"3"` 这类序号定位，机器上已经装过
+别的强制扩展时很容易把别人的项覆盖掉；`ExtensionSettings` 按 ID 索引，不冲突
+（[Edge 策略文档](https://learn.microsoft.com/deployedge/microsoft-edge-policies/extensionsettings)、
+[强制安装示例](https://alb.ghostery.com/enterprise-privacy-solutions/documentation/edge)）。
+
+写 `HKCU` 而不是 `HKLM`：Edge 两个位置都读，`HKCU` 下不需要管理员权限，
+正好配合按用户安装 —— 全程零 UAC。旧版 `ExtensionInstallForcelist` 在
+`HKCU\Software\Policies\Microsoft\Edge` 下同样有效（[Trend 的修复文档](https://success.trendmicro.com/zh-TW/solution/ka-0021157) 里就是这么写的），
+但既然我们用 ID 索引的方式，`ExtensionSettings` 更干净。
+
+**`update_url` 必须是商店的 CRX 端点**：自建 update URL 需要额外的
+`update.xml`，而 `ExtensionSettings` 的 `override_update_url` 对 Edge 附加组件
+网站 URL 是忽略的（[策略文档](https://learn.microsoft.com/deployedge/microsoft-edge-policies/extensionsettings) 原话），所以别指望用它绕开商店。
+
+⚠️ **扩展还没上架前不能开这个选项**：`EdgeExtPublished` 现在还是 `0`，
+[Tasks] 与 [Registry] 里那段会被整个编译掉。指向商店的强制安装策略在扩展
+未发布时只会让 Edge 报"找不到扩展"，用户还以为是我们装坏了。上架拿到最终
+CRX ID 之后，把 `#define EdgeExtPublished 1` 和 `#define EdgeExtId` 一起改掉。
+
+#### 13.22.5 卸载时保留 `data\`
+
+`[UninstallRun]` 先 `taskkill /IM adl-gui.exe /F`（否则 exe 被占用删不掉），
+然后 Inno 删自己装的所有文件；`data\` 不在 `[Files]` 里，所以天然留下。
+`CurUninstallStepChanged` 在 `usPostUninstall` 弹一句"你的配置、任务列表和日志
+还留在 …，这是有意保留的，重装后能接着用"。
+
+注册表清理：`adl://` 的 key 带 `uninsdeletekey` 会被删掉，
+`Run\ADL`（开机自启）用 `uninsdeletevalue` 删值。
+
+#### 13.22.6 实测
+
+静默装到 `E:\ADL\probe\install-test`：
+
+```
+exit: 0
+adl-gui.exe  11,342,880 B   ← 已签名 Valid
+adl.exe       3,382,304 B
+plugins\  6 个目录（含 media-converter）
+browser-extension\  9 个文件（含 icons/ 四个 png）
+```
+
+- 直接跑装好的 `adl-gui.exe` → `startup.log` 显示 `数据目录:
+  E:\ADL\probe\install-test\data`（**数据跟着 exe 走，没有跑到 %LOCALAPPDATA%**）、
+  `[api] 浏览器接管 API 监听 127.0.0.1:17800`、托盘 `已注册（任务栏可见）`。
+- `/bridge` 返回 `port:17800`；`/status` 200。
+- 杀掉进程后 `Start-Process 'adl://open'` → 装好的那份被拉起
+  （`pid 9696 E:\ADL\probe\install-test\adl-gui.exe`），`startup.log` 末行
+  `[boot] 已缩到托盘` —— **安装器写的 `adl://` 注册表项能独立工作**，
+  不需要先手动开一次程序。
+- 卸载：`exit 0`，`adl-gui.exe` 删除、`HKCU\Software\Classes\adl` 消失、
+  `Run\ADL` 消失、开始菜单/桌面快捷方式消失，`data\config.toml` 我特意造了一个
+  —— **卸载后还在**。
+
+### 13.23 待续
 
 - macOS / Linux 的**真机**构建验证仍未做（本机只有 Windows；M 芯片 Mac 无法在本机测）。
   交叉编译也不能替代：`eframe` 的 glow/wgpu 后端要链接平台图形库。
