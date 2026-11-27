@@ -260,7 +260,7 @@ pub fn form(ui: &mut Ui, title: &str, fields: &mut [Field<'_>]) -> Option<String
                     Field::Check { value, text, .. } => {
                         ui.vertical(|ui| {
                             ui.add_space(3.0);
-                            ui.checkbox(&mut **value, *text);
+                            widgets::checkbox(ui, &mut **value, *text);
                             if let Some(orig) = &mark {
                                 widgets::hint_was(ui, &format!("原：{orig}"));
                             }

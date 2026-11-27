@@ -3104,7 +3104,86 @@ browser-extension\  9 个文件（含 icons/ 四个 png）
   `Run\ADL` 消失、开始菜单/桌面快捷方式消失，`data\config.toml` 我特意造了一个
   —— **卸载后还在**。
 
-### 13.23 待续
+### 13.23 任务多选、`#N` 编号回收、扩展开关挪到图标
+
+这一轮（用户 m24756 / m25107 / m25147）补齐三件"用得久了才发现缺"的东西。
+
+#### 13.23.1 多选管理
+
+任务表最前面加一列 34px 的勾选框（`Column::new("", 34.0)`），原有六列的
+`w[i]` 下标全部后移一位 —— 这类"插一列"的改动最容易漏掉某处还在用旧下标
+（进度条宽度曾是 `w[2] - 52.0`，要跟到 `w[3]`）。
+
+勾选状态存 **`BTreeSet<u64>`（任务 id）而不是 `BTreeSet<usize>`（行下标）**：
+列表每帧都可能因为搜索/筛选/排序重排，存下标等于"勾着勾着勾到别人身上"。
+每帧开头用当前快照里的 id 集合 `retain` 一遍，把已经被删掉的 id 清出去，
+否则「已选 N 条」会一直挂着一个不存在的任务。
+
+「全选」「反选」放在搜索/筛选工具条里，不放在表头 —— `adl_ui::table::Column`
+只有静态标题字符串，为一个复选框去改整个 `table` 的签名不值当。
+
+多选操作条只在 `selected.len() > 0` 时渲染（否则白占 30px 行高）。
+批量删除走独立的 `BulkAsk` 弹窗，**不问「记住我的选择」**：那个选项的语义
+是"以后删除都按这个来"，批量选择不该顺手改掉单条删除的习惯。
+批量删除默认 **不勾**删文件 —— 一次十几条误勾代价太大。
+
+#### 13.23.2 `#N` 编号回收
+
+用户 m25147：「下载了东西之后一定时间清理这个 id 就行了，就是之后的 id
+还是会从 1 开始」。
+
+- `SavedTask` 加 `done_unix`（**不是**复用 `added_unix`：大文件可能下了两小时，
+  刚下完就该过一会儿清掉，不能因为"添加得早"立刻消失）。下载成功/失败的收尾
+  分支各写一次 `t.done_unix = adl_app::history::now_unix()`。
+- `Config.auto_clean_completed`（默认 `true`）+ `auto_clean_minutes`（默认 30）。
+- `App::run_cleanup()` 在 `fn logic` 里 60 秒节流跑一次：把
+  `status ∈ {completed, failed} && done_unix > 0 && now - done_unix >= 阈值`
+  的任务从列表里**移走（不删文件）**；**整张列表清空时**才 `next_id.store(1)`。
+  只清一部分就归 1 会让新任务和老任务撞号。
+- 🔴 `run_cleanup` 必须写在第二个 `impl App` 里，不能写进 `impl eframe::App`：
+  后者是 trait 实现，会报 `E0407: method is not a member of trait 'eframe::App'`。
+- 🔴 `struct TaskView`（快照）不要加 `done_unix` —— 只写不读会
+  `warning: field 'done_unix' is never read`；清理逻辑直接读 `self.gui.tasks`。
+
+实测：列表空了但只删任务时 `next_id` 仍停在 4（清理才归 1）；把阈值调成 1 分钟、
+等 100 秒后 `tasks.json` 变成 `{"tasks":[],"next_id":1}`，再 `POST /add` 拿到 `id:1`。
+
+#### 13.23.3 自绘勾选框
+
+🔴 本主题下 `ui.checkbox` **几乎看不见**：egui 0.37 的复选框填充取
+`widget_visuals.bg_fill`、描边取 `bg_stroke`（`egui-0.37.0/src/theme/default_style.rs:192-200`），
+而 `crates/adl-ui/src/theme.rs` 把 `inactive.bg_fill` 设成了 `accent_soft`（#E2F1ED）、
+又没设 `bg_stroke` → 白卡上就是一块极淡的浅青方块。用户以为没有多选功能。
+
+修法：`adl_ui::widgets::check(ui, on)` 自绘 18×18 —— 未选 = 白底 + `muted` 描边，
+已选 = `accent` 底 + 白勾（`animate_bool_responsive` 淡入，**不做缩放**，
+缩放会让虚拟滚动的每一行各自算一次尺寸、滚动时轻微"呼吸"）；
+禁用态压成 `bg`/`line`。
+
+`widgets::checkbox(ui, &mut bool, label)` 是带文字的版本：方块与文字**整行可点**
+（没人愿意盯着 18px 的方块戳）。设置页、两个删除弹窗、插件 `boolean` 选项
+全部换成它，`crates/adl-ui/src/form.rs` 的 `Field::Check` 也换了。
+
+`CheckboxStyle.checkbox_frame.fill` 不随 checked 变化（provider 只知道 `state`），
+所以"勾上=青绿底"没法靠 `add_widget_theme` 解决，只能自绘。
+
+#### 13.23.4 扩展开关挪到图标 + 误接管第三道闸
+
+用户 m24756：「点一下就能直接选择开启接管和关闭接管不用这个页面（左下角添加
+一个 on 与 off 就行）」。→ 删掉 popup/options 与 `action.default_popup`，
+`chrome.action.onClicked` 直接切开关，角标 `ON`/`OFF` 显示状态。
+
+🔴 **误接管历史下载**（用户踩了两次，一屏 `E_downloadxxxxx` 被塞进 ADL）：
+Chrome/Edge 重启后会续传上次没下完的下载、在下载历史页点「重新下载」也会再触发
+`onCreated`。原来的 `looksResumed` 三条判据（`exists` / `bytesReceived>0` /
+`startTime` 超过 3 秒）不够 —— 续传时 `startTime` 可能被刷成"现在"。
+
+第三道闸：`chrome.storage.session` 记本次浏览器会话的 boot 时刻，
+`startTime` 早于它（留 5000ms 余量，SW 唤醒可能略晚于 `startTime`）就当历史丢弃。
+🔴 必须用 `storage.session`（MV3 内存级）而不是 `storage.local`：后者持久化，
+读到的是"三天前那次开机"，闸永远不生效。
+
+### 13.24 待续
 
 - macOS / Linux 的**真机**构建验证仍未做（本机只有 Windows；M 芯片 Mac 无法在本机测）。
   交叉编译也不能替代：`eframe` 的 glow/wgpu 后端要链接平台图形库。

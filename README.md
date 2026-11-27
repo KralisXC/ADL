@@ -395,6 +395,14 @@ adl.notify({ title: "下载完成", body: "report.pdf · 12.4 MB" });
 - ✅ `adl://` 协议自注册（`HKCU\Software\Classes\adl`）：ADL 没开时扩展能把它拉起来，静默缩托盘
 - ✅ 扩展补 `icons`（16/32/48/128），可上架（扩展 ID 由 Edge 商店分配，不写死 `key`）
 - ✅ Inno Setup 安装包（`scripts\build-installer.ps1` + `installer\adl.iss`）：按用户装到 `%LOCALAPPDATA%\Programs\ADL`、零 UAC、随包装六个插件与扩展、写 `adl://` 协议、卸载保留 `data\`
+- ✅ 任务列表多选管理：行首勾选框 + 全选/反选 + 批量暂停/继续/删除（批量删除默认不删文件）
+- ✅ `#N` 编号回收：已完成的任务过一段时间自动移出列表（`auto_clean_completed` / `auto_clean_minutes`），列表清空后编号从 1 重新开始
+- ✅ 自绘勾选框 `adl_ui::widgets::check/checkbox`（本主题下 `ui.checkbox` 几乎看不见，原因见 DESIGN §13.23.3）
+- ✅ 浏览器扩展点图标即切接管开关（角标 `ON`/`OFF`），不再有 popup 页面
+- ✅ 接管时弹「新建下载」预填地址/文件名/UA/Referer/Cookie，等人确认再下（`browser_confirm_first`）
+- ✅ 设置页「删除任务时」三态：每次都问 / 连本地文件一起删 / 只删列表
+- ✅ 任务行文件名可点，直接进任务详情页
+- ✅ 扩展误接管下载历史修复：`looksResumed` 三条判据 + `chrome.storage.session` 会话闸
 - ⛔ **剪贴板监听不做**（自动嗅探剪贴板里复制的 URL 太吵；Ctrl+V 粘贴一直在）
 
 设计文档见 [docs/DESIGN.md](docs/DESIGN.md)。

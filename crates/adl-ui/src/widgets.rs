@@ -232,6 +232,125 @@ pub fn switch(ui: &mut Ui, on: bool) -> Response {
     resp
 }
 
+/// 表格行首的勾选框（18×18）。
+///
+/// 为什么不用 `egui::Checkbox`：egui 0.37 的复选框**填充取
+/// `widgets.inactive.bg_fill`、描边取 `bg_stroke`**（见
+/// `egui-0.37.0/src/theme/default_style.rs:192-200`），而本主题把
+/// `inactive.bg_fill` 设成了 `accent_soft`（#E2F1ED）、又没设 `bg_stroke`
+/// → 白卡上就是一块几乎看不见的浅青方块（实测整列像空的，用户以为没有
+/// 多选功能；截图 `m12.png`）。这里直接画：未选 = 白底 + `muted` 描边，
+/// 已选 = `accent` 底 + 白勾，和侧栏选中态、主按钮的视觉语言一致。
+///
+/// 勾用 `animate_bool_responsive` 淡入，不做缩放 —— 缩放会让虚拟滚动的
+/// 每一行各自算一次尺寸，滚动时轻微地"呼吸"。
+pub fn check(ui: &mut Ui, on: bool) -> Response {
+    let th = Theme::from_ui(ui);
+    let p = &th.palette;
+    let enabled = ui.is_enabled();
+
+    let (rect, mut resp) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
+    let t = ui.ctx().animate_bool_responsive(resp.id, on);
+
+    // 禁用态（插件设置里没有 `editable` 权限的项）不能画得跟能点一样，
+    // 否则用户会以为点了没反应是 bug。整块压成 `line`/`muted` 的浅色。
+    let base = if !enabled {
+        p.bg
+    } else if resp.hovered() {
+        p.hover_bg
+    } else {
+        Color32::WHITE
+    };
+    let edge = if !enabled {
+        p.line
+    } else if resp.hovered() {
+        p.accent
+    } else {
+        p.muted
+    };
+    let fill_to = if enabled { p.accent } else { p.line };
+    ui.painter().rect(
+        rect.shrink(0.5),
+        CornerRadius::same(4),
+        mix_color(base, fill_to, t),
+        egui::Stroke::new(1.0, mix_color(edge, fill_to, t)),
+        egui::StrokeKind::Inside,
+    );
+
+    if t > 0.01 {
+        let s = rect.shrink(4.5);
+        let tick = if enabled { 255.0 } else { 200.0 };
+        ui.painter().add(egui::Shape::line(
+            vec![
+                egui::pos2(s.left(), s.center().y),
+                egui::pos2(s.center().x, s.bottom()),
+                egui::pos2(s.right(), s.top()),
+            ],
+            egui::Stroke::new(2.0, Color32::from_white_alpha((tick * t) as u8)),
+        ));
+    }
+
+    if resp.clicked() {
+        resp.mark_changed();
+    }
+    resp.widget_info(|| WidgetInfo::selected(Role::CheckBox, enabled, on, ""));
+    if resp.hovered() && enabled {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp
+}
+
+/// 带文字的勾选框：`check()` + 可点击的文字。
+///
+/// 为什么需要它：本主题下 `ui.checkbox` 画出来几乎看不见（原因见
+/// `check()` 的注释），而设置页、弹窗里有十几处"勾一下某个选项"，
+/// 全部改写成 `check()` + 手写 label 会让每处都要管 id 和点击命中区。
+/// 这里把两件事包一起：方块与文字**整行可点**（只点文字也算勾选，
+/// 用户不会盯着 18px 的方块戳），并且给出正确的 `WidgetInfo`。
+///
+/// 用 `ui.horizontal` 而不是 `allocate_ui_with_layout` + 手算宽度：
+/// 标签可能带换行（说明性长句），横向布局会让方块和第一行文字基线对齐。
+pub fn checkbox(ui: &mut Ui, value: &mut bool, label: &str) -> Response {
+    let th = Theme::from_ui(ui);
+    let mut clicked = false;
+    let (r, text) = ui
+        .horizontal(|ui| {
+            let r = check(ui, *value);
+            if r.clicked() {
+                clicked = true;
+            }
+            // 文字紧贴方块，不留大空隙（`item_spacing.x` 是 8，再补 2 刚好）
+            ui.add_space(2.0);
+            let text = ui.add(
+                egui::Label::new(
+                    egui::RichText::new(label)
+                        .size(th.text.body)
+                        .color(th.palette.ink),
+                )
+                .sense(egui::Sense::click()),
+            );
+            if text.clicked() {
+                clicked = true;
+            }
+            if text.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            (r, text)
+        })
+        .inner;
+    if clicked {
+        *value = !*value;
+    }
+    // 返回文字那一格（id 稳定、大小正确），`changed()` 由调用方判定。
+    let mut resp = text;
+    resp.rect = r.rect.union(resp.rect);
+    if clicked {
+        resp.mark_changed();
+    }
+    resp.widget_info(|| WidgetInfo::selected(Role::CheckBox, ui.is_enabled(), *value, label));
+    resp
+}
+
 /// 两色之间按 `t`（0..=1）插值。
 ///
 /// `Color32` 没有现成的 lerp：`gamma_multiply` 只是整体缩放亮度，

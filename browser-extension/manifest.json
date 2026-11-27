@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "ADL 下载桥",
-  "version": "0.2.0",
-  "description": "把浏览器下载交给 ADL。浏览器里只有一个开关，其余设置都在 ADL 桌面端的「浏览器接管」页。",
+  "version": "0.3.0",
+  "description": "把浏览器下载交给 ADL。浏览器里只有一个开关（点图标切换），其余设置都在 ADL 桌面端的「浏览器接管」页。",
   "permissions": [
     "downloads",
     "cookies",
@@ -20,7 +20,6 @@
   },
   "action": {
     "default_title": "ADL 下载桥",
-    "default_popup": "popup.html",
     "default_icon": {
       "16": "icons/icon16.png",
       "32": "icons/icon32.png",

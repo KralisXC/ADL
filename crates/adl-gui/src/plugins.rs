@@ -806,10 +806,11 @@ impl App {
                     adl_ui::widgets::cell(ui, 280.0, |ui| match kind.as_str() {
                         "boolean" => {
                             let mut b = value == "true";
-                            if ui
-                                .add_enabled(editable, egui::Checkbox::new(&mut b, ""))
-                                .changed()
-                            {
+                            let r = ui.add_enabled_ui(editable, |ui| {
+                                adl_ui::widgets::check(ui, b)
+                            });
+                            if r.inner.clicked() {
+                                b = !b;
                                 pending.push((plugin.clone(), key.clone(), b.to_string()));
                             }
                         }

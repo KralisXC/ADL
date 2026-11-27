@@ -29,7 +29,7 @@ use queue_fn::{add_batch, add_task, pause_all, pause_task, remove_task, restore_
 use terminal::TerminalState;
 mod platform;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -75,6 +75,10 @@ pub(crate) struct Task {
     pub(crate) cookies: Option<String>,
     /// 入队时刻（unix 秒），排序用。
     pub(crate) added_unix: u64,
+    /// 结束时刻（unix 秒）：下完或失败那一下写进来，0 = 还在跑。
+    ///
+    /// 「下完一段时间后自动从列表里消失」靠它算时长（用户 m25147）。
+    pub(crate) done_unix: u64,
     pub(crate) handle: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -87,6 +91,25 @@ pub(crate) struct Gui {
     /// 后台（下载任务、插件线程）要弹给用户的消息。界面每帧取走，
     /// 因为那些线程拿不到 `App`，只能往这里塞。
     pub(crate) pending_notices: Mutex<Vec<(notice::Level, String, String)>>,
+    /// 浏览器接管要求"先弹新建下载确认"的那些参数。
+    ///
+    /// `/add` 在 API 线程里跑，拿不到 `App`（表单字段全在 `App` 上），
+    /// 只能把参数塞进这里，让界面线程取走填进弹窗。用户 m24756：
+    /// 「接管下载后没有软件弹出来，而是直接静默下载，可能会导致用户
+    /// 不知道下载没有多点了好几下，可以弹出一个新建下载，然后获取的
+    /// 数据直接填上去」。
+    pub(crate) pending_prefill: Mutex<Vec<Prefill>>,
+}
+
+/// 一条"交给新建下载弹窗预填"的请求。
+#[derive(Clone, Default)]
+pub(crate) struct Prefill {
+    pub(crate) url: String,
+    pub(crate) out: String,
+    pub(crate) dir: String,
+    pub(crate) user_agent: String,
+    pub(crate) referer: String,
+    pub(crate) cookies: String,
 }
 
 #[derive(Clone)]
@@ -187,6 +210,13 @@ struct App {
     /// 后端 `add_task` 早就认 `args["dir"]`，这里只是把入口补上
     /// （用户 m15179："每个文件单独的下载目录调整（新建下载页面）"）。
     f_dir: String,
+    /// 浏览器接管进来的 Referer / Cookie。
+    ///
+    /// 表单里**不暴露**这两项（用户看了也不知道填什么），但接管时必须带上：
+    /// 防盗链站点少了 Referer 直接 403，需要登录的站点少了 Cookie 会下到
+    /// 登录页。所以只做"透明携带"，不进界面。
+    f_referer: String,
+    f_cookies: String,
     // 设置表单
     s_dir: String,
     s_conn: u64,
@@ -212,8 +242,17 @@ struct App {
     s_browser_min_mb: u64,
     s_browser_notify_fail: bool,
     s_browser_allow_launch: bool,
+    // 接管时先弹「新建下载」确认 —— 草稿值（用户 m24756：
+    // 「接管下载后没有软件弹出来…可以弹出一个新建下载，然后获取的数据直接填上去」）
+    s_browser_confirm: bool,
     // 关闭窗口时的行为 —— 草稿值（"tray" / "close"）
     s_close_action: String,
+    /// 删除任务时要不要连本地文件一起删 —— 草稿值。
+    ///
+    /// `None` = 每次都问，`Some(true)` = 总是删文件，`Some(false)` = 只删任务。
+    /// 用户 m24756：「删除文件这边没在设置选回是直接删除文件还是删除列表不删文件」
+    /// —— 原来只有删除弹窗里的「记住我的选择」能写，写进去之后就再也改不回来。
+    s_delete_files: Option<bool>,
     // 限速显示单位（"auto" 或固定单位）
     limit_unit: String,
     // 侧栏收起
@@ -281,6 +320,19 @@ struct App {
     task_filter: String,
     /// 任务列表排序：status（默认，进行中在上）/ added / name / size / progress。
     task_sort: String,
+    /// 任务列表里被勾选的任务 id（多选管理，用户 m25107：「没有任务列表的多选管理」）。
+    ///
+    /// 存 id 而不是行下标：列表会随搜索/筛选/排序重排，下标每一帧都可能变，
+    /// 存下标等于"勾着勾着勾到别人身上"。id 在整个列表里唯一且稳定。
+    selected: BTreeSet<u64>,
+    /// 批量删除的确认（`Some(..)` = 正在问"要移除这几条吗"）。
+    bulk_ask: Option<BulkAsk>,
+    /// 上次自动清理"已完成任务"的时刻。
+    ///
+    /// 用户 m25147：「这个 #N 的 id 可以就是下载了东西之后一定时间清理这个 id
+    /// 就行了，就是之后的 id 还是会从 1 开始」。清理是"从列表里拿走"，
+    /// 历史还在 `history.json` 里；拿光之后 `next_id` 归 1，编号重新开始。
+    last_cleanup: Instant,
     /// 插件市场的索引结果（后台拉，UI 这里只负责取）。
     ///
     /// `None` = 还没点过「刷新」。`Some(Err(_))` 也要留住，否则"拉失败了"
@@ -348,6 +400,18 @@ struct DeleteAsk {
     delete_files: bool,
     /// 是否记住这次选择
     remember: bool,
+}
+
+/// 批量删除前的确认（多选管理，用户 m25107：「没有任务列表的多选管理」）。
+///
+/// 与单条删除分开一个结构：批量删除不问"要不要连文件一起删"那么细，
+/// 但**默认不勾**删文件 —— 一次删十几条时误勾的代价太大。
+struct BulkAsk {
+    /// 要删的任务 id 快照：确认框开着的时候列表可能因为下载完成而重排，
+    /// 不能等到点"删除"时再回头从列表里捞。
+    ids: Vec<u64>,
+    /// 是否连本地文件一起删
+    delete_files: bool,
 }
 
 /// 起一个线程去弹系统的「选择文件夹」对话框，立刻返回收结果的 channel。
@@ -557,6 +621,8 @@ impl App {
             f_out: String::new(),
             f_ua: String::new(),
             f_dir: String::new(),
+            f_referer: String::new(),
+            f_cookies: String::new(),
             s_dir: cfg.dir.clone(),
             s_conn: cfg.connections as u64,
             s_limit: cfg.limit,
@@ -574,11 +640,13 @@ impl App {
             s_browser_min_mb: cfg.browser_min_mb,
             s_browser_notify_fail: cfg.browser_notify_fail,
             s_browser_allow_launch: cfg.browser_allow_launch,
+            s_browser_confirm: cfg.browser_confirm_first,
             s_close_action: if cfg.close_action.trim().is_empty() {
                 "tray".to_string()
             } else {
                 cfg.close_action.clone()
             },
+            s_delete_files: cfg.delete_files_choice,
             limit_unit: if cfg.limit_unit.trim().is_empty() {
                 "auto".to_string()
             } else {
@@ -620,6 +688,9 @@ impl App {
             task_search: String::new(),
             task_filter: cfg.task_filter.clone(),
             task_sort: cfg.task_sort.clone(),
+            selected: BTreeSet::new(),
+            bulk_ask: None,
+            last_cleanup: Instant::now(),
             market_rx: None,
             market_entries: Vec::new(),
             market_note: None,
@@ -710,6 +781,8 @@ impl App {
             self.f_out.clear();
             self.f_ua.clear();
             self.f_dir.clear();
+            self.f_referer.clear();
+            self.f_cookies.clear();
             self.add_open = false;
             self.tab = Tab::Tasks;
             return;
@@ -717,6 +790,10 @@ impl App {
         let out = self.f_out.trim();
         let ua = self.f_ua.trim();
         let dir = self.f_dir.trim();
+        // Referer / Cookie 只可能来自浏览器接管（表单里没有入口），
+        // 用户手动新建时它们恒为空，传 Null 出去 backend 会自己忽略。
+        let referer = self.f_referer.trim();
+        let cookies = self.f_cookies.trim();
         let args = json!({
             "url": self.f_url.trim(),
             "out": if out.is_empty() { Value::Null } else { json!(out) },
@@ -724,6 +801,8 @@ impl App {
             "user_agent": if ua.is_empty() { Value::Null } else { json!(ua) },
             // 留空 = 用设置里的默认下载目录（add_task 里 `.filter(!is_empty)`）
             "dir": if dir.is_empty() { Value::Null } else { json!(dir) },
+            "referer": if referer.is_empty() { Value::Null } else { json!(referer) },
+            "cookies": if cookies.is_empty() { Value::Null } else { json!(cookies) },
         });
         match add_task(&self.gui, &args) {
             Ok(v) => {
@@ -738,6 +817,8 @@ impl App {
                 self.f_out.clear();
                 self.f_ua.clear();
                 self.f_dir.clear();
+                self.f_referer.clear();
+                self.f_cookies.clear();
                 self.add_open = false;
                 self.tab = Tab::Tasks;
             }
@@ -771,6 +852,13 @@ impl App {
             "browser_min_mb": self.s_browser_min_mb,
             "browser_notify_fail": self.s_browser_notify_fail,
             "browser_allow_launch": self.s_browser_allow_launch,
+            "browser_confirm_first": self.s_browser_confirm,
+            // 删除任务时要不要连文件一起删：None 也要显式传，否则用户
+            // 从"总是删文件"改回"每次问"时会被 `if let Some` 忽略掉。
+            "delete_files_choice": match self.s_delete_files {
+                None => Value::Null,
+                Some(b) => json!(b),
+            },
         });
         match set_settings(&self.gui, &args) {
             Ok(_) => {
@@ -814,11 +902,13 @@ impl App {
         self.s_browser_min_mb = cfg.browser_min_mb;
         self.s_browser_notify_fail = cfg.browser_notify_fail;
         self.s_browser_allow_launch = cfg.browser_allow_launch;
+        self.s_browser_confirm = cfg.browser_confirm_first;
         self.s_close_action = if cfg.close_action.trim().is_empty() {
             "tray".to_string()
         } else {
             cfg.close_action.clone()
         };
+        self.s_delete_files = cfg.delete_files_choice;
         self.limit_unit = if cfg.limit_unit.trim().is_empty() {
             "auto".to_string()
         } else {
@@ -847,6 +937,7 @@ impl App {
         } else {
             cfg.close_action.clone()
         };
+        let cfg_delete_files = cfg.delete_files_choice;
         let mut n = 0usize;
         if self.s_conn as usize != cfg.connections {
             n += 1;
@@ -898,7 +989,13 @@ impl App {
         if self.s_browser_allow_launch != cfg.browser_allow_launch {
             n += 1;
         }
+        if self.s_browser_confirm != cfg.browser_confirm_first {
+            n += 1;
+        }
         if self.s_close_action != cfg_close {
+            n += 1;
+        }
+        if self.s_delete_files != cfg_delete_files {
             n += 1;
         }
         n
@@ -1264,6 +1361,19 @@ impl eframe::App for App {
                 }
                 _ => {}
             }
+        }
+
+        // 定时把"已经下完一段时间"的任务从列表里拿走。
+        //
+        // 用户 m25147：「这个 #N 的 id 可以就是下载了东西之后一定时间清理这个
+        // id 就行了，就是之后的 id 还是会从 1 开始」。
+        //
+        // 为什么不是每次删任务就把 id 还回去：id 是用户能看见、能口头说的
+        // 编号（"那个 #7 下完了吗"），中途回收会让同一个编号指到另一条任务
+        // 上。只在"整张列表清空"时把 `next_id` 归 1，编号才不会互相串。
+        if self.last_cleanup.elapsed() >= Duration::from_secs(60) {
+            self.last_cleanup = Instant::now();
+            self.run_cleanup();
         }
     }
 
@@ -1695,6 +1805,33 @@ impl eframe::App for App {
             self.notify(level, title, body);
         }
 
+        // 浏览器接管要求"先弹确认"的请求：填进新建下载弹窗。
+        //
+        // 一次取一条就够 —— 用户同时点两三个下载的情况很少，而弹窗只有
+        // 一个；剩下的留在队列里，下一个 repaint 再取。取到就 `request_repaint`
+        // 保证弹窗真的画出来（窗口可能正缩在托盘里）。
+        let prefill = {
+            let mut q = self.gui.pending_prefill.lock().unwrap();
+            if q.is_empty() {
+                None
+            } else {
+                Some(q.remove(0))
+            }
+        };
+        if let Some(p) = prefill {
+            self.f_url = p.url;
+            self.f_out = p.out;
+            self.f_dir = p.dir;
+            self.f_ua = p.user_agent;
+            // referer / cookies 没有对应输入框（表单里不暴露），但接管时必须
+            // 带上，否则防盗链站点直接 403。存在 App 上，`do_add` 时一起提交。
+            self.f_referer = p.referer;
+            self.f_cookies = p.cookies;
+            self.add_open = true;
+            self.tab = Tab::Tasks;
+            ctx.request_repaint();
+        }
+
         // 右下角 toast：4 秒后自己淡出消失，点了跳「消息」页。
         self.show_toast(&ctx);
 
@@ -1705,6 +1842,8 @@ impl eframe::App for App {
             2
         } else if self.del_ask.is_some() {
             3
+        } else if self.bulk_ask.is_some() {
+            4
         } else {
             0
         };
@@ -1728,11 +1867,56 @@ impl eframe::App for App {
             self.show_delete_modal(&ctx);
         }
 
+        // 批量删除确认（多选管理）
+        if self.bulk_ask.is_some() {
+            self.show_bulk_modal(&ctx);
+        }
+
         ctx.request_repaint_after(Duration::from_millis(250));
     }
 }
 
 impl App {
+    /// 清掉已经结束一段时间的任务（只清列表，不碰文件）。
+    ///
+    /// 用户 m25147：「这个 #N 的 id 可以就是下载了东西之后一定时间清理这个
+    /// id 就行了，就是之后的 id 还是会从 1 开始」。
+    ///
+    /// 判定用 `done_unix` 而不是 `added_unix`：一个 3 GB 的镜像可能挂了半小时
+    /// 才下完，按添加时间算等于"刚下完就消失"，用户连看一眼都来不及。
+    fn run_cleanup(&mut self) {
+        let (enabled, minutes) = {
+            let cfg = self.gui.cfg.lock().unwrap();
+            (cfg.auto_clean_completed, cfg.auto_clean_minutes)
+        };
+        if !enabled || minutes == 0 {
+            return;
+        }
+        let now = adl_app::history::now_unix();
+        let limit = minutes.saturating_mul(60);
+        let removed = {
+            let mut tasks = self.gui.tasks.lock().unwrap();
+            let before = tasks.len();
+            tasks.retain(|t| {
+                let ended = matches!(t.status.as_str(), "completed" | "failed");
+                // `done_unix == 0` 是"还在跑 / 老版本存下来的记录"，不动它。
+                !(ended && t.done_unix > 0 && now.saturating_sub(t.done_unix) >= limit)
+            });
+            let removed = before - tasks.len();
+            if tasks.is_empty() {
+                // 列表清空了，编号从头开始（用户 m25147）。
+                self.gui.next_id.store(1, Ordering::SeqCst);
+            }
+            removed
+        };
+        if removed > 0 {
+            // 不弹消息、不弹 toast：这是用户自己开的自动清理，每次下完都弹
+            // 一条"已清理 1 项"反而是噪音。状态条轻轻带一下就够了。
+            self.set_status(format!("已自动清理 {removed} 条已完成的任务"), false);
+            save_tasks(&self.gui);
+        }
+    }
+
     /// 左侧整高边栏。
     ///
     /// 布局参考 DSH 的侧栏：最上面是 `ADL` 品牌字，接着是主操作按钮（新建下载），
@@ -2514,6 +2698,15 @@ impl App {
 
         let mut tasks = snapshot(&self.gui);
 
+        // 勾选集合里可能残留已经消失的任务 id（被删除、被自动清理、
+        // 或者上一次运行留下的），每帧先按当前列表清一遍。
+        // 不做这件事的话「已选 3 条」会随着列表变短一直挂着，
+        // 点批量删除时又把早已不存在的 id 再删一遍。
+        {
+            let live: BTreeSet<u64> = tasks.iter().map(|t| t.id).collect();
+            self.selected.retain(|id| live.contains(id));
+        }
+
         // ── 搜索 / 筛选 / 排序（用户 m18583）───────────────
         //
         // 先过滤再排序：`total` 与 `completed` 都是过滤后的子集，计数才对得上。
@@ -2583,6 +2776,22 @@ impl App {
                     .small()
                     .color(muted()),
             );
+            // 全选 / 反选放这里而不是表头：表头那格是 `Column` 的静态标题，
+            // 要放控件就得让 `adl_ui::table` 支持自定义表头，为一个复选框
+            // 不值当。按钮在工具条上一样好用，而且"全选"这个词比表头一个
+            // 光秃秃的勾更好懂。
+            if ui.small_button("全选").clicked() {
+                self.selected = tasks.iter().map(|t| t.id).collect();
+            }
+            if ui.small_button("反选").clicked() {
+                let mut next = BTreeSet::new();
+                for t in tasks.iter() {
+                    if !self.selected.contains(&t.id) {
+                        next.insert(t.id);
+                    }
+                }
+                self.selected = next;
+            }
             // 批量控制放在右边：任务一多，逐行点暂停很烦。
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.small_button("全部继续").clicked() {
@@ -2593,6 +2802,53 @@ impl App {
                 }
             });
         });
+
+        // ── 多选工具条（用户 m25107：「没有任务列表的多选管理」）──────
+        //
+        // 勾了才出现：没勾的时候多一行空工具条等于白占 30px 高度。
+        // 选中数从 `self.selected` 现算 —— 它是 id 集合，不是"上次点了几个"。
+        let selected_n = self.selected.len();
+        if selected_n > 0 {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.label(
+                    egui::RichText::new(format!("已选 {selected_n} 条"))
+                        .small()
+                        .color(teal()),
+                );
+                if ui.small_button("暂停所选").clicked() {
+                    let ids: Vec<u64> = self.selected.iter().copied().collect();
+                    let mut n = 0;
+                    for id in ids {
+                        if pause_task(&self.gui, &json!({"id": id})).is_ok() {
+                            n += 1;
+                        }
+                    }
+                    self.set_status(format!("已暂停 {n} 条任务"), false);
+                }
+                if ui.small_button("继续所选").clicked() {
+                    let ids: Vec<u64> = self.selected.iter().copied().collect();
+                    let mut n = 0;
+                    for id in ids {
+                        if resume_task(&self.gui, &json!({"id": id})).is_ok() {
+                            n += 1;
+                        }
+                    }
+                    self.set_status(format!("已把 {n} 条任务放回队列"), false);
+                }
+                if ui.small_button("删除所选…").clicked() {
+                    self.bulk_ask = Some(BulkAsk {
+                        ids: self.selected.iter().copied().collect(),
+                        // 默认不勾"连文件一起删"：一次十几条时误勾的代价太大。
+                        delete_files: false,
+                    });
+                }
+                if ui.small_button("取消选择").clicked() {
+                    self.selected.clear();
+                }
+            });
+        }
         if filter_changed {
             // 筛选/排序是用户偏好，下次打开还要在，所以落配置里。
             let mut cfg = self.gui.cfg.lock().unwrap();
@@ -2658,6 +2914,9 @@ impl App {
         // 列定义搬到 adl-ui：固定宽 + 一列吃剩余 + 单行截断。
         // 以前这里 170 行手写水平布局与 table_cell(..) 胶水，现在只有表与行。
         let cols = [
+            // 多选列（用户 m25107：「没有任务列表的多选管理」）。
+            // 34px：刚好放一个 checkbox，再多就白占文件名的地方。
+            adl_ui::Column::new("", 34.0),
             adl_ui::Column::new("状态", 72.0),
             adl_ui::Column::remainder("文件"),
             adl_ui::Column::new("进度", 150.0),
@@ -2700,7 +2959,19 @@ impl App {
             let t = &tasks[i];
             let (txt, color) = status_style(&t.status);
 
+            // 行首复选框。用自绘的 `widgets::check` 而不是 `ui.checkbox("")`：
+            // egui 的复选框填充取 `widgets.inactive.bg_fill`，本主题把它设成了
+            // `accent_soft`（#E2F1ED），白卡上几乎看不见（实测整列像空的）。
+            // `BTreeSet` 没有可变槽位，先算当前状态再按结果增删。
             adl_ui::widgets::cell(ui, w[0], |ui| {
+                if adl_ui::widgets::check(ui, self.selected.contains(&t.id)).clicked() {
+                    if !self.selected.remove(&t.id) {
+                        self.selected.insert(t.id);
+                    }
+                }
+            });
+
+            adl_ui::widgets::cell(ui, w[1], |ui| {
                 let r = ui.label(egui::RichText::new(txt).color(color));
                 if t.status == "failed" {
                     let msg = t.error.as_deref().unwrap_or("失败");
@@ -2709,8 +2980,11 @@ impl App {
             });
 
             let name = display_name(t);
-            adl_ui::widgets::cell(ui, w[1], |ui| {
-                adl_ui::table::truncated(ui, &name, &t.url);
+            adl_ui::widgets::cell(ui, w[2], |ui| {
+                // 文件名整格可点 = 直接进详情页（用户 m24756：不用再点「⋯」）。
+                if adl_ui::table::truncated_link(ui, &name, &t.url).clicked() {
+                    detail_id = Some(t.id);
+                }
             });
 
             let frac = if t.total > 0 {
@@ -2720,7 +2994,7 @@ impl App {
             };
             // 失败原因不塞进"进度"列（150px 装不下，实测被截成"资源不存在（HTTP 4…"），
             // 改成在进度列给一行短标记，完整原因挂到状态列的悬停提示上。
-            adl_ui::widgets::cell(ui, w[2], |ui| {
+            adl_ui::widgets::cell(ui, w[3], |ui| {
                 if t.status == "completed" {
                     ui.label(egui::RichText::new("已完成").color(teal()));
                 } else if t.status == "failed" {
@@ -2739,7 +3013,7 @@ impl App {
                     // 现在把高度压到 8、圆角给 3、最小填充宽度自然变成 6，
                     // 才是「细长圆角条」。
                     ui.horizontal(|ui| {
-                        let bar_w = (w[2] - 52.0).max(40.0);
+                        let bar_w = (w[3] - 52.0).max(40.0);
                         ui.add(
                             egui::ProgressBar::new(frac)
                                 .desired_width(bar_w)
@@ -2756,7 +3030,7 @@ impl App {
                 }
             });
 
-            adl_ui::widgets::cell(ui, w[3], |ui| {
+            adl_ui::widgets::cell(ui, w[4], |ui| {
                 let s = if t.speed > 0 {
                     format_speed(t.speed)
                 } else {
@@ -2765,11 +3039,11 @@ impl App {
                 ui.label(egui::RichText::new(s).color(muted()));
             });
 
-            adl_ui::widgets::cell(ui, w[4], |ui| {
+            adl_ui::widgets::cell(ui, w[5], |ui| {
                 ui.label(format_bytes(t.total));
             });
 
-            adl_ui::widgets::cell(ui, w[5], |ui| {
+            adl_ui::widgets::cell(ui, w[6], |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     // 只有下载中的任务能暂停，其余状态这里留空会显得缺一块，
@@ -2918,6 +3192,79 @@ impl App {
         }
     }
 
+    /// 批量删除确认弹窗（多选管理，用户 m25107）。
+    ///
+    /// 与单条删除不同：这里**不问"记住选择"**。记住的语义是"以后删除都按
+    /// 这个来"，一条批量删除的选择会顺手改掉用户单条删除的习惯，代价太大。
+    fn show_bulk_modal(&mut self, ctx: &egui::Context) {
+        let mut go = false;
+        let mut cancel = false;
+
+        let a = self.fade.alpha(FADE_SECS);
+        let resp = egui::Modal::new(egui::Id::unique("adl_bulk_modal"))
+            .frame(fade_frame(ctx, a))
+            .backdrop_color(fade_color(egui::Color32::from_black_alpha(100), a))
+            .show(ctx, |ui| {
+                ui.set_opacity(a);
+                ui.set_width(420.0);
+                adl_ui::widgets::section_title(ui, "删除所选任务");
+                ui.add_space(10.0);
+                if let Some(ask) = self.bulk_ask.as_ref() {
+                    adl_ui::widgets::hint(ui, &format!("将移除选中的 {} 条任务。", ask.ids.len()));
+                }
+                ui.add_space(10.0);
+                if let Some(ask) = self.bulk_ask.as_mut() {
+                    adl_ui::widgets::checkbox(
+                        ui,
+                        &mut ask.delete_files,
+                        "同时删除这些任务的本地文件和控制文件（不可恢复）",
+                    );
+                    ui.add_space(14.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("删除").clicked() {
+                            go = true;
+                        }
+                        if ui.button("取消").clicked() {
+                            cancel = true;
+                        }
+                    });
+                }
+            });
+
+        if resp.should_close() {
+            cancel = true;
+        }
+        if cancel {
+            self.bulk_ask = None;
+            return;
+        }
+        if go {
+            let (ids, files) = match self.bulk_ask.take() {
+                Some(a) => (a.ids, a.delete_files),
+                None => return,
+            };
+            let mut n = 0usize;
+            let mut errs = 0usize;
+            for id in ids.iter().copied() {
+                match remove_task(&self.gui, &json!({"id": id, "files": files})) {
+                    Ok(_) => n += 1,
+                    Err(_) => errs += 1,
+                }
+            }
+            self.selected.clear();
+            let msg = if errs == 0 {
+                if files {
+                    format!("已删除 {n} 条任务和本地文件")
+                } else {
+                    format!("已删除 {n} 条任务")
+                }
+            } else {
+                format!("已删除 {n} 条任务，{errs} 条失败")
+            };
+            self.set_status(msg, errs > 0);
+        }
+    }
+
     /// 删除确认弹窗：问一句"本地文件要不要一起删"，可勾"记住"。
     fn show_delete_modal(&mut self, ctx: &egui::Context) {
         let mut go: Option<bool> = None;
@@ -2941,10 +3288,14 @@ impl App {
                 if !ask.has_file {
                     adl_ui::widgets::hint(ui, "这个任务还没有落盘文件，只会删掉任务记录。");
                 } else {
-                    ui.checkbox(&mut ask.delete_files, "同时删除本地文件和控制文件（不可恢复）");
+                    adl_ui::widgets::checkbox(
+                        ui,
+                        &mut ask.delete_files,
+                        "同时删除本地文件和控制文件（不可恢复）",
+                    );
                 }
                 ui.add_space(8.0);
-                ui.checkbox(&mut ask.remember, "记住我的选择（以后不再询问）");
+                adl_ui::widgets::checkbox(ui, &mut ask.remember, "记住我的选择（以后不再询问）");
                 ui.add_space(14.0);
                 ui.horizontal(|ui| {
                     let del_files = ask.delete_files && ask.has_file;
@@ -3120,7 +3471,7 @@ impl App {
             // 勾选框在上、按钮在下 —— 和 Windows 自己的确认框一致。
             // 原来按钮在上、勾选框在下，读起来像"先做决定再看到选项"。
             if let Some(ask) = self.close_ask.as_mut() {
-                ui.checkbox(&mut ask.remember, "记住我的选择（以后不再询问）");
+                adl_ui::widgets::checkbox(ui, &mut ask.remember, "记住我的选择（以后不再询问）");
             }
             ui.add_space(14.0);
 
@@ -3312,6 +3663,7 @@ impl App {
             was_check_update,
             was_close,
             was_show_on_boot,
+            was_delete_files,
         ) = {
             let cfg = self.gui.cfg.lock().unwrap();
             (
@@ -3338,6 +3690,7 @@ impl App {
                     cfg.close_action.clone()
                 },
                 cfg.show_on_auto_start,
+                cfg.delete_files_choice,
             )
         };
         // 自启动的"原值"不取配置，取注册表实际状态（任务管理器关掉后
@@ -3556,7 +3909,7 @@ impl App {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 let mut on = self.s_check_update;
-                if ui.checkbox(&mut on, "启动时检查更新").changed() {
+                if adl_ui::widgets::checkbox(ui, &mut on, "启动时检查更新").changed() {
                     self.s_check_update = on;
                 }
                 if dirty {
@@ -3713,7 +4066,7 @@ impl App {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 let mut on = self.s_auto_start;
-                if ui.checkbox(&mut on, "开机自动启动").changed() {
+                if adl_ui::widgets::checkbox(ui, &mut on, "开机自动启动").changed() {
                     self.s_auto_start = on;
                 }
                 if self.s_auto_start != was_auto_start {
@@ -3731,7 +4084,7 @@ impl App {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 let mut show = self.s_show_on_boot;
                 let resp = ui.add_enabled_ui(self.s_auto_start, |ui| {
-                    ui.checkbox(&mut show, "启动后显示主界面")
+                    adl_ui::widgets::checkbox(ui, &mut show, "启动后显示主界面")
                 });
                 if resp.inner.changed() {
                     self.s_show_on_boot = show;
@@ -3769,6 +4122,46 @@ impl App {
                         .color(color),
                 );
             });
+        });
+
+        // ── 删除任务时怎么处理本地文件 ──
+        //
+        // 用户 m24756：「删除文件这边没在设置选回是直接删除文件还是删除列表
+        // 不删文件」。原来只有删除弹窗里的「记住我的选择」能写这个值，
+        // 写进去之后设置页没有任何入口，等于一选定终身。
+        ui.add_space(10.0);
+        adl_ui::widgets::card(ui, |ui| {
+            let dirty = self.s_delete_files != was_delete_files;
+            dirty_title(ui, "删除任务时", dirty);
+            ui.add_space(6.0);
+            // 三态：None = 每次问。用 selectable_label 而不是 ComboBox，
+            // 三项都摊开更符合"这是个会被反复改的偏好"。
+            let cur = self.s_delete_files;
+            ui.horizontal(|ui| {
+                for (v, l) in [
+                    (None, "每次都问"),
+                    (Some(true), "连本地文件一起删"),
+                    (Some(false), "只删列表，留文件"),
+                ] {
+                    if ui.selectable_label(cur == v, l).clicked() {
+                        self.s_delete_files = v;
+                    }
+                }
+            });
+            if dirty {
+                let was_label = match was_delete_files {
+                    None => "每次都问",
+                    Some(true) => "连本地文件一起删",
+                    Some(false) => "只删列表，留文件",
+                };
+                adl_ui::widgets::hint_was(ui, &format!("原：{was_label}"));
+            }
+            ui.add_space(6.0);
+            adl_ui::widgets::hint(
+                ui,
+                "选「每次都问」时，删除会弹一个确认框，里面还有「记住我的选择」——\
+                 勾了就会自动变成上面两种之一。",
+            );
         });
 
         // ── 关闭行为 ──
@@ -3855,10 +4248,13 @@ impl App {
                         adl_ui::widgets::cell(ui, 260.0, |ui| match kind.as_str() {
                             "boolean" => {
                                 let mut b = value == "true";
-                                if ui
-                                    .add_enabled(editable, egui::Checkbox::new(&mut b, ""))
-                                    .changed()
-                                {
+                                // 插件设置里的布尔项：插件没申请 fs_write 权限时
+                                // 只能看不能改，灰掉交给 `add_enabled_ui` 统一处理。
+                                let r = ui.add_enabled_ui(editable, |ui| {
+                                    adl_ui::widgets::check(ui, b)
+                                });
+                                if r.inner.clicked() {
+                                    b = !b;
                                     pending.push((plugin.clone(), key.clone(), b.to_string()));
                                 }
                             }
@@ -3928,7 +4324,7 @@ impl App {
         ui.add_space(2.0);
 
         // 「原值」一次抄出来，下面按项比。端口/阈值都是 u64 草稿值。
-        let (was_port, was_cookies, was_min_mb, was_notify, was_launch, mode_name) = {
+        let (was_port, was_cookies, was_min_mb, was_notify, was_launch, was_confirm, mode_name) = {
             let cfg = self.gui.cfg.lock().unwrap();
             (
                 cfg.browser_port as u64,
@@ -3936,6 +4332,7 @@ impl App {
                 cfg.browser_min_mb,
                 cfg.browser_notify_fail,
                 cfg.browser_allow_launch,
+                cfg.browser_confirm_first,
                 if cfg.mode_trusted() {
                     "信任模式"
                 } else {
@@ -3995,16 +4392,43 @@ impl App {
 
         // ── 2. 接管行为 ──
         adl_ui::widgets::card(ui, |ui| {
-            let dirty = self.s_browser_cookies != was_cookies
+            let dirty = self.s_browser_confirm != was_confirm
+                || self.s_browser_cookies != was_cookies
                 || self.s_browser_notify_fail != was_notify
                 || self.s_browser_allow_launch != was_launch;
             dirty_title(ui, "接管行为", dirty);
             ui.add_space(6.0);
 
+            // 放在第一位：这是"接管之后你能不能看见它"的问题，比 Cookie
+            // 这类细节更影响用户感受（用户 m24756 的第一条反馈就是它）。
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                let mut on = self.s_browser_confirm;
+                if ui
+                    .checkbox(&mut on, "接管时先弹「新建下载」让我确认")
+                    .changed()
+                {
+                    self.s_browser_confirm = on;
+                }
+                if self.s_browser_confirm != was_confirm {
+                    adl_ui::widgets::badge(
+                        ui,
+                        &format!("原：{}", if was_confirm { "开启" } else { "关闭" }),
+                        pal().warn,
+                    );
+                }
+            });
+            adl_ui::widgets::hint(
+                ui,
+                "开：浏览器点下载后桌面端弹出新建下载，地址和文件名已填好，点「开始下载」才真下。\
+                 关：后台直接接管，界面不出声（容易让人以为没下成，于是多点几次）。",
+            );
+
+            ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 let mut on = self.s_browser_cookies;
-                if ui.checkbox(&mut on, "把页面 Cookie 一起交给下载器").changed() {
+                if adl_ui::widgets::checkbox(ui, &mut on, "把页面 Cookie 一起交给下载器").changed() {
                     self.s_browser_cookies = on;
                 }
                 if self.s_browser_cookies != was_cookies {
@@ -4024,7 +4448,7 @@ impl App {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 let mut on = self.s_browser_notify_fail;
-                if ui.checkbox(&mut on, "接管失败时在消息中心提醒").changed() {
+                if adl_ui::widgets::checkbox(ui, &mut on, "接管失败时在消息中心提醒").changed() {
                     self.s_browser_notify_fail = on;
                 }
                 if self.s_browser_notify_fail != was_notify {
@@ -4822,7 +5246,7 @@ fn render_node(ui: &mut egui::Ui, plugin: &str, node: &Value, out: &mut Vec<Disp
             let label = s_of(node, "label");
             let cur = b_of(node, "value", false);
             let mut b = cur;
-            if ui.checkbox(&mut b, label).changed() {
+            if adl_ui::widgets::checkbox(ui, &mut b, label).changed() {
                 if let Some(key) = node.get("setting").and_then(|x| x.as_str()) {
                     out.push(Dispatch::Setting {
                         plugin: plugin.to_string(),
@@ -5579,6 +6003,11 @@ fn settings_json(cfg: &Config) -> Value {
         "browser_min_mb": cfg.browser_min_mb,
         "browser_notify_fail": cfg.browser_notify_fail,
         "browser_allow_launch": cfg.browser_allow_launch,
+        "browser_confirm_first": cfg.browser_confirm_first,
+        "delete_files_choice": match cfg.delete_files_choice {
+            None => Value::Null,
+            Some(b) => json!(b),
+        },
     })
 }
 
@@ -5646,6 +6075,19 @@ fn set_settings(gui: &Arc<Gui>, args: &Value) -> Result<Value, String> {
     }
     if let Some(b) = args.get("browser_allow_launch").and_then(|x| x.as_bool()) {
         cfg.browser_allow_launch = b;
+    }
+    if let Some(b) = args.get("browser_confirm_first").and_then(|x| x.as_bool()) {
+        cfg.browser_confirm_first = b;
+    }
+    // 删除是否含本地文件的三态：显式传 null = 回到"每次询问"。
+    //
+    // `args.get(..)` 拿到 `Some(Value::Null)` 时 `as_bool()` 是 None，
+    // 所以这里必须**先判断键存不存在**，再看值是不是 null。
+    if args.get("delete_files_choice").is_some() {
+        cfg.delete_files_choice = match args.get("delete_files_choice") {
+            Some(Value::Bool(b)) => Some(*b),
+            _ => None,
+        };
     }
     cfg.save().map_err(|e| format!("保存配置失败: {e}"))?;
     let snapshot = settings_json(&cfg);
@@ -5885,6 +6327,7 @@ fn main() -> eframe::Result {
         cfg: Mutex::new(cfg.clone()),
         hooks: Mutex::new(build_hooks(&cfg)),
         pending_notices: Mutex::new(Vec::new()),
+        pending_prefill: Mutex::new(Vec::new()),
     });
 
     // 插件线程调 `adl.notify()` 时往 pending_notices 里塞，界面每帧取走。

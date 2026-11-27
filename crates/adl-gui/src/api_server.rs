@@ -52,6 +52,8 @@ struct BridgeCfg {
     min_mb: u64,
     notify_fail: bool,
     allow_launch: bool,
+    /// 接管时先弹「新建下载」让人确认，而不是静默在后台开跑。
+    confirm_first: bool,
 }
 
 /// 启动 API 服务，返回实际监听端口。
@@ -71,6 +73,7 @@ pub fn start(gui: Arc<Gui>, port: u16) -> std::io::Result<u16> {
             min_mb: cfg.browser_min_mb,
             notify_fail: cfg.browser_notify_fail,
             allow_launch: cfg.browser_allow_launch,
+            confirm_first: cfg.browser_confirm_first,
         }
     };
     spawn_listener(listener, gui.clone(), token.clone(), bridge.clone());
@@ -233,6 +236,7 @@ fn handle_conn(
                         "min_mb": bridge.min_mb,
                         "notify_fail": bridge.notify_fail,
                         "allow_launch": bridge.allow_launch,
+                        "confirm_first": bridge.confirm_first,
                     })
                     .to_string(),
                 )
@@ -283,9 +287,51 @@ fn handle_conn(
                 (200, json!({"ok": true}).to_string())
             } else if req.path == "/add" {
                 let v: Value = serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}));
-                match add_task(gui, &v) {
-                    Ok(r) => (200, r.to_string()),
-                    Err(e) => (400, json!({"ok": false, "error": e}).to_string()),
+                // `confirm: true` = 只把参数送进「新建下载」弹窗，等人点确认再开始
+                // （用户 m24756：「接管下载后没有软件弹出来，而是直接静默下载…
+                // 可以弹出一个新建下载，然后获取的数据直接填上去」）。
+                //
+                // 校验在这里先做一遍：URL 不合法就直接回 400，别让用户点了
+                // 浏览器里那条下载、结果桌面端弹出一个填着垃圾地址的表单。
+                let confirm = v.get("confirm").and_then(|x| x.as_bool()).unwrap_or(false);
+                if confirm {
+                    let url = v
+                        .get("url")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    if !(url.starts_with("http://") || url.starts_with("https://")) {
+                        (
+                            400,
+                            json!({"ok": false, "error": format!("不是 http/https 地址：{url}")})
+                                .to_string(),
+                        )
+                    } else {
+                        let txt = |k: &str| {
+                            v.get(k)
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("")
+                                .trim()
+                                .to_string()
+                        };
+                        if let Ok(mut q) = gui.pending_prefill.lock() {
+                            q.push(crate::Prefill {
+                                url,
+                                out: txt("out"),
+                                dir: txt("dir"),
+                                user_agent: txt("user_agent"),
+                                referer: txt("referer"),
+                                cookies: txt("cookies"),
+                            });
+                        }
+                        (200, json!({"ok": true, "pending": true}).to_string())
+                    }
+                } else {
+                    match add_task(gui, &v) {
+                        Ok(r) => (200, r.to_string()),
+                        Err(e) => (400, json!({"ok": false, "error": e}).to_string()),
+                    }
                 }
             } else {
                 // /probe：最小实现，回显 URL 是否可用（M6 暂不深探）

@@ -40,6 +40,7 @@ pub(crate) fn save_tasks(gui: &Arc<Gui>) {
                     path: t.path.clone(),
                     error: t.error.clone(),
                     added_unix: t.added_unix,
+                    done_unix: t.done_unix,
                 })
                 .collect(),
         }
@@ -210,6 +211,7 @@ fn launch_task(gui: &Arc<Gui>, id: u64) {
                 // 退出之后就不再 emit_progress 了，这里不清的话详情页会
                 // 一直挂着几十条残留区间（已写入 0 B 也照样列出来）。
                 t.runs.clear();
+                let now = adl_app::history::now_unix();
                 match &res {
                     Ok(r) => {
                         t.status = "completed".into();
@@ -218,11 +220,13 @@ fn launch_task(gui: &Arc<Gui>, id: u64) {
                         t.path = Some(r.path.to_string_lossy().to_string());
                         t.speed = r.speed_bps();
                         t.connections = 0;
+                        t.done_unix = now;
                     }
                     Err(e) => {
                         t.status = "failed".into();
                         t.error = Some(e.to_string());
                         t.connections = 0;
+                        t.done_unix = now;
                     }
                 }
             }
@@ -317,6 +321,7 @@ pub(crate) fn add_task(gui: &Arc<Gui>, args: &Value) -> Result<Value, String> {
             headers,
             cookies,
             added_unix: adl_app::history::now_unix(),
+            done_unix: 0,
             handle: None,
         });
     }
@@ -469,7 +474,6 @@ pub(crate) fn remove_task(gui: &Arc<Gui>, args: &Value) -> Result<Value, String>
 }
 
 /// 启动时把 `tasks.json` 读回来。
-///
 /// 规则：
 /// - 已完成 / 失败的照原样进列表（能点"打开文件所在位置"）；
 /// - 上次在跑、或排着队、或用户手动暂停的，一律改成 `queued` 交给队列 ——
@@ -509,6 +513,7 @@ pub(crate) fn restore_tasks(gui: &Arc<Gui>) -> usize {
                 headers: s.headers,
                 cookies: s.cookies,
                 added_unix: s.added_unix,
+                done_unix: s.done_unix,
                 handle: None,
             });
         }

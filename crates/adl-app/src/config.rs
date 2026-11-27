@@ -264,6 +264,23 @@ pub struct Config {
     /// 浏览器拉起 `adl-gui.exe --from-browser`，后者静默缩到托盘只起 API。
     /// 关掉之后扩展连不上就老老实实让浏览器自己下。
     pub browser_allow_launch: bool,
+    /// 浏览器接管时先弹「新建下载」把参数填好，等人点确认再开始。
+    ///
+    /// 用户 m24756：「接管下载后没有软件弹出来，而是直接静默下载，可能会
+    /// 导致用户不知道下载没有多点了好几下，可以弹出一个新建下载，然后获取
+    /// 的数据直接填上去」。
+    ///
+    /// 关掉就退回纯后台接管（点了就下，桌面端不出声）。
+    pub browser_confirm_first: bool,
+    /// 下完之后过一段时间，把这条任务从列表里自动拿走。
+    ///
+    /// 用户 m25147：「这个 #N 的 id 可以就是下载了东西之后一定时间清理这个
+    /// id 就行了，就是之后的 id 还是会从 1 开始」。
+    ///
+    /// 只是从**列表**里拿走，不想删用户文件；`history.json` 里照旧留着记录。
+    pub auto_clean_completed: bool,
+    /// 自动清理的等待时长（分钟）。默认 30。
+    pub auto_clean_minutes: u64,
 }
 
 impl Default for Config {
@@ -303,6 +320,9 @@ impl Default for Config {
             browser_min_mb: 0,
             browser_notify_fail: true,
             browser_allow_launch: true,
+            browser_confirm_first: true,
+            auto_clean_completed: true,
+            auto_clean_minutes: 30,
         }
     }
 }
@@ -528,6 +548,14 @@ browser_min_mb = 0
 browser_notify_fail = true
 # 允许浏览器扩展在 ADL 没运行时把它拉起来（注册 adl:// 协议）。
 browser_allow_launch = true
+# 接管时先弹「新建下载」把地址/文件名填好，等人点确认再开始。
+# 关掉 = 点了就在后台直接下，桌面端不出声。
+browser_confirm_first = true
+# 下完之后过一段时间把任务从列表里自动拿走（只清列表，不删文件）。
+# 用户 m25147：「#N 的 id 下载完一定时间清理，之后的 id 还是会从 1 开始」。
+auto_clean_completed = true
+# 等多久算"下完一段时间"（分钟）。
+auto_clean_minutes = 30
 "#;
 
 #[cfg(test)]
@@ -558,6 +586,9 @@ mod tests {
         assert_eq!(c.browser_min_mb, 0);
         assert!(c.browser_notify_fail);
         assert!(c.browser_allow_launch);
+        assert!(c.browser_confirm_first);
+        assert!(c.auto_clean_completed);
+        assert_eq!(c.auto_clean_minutes, 30);
     }
 
     #[test]

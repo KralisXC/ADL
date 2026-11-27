@@ -167,3 +167,18 @@ pub fn truncated(ui: &mut Ui, text: &str, full: &str) -> Response {
     ui.add(egui::Label::new(text).truncate().sense(egui::Sense::hover()))
         .on_hover_text(full)
 }
+
+/// 同上，但整格可点、悬停变手型 —— 给"点标题就进详情"这种整行入口用。
+///
+/// 用户 m24756：「这个下载文件的详细界面点这个下载（图二）就可以直接进入
+/// 详细就不用点后面更多了」。单独开一个函数而不是给 `truncated` 加参数：
+/// 只有这一处需要点，别让调用方到处传 `Sense`。
+pub fn truncated_link(ui: &mut Ui, text: &str, full: &str) -> Response {
+    let r = ui
+        .add(egui::Label::new(text).truncate().sense(egui::Sense::click()))
+        .on_hover_text(full);
+    if r.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    r
+}

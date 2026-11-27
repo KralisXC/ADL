@@ -53,6 +53,14 @@ pub struct SavedTask {
     pub error: Option<String>,
     #[serde(default)]
     pub added_unix: u64,
+    /// 完成 / 失败的时刻（unix 秒）。0 = 还没结束。
+    ///
+    /// 用户 m25147：「这个 #N 的 id 可以就是下载了东西之后一定时间清理这个 id
+    /// 就行了」—— 定时清理靠这个时间戳判断"已经下完多久了"，而不是靠
+    /// `added_unix`（大文件可能下了两小时，刚下完就该过一会儿清掉，
+    /// 不能因为"添加得早"立刻消失）。
+    #[serde(default)]
+    pub done_unix: u64,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -146,6 +154,7 @@ mod tests {
             path: None,
             error: None,
             added_unix: 1,
+            done_unix: 0,
         }
     }
 
