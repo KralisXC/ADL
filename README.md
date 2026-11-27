@@ -147,9 +147,9 @@ cargo build --release -p adl-gui
 - **启动日志**：release 版没有控制台，`eprintln!` 全丢，所以启动过程写到 `data/startup.log`（每次启动截断重写），第一行就是进程完整性级别（`S-1-16-4096 (Low)` / `S-1-16-8192 (Medium)`）。托盘不显示时先看这份日志：Low 是环境限制（`Shell_NotifyIconW` 在 Low 下恒失败），Medium 还失败才是代码问题。
 - **开机自启动**：设置页「启动」卡里有一个开关，只写 `HKCU\...\Run` 的 `ADL` 值（不需要管理员权限），带着 `--auto-start` 参数。开机那次是否弹主窗口由同卡的「启动后显示主界面」决定（默认静默缩到托盘）；托盘不可用时会取消静默启动（否则用户再也叫不出界面）。开关的实际状态**每次从注册表读**，所以在任务管理器「启动」页关掉它之后，界面会如实显示"关闭"。同一张卡最底下还显示托盘图标的注册结论，不用再去翻日志。
 - **托盘三种点击**：左键单击无反应、**左键双击唤醒主界面**、右键弹菜单（「显示主界面」/「退出」）。`tray-icon` 默认单击也弹菜单，我们显式关掉了 `with_menu_on_left_click`。
+- **最小化后也能唤回**：窗口最小化时 eframe 只调 `App::logic`、不调 `App::ui`，所以托盘事件轮询放在 `logic()` 里；另外 `logic()` 每帧 `request_repaint_after(250ms)` 自己催帧（没有输入时 egui 默认不重绘，`logic` 也跟着不跑）。winit 的 `set_minimized` 在无边框窗口上不可靠，最终靠 `platform::force_show_main_window()` 对 HWND 直接 `SW_RESTORE` → `SW_SHOW` → `SetForegroundWindow`，并延后 30ms/120ms 各补一刀（等 eframe 处理完 viewport 命令）。
 - **代码签名**：`scripts/new-codesign-cert.ps1` 生成自签证书（`CN=棱汐 Risk, O=KralisXC`，RSA 4096 / 10 年），`scripts/sign.ps1` 给 exe 签名并自校验。**自签名治不了 SmartScreen** —— 它看的是文件信誉而不是签名是否有效，自签名永远拿不到信誉；跨机器不弹只有 EV 证书或 SignPath。
 - **CI**：`.github/workflows/release.yml` 在打 `v*` tag 时于 `windows-latest` 构建 GUI + CLI、跑冒烟测试、把 `.exe` 作为 release asset 上传（自动更新只认 asset 里的 exe）。SignPath 的签名 job 已留占位。
-- **代码签名**：`scripts/new-codesign-cert.ps1` 生成自签证书（`CN=棱汐 Risk, O=KralisXC`，RSA 4096 / 10 年），`scripts/sign.ps1` 给 exe 签名并自校验。**自签名治不了 SmartScreen** —— 它看的是文件信誉而不是签名是否有效，自签名永远拿不到信誉；跨机器不弹只有 EV 证书或 SignPath。
 
 > **渲染后端可切换**（环境变量 `ADL_RENDERER`）：
 > - 不设 / `glow`：OpenGL，**默认**，兼容性最好（虚拟机、远程桌面、老核显都能开）。

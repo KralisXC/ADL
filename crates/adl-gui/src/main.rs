@@ -1111,8 +1111,29 @@ impl eframe::App for App {
         ]
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
+    /// 不画界面的那一遍：窗口最小化 / 被完全遮挡时 eframe 只调这个，
+    /// 调完 `ui()` 就不跑了（`eframe-0.37.0/src/native/epi_integration.rs`
+    /// 的 `update_logic_only`，以及 `glow_integration.rs` 里
+    /// `if !show_ui { ... update_logic_only ... }` 那条分支）。
+    ///
+    /// 所以**凡是"窗口看不见时也得处理"的东西都必须放这里**：
+    /// 托盘图标事件、托盘菜单、唤醒信号。否则表现就是用户 m23462 报的
+    /// "最小化之后双击托盘叫不出来" —— 事件确实到了，只是没人读。
+    ///
+    /// 这里只能碰 `ctx`，不能碰任何 `Ui`（这一遍根本没有 Ui）。
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 🔴 必须自己催帧。
+        //
+        // egui 只在"有输入或有动画"时才重绘；窗口最小化 / 缩到托盘之后
+        // 既没有鼠标事件也没有动画，一帧都不再画 —— 于是 `logic()` 根本
+        // 不会被调用，托盘事件积在那个 channel 里没人读，用户双击托盘
+        // 看起来就是死的（用户 m23610）。实测证据：窗口最小化时连点
+        // 托盘十几次，`data/startup.log` 里一条 `[tray]` 都没有；把窗口
+        // 从外部还原（`[EW3]::Restore`）之后，积压的事件才被一次读完。
+        //
+        // 250ms 一次空帧的代价极低（最小化时 eframe 走 `update_logic_only`，
+        // 不跑 UI 也不提交绘制），换来托盘响应延迟不超过四分之一秒。
+        ctx.request_repaint_after(std::time::Duration::from_millis(250));
 
         // 开机自启拉起的那一次：缩到托盘、不弹主窗口。
         //
@@ -1132,7 +1153,8 @@ impl eframe::App for App {
             }
         }
 
-        // 处理唤醒 / 电源事件
+        // 处理唤醒 / 电源事件。唤醒必须在这里：休眠醒来时窗口多半是最小化
+        // 或已隐藏的，等 `ui()` 处理就永远等不到。
         if self.wake.swap(false, Ordering::SeqCst) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
@@ -1144,6 +1166,63 @@ impl eframe::App for App {
         if self.resume.swap(false, Ordering::SeqCst) {
             self.set_status("系统已从休眠恢复，如需继续请点「继续」", false);
         }
+
+        // 托盘左键双击 = 唤醒窗口（用户 m23062：「双击左键可以唤醒这个软件，
+        // 右键就是菜单，单击左键没反应」）。
+        //
+        // 菜单本身由 `with_menu_on_left_click(false)` 关掉左键绑定，所以
+        // 左键单击不会再弹菜单、也不用在这里"吞掉"它 —— tray-icon 会把
+        // 单击作为 `Click { button: Left, .. }` 送进来，我们什么都不做即可。
+        while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
+            if let TrayIconEvent::DoubleClick {
+                button: MouseButton::Left,
+                ..
+            } = ev
+            {
+                // 最小化时 `Visible(true)` 单独发是没用的：Windows 的
+                // SW_SHOW 不还原最小化窗口，必须再发 `Minimized(false)`
+                // 让 winit 走 `restore()`。
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                // 🔴 光发上面三条不够：winit 的 `set_minimized` 会先把内部
+                // flag 改成"当前实际状态"再改成目标值，状态对不上时它认为
+                // 没变化、`ShowWindow(SW_RESTORE)` 根本不发，窗口就永远停在
+                // IsIconic。实测过（见 startup.log 与 platform::
+                // force_show_main_window 的注释），所以这里直接对 HWND
+                // 调 Win32 兜底。上面三条仍保留，让 egui/winit 内部状态同步。
+                platform::schedule_force_show();
+                logfile::log("[tray] 双击托盘：唤醒主窗口");
+            }
+        }
+
+        // 托盘菜单事件（显示主界面 / 退出）
+        while let Ok(ev) = MenuEvent::receiver().try_recv() {
+            match ev.id.0.as_str() {
+                "show" => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    // 同双击：最小化时 egui 的命令不保证真还原，Win32 兜底。
+                    platform::schedule_force_show();
+                    logfile::log("[tray] 菜单：显示主界面");
+                }
+                "quit" => {
+                    // 托盘「退出」是用户的明确意图，直接放行。
+                    // 不设 closing 的话，Close 会再被关闭拦截抓住、弹一次询问框
+                    // —— 表现就是"点了退出没反应，还得再点 X"。
+                    self.closing = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+
+        // 托盘/菜单/唤醒/静默启动都在 `logic()` 里处理（最小化时只有它被调用）。
 
         // 关闭拦截：行为由配置决定（首次点关闭时问一次，可以记住）
         //
@@ -1171,43 +1250,12 @@ impl eframe::App for App {
             }
         }
 
-        // 托盘左键双击 = 唤醒窗口（用户 m23062：「双击左键可以唤醒这个软件，
-        // 右键就是菜单，单击左键没反应」）。
+        // 托盘与菜单事件**不在这里**处理 —— 见 `fn pump_tray_events`。
         //
-        // 菜单本身由 `with_menu_on_left_click(false)` 关掉左键绑定，所以
-        // 左键单击不会再弹菜单、也不用在这里"吞掉"它 —— tray-icon 会把
-        // 单击作为 `Click { button: Left, .. }` 送进来，我们什么都不做即可。
-        while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
-            if let TrayIconEvent::DoubleClick {
-                button: MouseButton::Left,
-                ..
-            } = ev
-            {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            }
-        }
-
-        // 托盘菜单事件（显示主界面 / 退出）
-        while let Ok(ev) = MenuEvent::receiver().try_recv() {
-            match ev.id.0.as_str() {
-                "show" => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                }
-                "quit" => {
-                    // 托盘「退出」是用户的明确意图，直接放行。
-                    // 不设 closing 的话，Close 会再被上面那段拦截抓住、弹一次询问框
-                    // —— 表现就是"点了退出没反应，还得再点 X"。
-                    self.closing = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-
-                _ => {}
-            }
-        }
+        // 原因：窗口最小化之后 eframe 走 `update_logic_only`，
+        // 只调 `App::logic`、根本不调这个函数（`epi_integration.rs`），
+        // 事件放在这里就等于"最小化时双击托盘毫无反应"（用户 m23462 报的
+        // 就是这个）。现在统一由 `logic()` 每帧调一次。
 
         // Ctrl+K：跳到终端页（不再是浮层命令面板）。
         //

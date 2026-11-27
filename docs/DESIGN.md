@@ -2859,6 +2859,56 @@ window "ADL 下载器"
   `add_enabled_ui(self.s_auto_start, ..)` 在"不自启"时灰掉，省得用户以为
   勾这个就能开机弹窗。
 
+#### 13.19.11 最小化时双击托盘唤不出：两处真因
+
+用户 m23610：「最小化后双击左键托盘还是没法唤醒。」
+
+**真因一：最小化时 `ui()` 根本不被调用，没人读托盘事件。**
+
+`eframe` 的 `epi_integration.rs` 里，窗口被最小化或完全遮挡时走
+`update_logic_only`，只调 `App::logic(ctx, frame)`，**不调 `App::ui(ui, frame)`**
+（`glow_integration.rs:711-742` 的 `if !show_ui { ... update_logic_only ... }`）。
+托盘事件轮询原先写在 `ui()` 里 → 最小化后事件堆在 `TrayIconEvent::receiver()`
+的 channel 里没人取，表现为"双击毫无反应"。
+
+- 修法：托盘/菜单/唤醒/静默启动四段全部搬进 `fn logic(&mut self, ctx, _frame)`
+  （`epi.rs:170` 的 trait 默认空实现）。`logic()` 里只能碰 `ctx`，不能碰 `Ui`。
+
+**真因二：egui 没输入就不重绘，`logic()` 也跟着不跑。**
+
+只有真因一修完还不够：最小化后既没有鼠标事件也没有动画，egui 一帧都不再画，
+`logic()` 一样不会被调用。实测证据 —— 最小化时连点托盘十几次，
+`data/startup.log` 里一条 `[tray]` 都没有；从外部 `ShowWindow(SW_RESTORE)`
+把窗口捞起来之后，积压的事件才被一次读完。
+
+- 修法：`logic()` 开头 `ctx.request_repaint_after(Duration::from_millis(250))`。
+  最小化时 eframe 走 `update_logic_only`，不跑 UI 也不提交绘制，代价极低；
+  换来托盘响应延迟不超过四分之一秒。
+
+**第三处：winit 的 `set_minimized` 不可靠，要自己打 HWND。**
+
+`ViewportCommand::Minimized(false)` → `egui-winit` 的 `window.set_minimized(v)`
+→ `winit/src/platform_impl/windows/window.rs:650-665`：它先把内部 flag 设成
+*当前实际*状态（把差异吞掉），再设成目标值；`window_state.rs:372-380` 只在
+flag 真的变化时才 `ShowWindow(SW_RESTORE)`。无边框窗口被用户最小化后，
+winit 记的状态和 Windows 实际状态常对不上，于是命令发了、`logic()` 也确实跑了
+（日志有 `[tray] 双击托盘：唤醒主窗口`），窗口却仍 `IsIconic() == TRUE`、
+位置停在 `(-21333, -21333)`。
+
+- 修法：`platform::force_show_main_window()` —— `EnumWindows` 遍历本进程顶层窗口，
+  按 `class == "Window Class" && title == "ADL 下载器"` 定位主窗口（⚠️ 不能按
+  `MainWindowHandle` 找，那拿到的是 `Winit Thread Event Target`，22×22；也不能按
+  rect 大小找，`tray_icon_app` 的 rect 每次都不一样），再
+  `ShowWindow(SW_RESTORE)` → `ShowWindow(SW_SHOW)` → `SetForegroundWindow`。
+- 还必须**延后**：`logic()` 里发的 `ViewportCommand` 是在 logic 返回后才由
+  eframe 依次执行（`glow_integration.rs:735-739`），同步调用会被随后的
+  `Visible/Minimized` 按回最小化。`platform::schedule_force_show()` 起子线程，
+  先睡 30ms 打一次、再睡 120ms 打一次，最后把"之前/之后是否最小化"写进
+  `startup.log`（`ShowWindow` 的返回值不可信，它返回的是上一次的可见状态）。
+- 用户 m23767 指定的顺序 `unminimize -> show -> set_focus` 就是这里的三步。
+- 三条 egui 命令**仍然保留**，让 winit 内部状态跟着同步，否则它下次自己发
+  `SW_MINIMIZE` 时会因为"觉得已经是最小化"而什么都不做。
+
 ### 13.20 待续
 - macOS / Linux 的**真机**构建验证仍未做（本机只有 Windows；M 芯片 Mac 无法在本机测）。
   交叉编译也不能替代：`eframe` 的 glow/wgpu 后端要链接平台图形库。

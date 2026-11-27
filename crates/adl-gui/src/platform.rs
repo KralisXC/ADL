@@ -649,3 +649,160 @@ pub fn set_auto_start(_on: bool) -> Result<(), String> {
 pub fn launched_by_auto_start() -> bool {
     std::env::args().any(|a| a == "--auto-start")
 }
+
+/// 把主窗口从「最小化 / 隐藏」状态强行捞出来（Windows）。
+///
+/// 为什么不能只发 `ViewportCommand::Visible(true)` + `Minimized(false)`：
+/// 那两条最终落到 winit 的 `set_minimized`（`winit-0.30.13/src/platform_impl/
+/// windows/window.rs:650-665`），它先把内部 flag 设成*当前实际*状态（把差异吞掉），
+/// 再设成目标值；`window_state.rs:372-380` 只在 flag 真的变化时才
+/// `ShowWindow(SW_RESTORE)`。我们这个无边框窗口被用户最小化后，winit 记的状态
+/// 和 Windows 实际状态常常对不上，于是命令发了、`App::logic` 也确实跑了
+/// （startup.log 里有 `[tray] 双击托盘：唤醒主窗口`），窗口却仍 `IsIconic()==TRUE`、
+/// 位置停在 `(-21333,-21333)` —— 用户看到的就是"双击没反应"。
+///
+/// 所以这里绕开 egui/winit，直接对 HWND 调 `ShowWindow(SW_RESTORE)`。
+/// 仍然保留 egui 那三条命令：winit 内部状态得同步，否则下次它自己发
+/// `SW_MINIMIZE` 时会因为"觉得已经是最小化"而什么都不做。
+#[cfg(windows)]
+pub fn force_show_main_window() {
+    use windows_sys::Win32::Foundation::{HWND, LPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetClassNameW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
+        SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
+    };
+
+    struct Ctx {
+        pid: u32,
+        found: Option<HWND>,
+    }
+
+    unsafe extern "system" fn cb(hwnd: HWND, lparam: LPARAM) -> i32 {
+        let ctx = &mut *(lparam as *mut Ctx);
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid != ctx.pid {
+            return 1; // 继续找
+        }
+        // 只要顶层窗口，且必须是我们自己那扇主窗口：
+        // 托盘那边还有一个 `tray_icon_app`、winit 另有一个
+        // `Winit Thread Event Target`（22×22），按类名/标题排除。
+        let mut cls = [0u16; 64];
+        let n = GetClassNameW(hwnd, cls.as_mut_ptr(), cls.len() as i32);
+        let class = String::from_utf16_lossy(&cls[..n.max(0) as usize]);
+        let mut title = [0u16; 128];
+        let m = GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
+        let text = String::from_utf16_lossy(&title[..m.max(0) as usize]);
+
+        if class == "Window Class" && text == "ADL 下载器" {
+            ctx.found = Some(hwnd);
+            return 0; // 找到了，停止枚举
+        }
+        let _ = IsWindowVisible(hwnd);
+        1
+    }
+
+    let mut ctx = Ctx {
+        pid: std::process::id(),
+        found: None,
+    };
+    unsafe {
+        EnumWindows(Some(cb), &mut ctx as *mut Ctx as LPARAM);
+        match ctx.found {
+            Some(hwnd) => {
+                // 顺序重要：SW_RESTORE 会同时做"取消最小化 + 显示 + 激活"，
+                // 再补一次 SW_SHOW 兜住"只是被 Visible(false) 藏起来"的情况。
+                let a = ShowWindow(hwnd, SW_RESTORE);
+                let b = ShowWindow(hwnd, SW_SHOW);
+                let c = SetForegroundWindow(hwnd);
+                crate::logfile::log(&format!(
+                    "[tray] force_show: hwnd={hwnd:?} restore={a} show={b} fg={c}"
+                ));
+            }
+            None => crate::logfile::log("[tray] force_show: 没找到主窗口"),
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn force_show_main_window() {}
+
+/// 主窗口现在是不是最小化状态（Windows）。
+///
+/// 用来判断「发的还原命令到底生效没有」。`ShowWindow` 返回非 0 只说明
+/// 调用没报错，不代表窗口真的起来了 —— 实测过 `restore=24 show=24`
+/// 而 `IsIconic()` 仍是 TRUE。
+#[cfg(windows)]
+pub fn main_window_minimized() -> bool {
+    use windows_sys::Win32::Foundation::{HWND, LPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetClassNameW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
+    };
+
+    struct Ctx {
+        pid: u32,
+        iconic: bool,
+        found: bool,
+    }
+
+    unsafe extern "system" fn cb(hwnd: HWND, lparam: LPARAM) -> i32 {
+        let ctx = &mut *(lparam as *mut Ctx);
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid != ctx.pid {
+            return 1;
+        }
+        let mut cls = [0u16; 64];
+        let n = GetClassNameW(hwnd, cls.as_mut_ptr(), cls.len() as i32);
+        let class = String::from_utf16_lossy(&cls[..n.max(0) as usize]);
+        let mut title = [0u16; 128];
+        let m = GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
+        let text = String::from_utf16_lossy(&title[..m.max(0) as usize]);
+        if class == "Window Class" && text == "ADL 下载器" {
+            ctx.found = true;
+            ctx.iconic = IsIconic(hwnd) != 0;
+            return 0;
+        }
+        1
+    }
+
+    let mut ctx = Ctx {
+        pid: std::process::id(),
+        iconic: false,
+        found: false,
+    };
+    unsafe {
+        EnumWindows(Some(cb), &mut ctx as *mut Ctx as LPARAM);
+    }
+    ctx.iconic
+}
+
+#[cfg(not(windows))]
+pub fn main_window_minimized() -> bool {
+    false
+}
+
+/// 延后一点再捞窗口（Windows）。
+///
+/// 为什么不能同步调用：`App::logic` 里发的那几条 `ViewportCommand`
+/// 是**本次逻辑跑完之后**才由 eframe 依次执行的（`glow_integration.rs:735-739`
+/// 的 `viewport.process_commands`）。如果我们在 logic 里就同步
+/// `ShowWindow(SW_RESTORE)`，顺序会变成「先还原 → 再让 eframe 处理
+/// Visible/Minimized」，实测结果窗口又被按回最小化（startup.log 里
+/// `restore=24 show=24 fg=1` 明明成功、`IsIconic()` 却仍是 TRUE）。
+/// 所以挪到子线程延后执行，等 eframe 把命令都处理完再补一刀。
+pub fn schedule_force_show() {
+    std::thread::spawn(|| {
+        // 先量一下再动手：能顺便在日志里记下"还原前到底是不是最小化"，
+        // 下次再出问题不用猜是命令没发、还是发了没生效。
+        let before = main_window_minimized();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        force_show_main_window();
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        force_show_main_window();
+        crate::logfile::log(&format!(
+            "[tray] 还原结果: 之前最小化={before} 之后最小化={}",
+            main_window_minimized()
+        ));
+    });
+}
