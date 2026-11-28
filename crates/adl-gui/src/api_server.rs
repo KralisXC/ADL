@@ -58,12 +58,16 @@ struct BridgeCfg {
 
 /// 启动 API 服务，返回实际监听端口。
 ///
-/// 除了配置端口，端口不是 17800 时还会在 17800 上再绑一个"发现端口"：
-/// 浏览器扩展是硬编码往 17800 问的，用户改了端口之后它得能问出真实端口。
+/// 端口自动选（用户 m26072：「本地接口的话就自动吧，不用让人调了」）：
+/// 从首选端口（默认 17800）开始往上找，第一个能绑上的就用。这样哪怕
+/// 17800 被别的程序占着（本机就常被另一个 aria2 前端占着），接管也不会
+/// 直接失效 —— 扩展问 `/bridge` 拿到的是真实端口。
+///
+/// 同时只要实际端口不是 17800，还会在 17800 上再绑一个"发现端口"：
+/// 扩展是硬编码往 17800 问的，用户/扩展都不知道真实端口时靠它问出来。
 /// 两个端口共用同一套 handler，只有 `/bridge` 里报的 `port` 可能不同。
 pub fn start(gui: Arc<Gui>, port: u16) -> std::io::Result<u16> {
-    let listener = TcpListener::bind(("127.0.0.1", port))?;
-    let actual = listener.local_addr()?.port();
+    let (listener, actual) = bind_auto(port)?;
     let token = Arc::new(gen_token());
     let bridge = {
         let cfg = gui.cfg.lock().unwrap();
@@ -87,6 +91,30 @@ pub fn start(gui: Arc<Gui>, port: u16) -> std::io::Result<u16> {
         }
     }
     Ok(actual)
+}
+
+/// 从 `preferred` 往上最多试 `PORT_TRIES` 个端口，返回第一个绑成功的监听器。
+///
+/// 只往一个方向试、且范围很小：端口号是给人看的，扫太大一片反而让
+/// "到底听在哪个端口"变得不可预测；20 个足够躲开常见的端口冲突。
+fn bind_auto(preferred: u16) -> std::io::Result<(TcpListener, u16)> {
+    const PORT_TRIES: u16 = 20;
+    let mut last = None;
+    for off in 0..PORT_TRIES {
+        let Some(p) = preferred.checked_add(off) else {
+            break;
+        };
+        match TcpListener::bind(("127.0.0.1", p)) {
+            Ok(l) => {
+                let actual = l.local_addr()?.port();
+                return Ok((l, actual));
+            }
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "没有可用端口")
+    }))
 }
 
 fn spawn_listener(

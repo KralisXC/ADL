@@ -27,15 +27,13 @@ pub(crate) enum PluginsTab {
 
 /// 判断一条插件记录是不是"软件自带"的。
 ///
-/// 内置插件的 id 统一是 `com.adl.xxx`（见 `plugins/` 下各 plugin.toml）。
-/// 用户自己装的插件就算起名也带 com.adl 前缀，也是他们自己的责任；
-/// 这里只按约定前缀分组，目的是在插件页把"程序自带功能"和"用户安装"
-/// 分开显示 —— 前者不可在插件页调整。
+/// 用户 m26072：「内置插件都是像终端那种的，其他的都是已安装插件了」——
+/// 所以判据不再是 id 前缀，而是记录里显式的 `builtin` 标记：
+/// 只有我们自己写的、不走 QuickJS 的页面（终端这类）才是内置，
+/// `plugins/` 目录里任何一个真插件（哪怕是 `com.adl.*` 的旧内置）
+/// 都算用户可管理的「已安装插件」。
 pub(crate) fn is_builtin(v: &Value) -> bool {
-    v.get("id")
-        .and_then(|x| x.as_str())
-        .map(|id| id.starts_with("com.adl."))
-        .unwrap_or(false)
+    v.get("builtin").and_then(|x| x.as_bool()).unwrap_or(false)
 }
 
 /// 从 `ui_snapshot["all"][i]["hooks"]` 这类 JSON 数组里取字符串列表。
@@ -183,10 +181,11 @@ impl App {
         // 走 QuickJS，但它是程序自带的能力，放在「内置插件」组里能让人一眼
         // 看全 ADL 有哪些自带功能，不用去用户装的插件里翻。
         //
-        // id 用 `com.adl.` 前缀，于是 `is_builtin()` 自然把它分到内置组，
-        // 也就自动没有右侧开关（终端是页面，不是能开关的东西）。
+        // `builtin: true` 让它进「内置插件」组，也就自动没有右侧开关
+        // （终端是页面，不是能开关的东西）。
         all.push(json!({
             "id": "com.adl.terminal",
+            "builtin": true,
             "name": "终端",
             "version": env!("CARGO_PKG_VERSION"),
             "description": "仿 PowerShell 的交互式命令行：敲 help 看命令，Tab 补全、↑/↓ 翻历史。",
@@ -201,6 +200,7 @@ impl App {
                 "fs_read": Vec::<String>::new(), "fs_write": Vec::<String>::new()
             }),
             "enabled_by_default": true,
+            "builtin": true,
         }));
 
         // 顶部：目录位置 + 两个动作
@@ -362,7 +362,7 @@ impl App {
         // 卸载同理：先记下 id，卡片全部画完再动配置和磁盘。
         let mut uninstall: Option<String> = None;
 
-        // 分两组显示：内置插件是软件自带的功能（id 都以 com.adl. 开头），
+        // 分两组显示：内置插件是软件自带的功能（记录里 `builtin: true`），
         // 在插件页里只能看、不能关 —— 关掉 ua-fixer 之类的没有意义，
         // 只会让人以为程序坏了。用户自己装的才给开关。
         let builtin: Vec<Value> = all.iter().filter(|p| is_builtin(p)).cloned().collect();

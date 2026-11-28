@@ -3183,7 +3183,69 @@ Chrome/Edge 重启后会续传上次没下完的下载、在下载历史页点�
 🔴 必须用 `storage.session`（MV3 内存级）而不是 `storage.local`：后者持久化，
 读到的是"三天前那次开机"，闸永远不生效。
 
-### 13.24 待续
+### 13.24 本地接口自动选端口、内置插件按标记判定、扩展改走商店
+
+用户 m26072：「还有图二的这个浏览器扩展其实不用了，到时候我们直接让用户安装
+浏览器 edge 的商店插件就行了（也可以留一个备用就是让谷歌其他那些浏览器安装的）。
+本地接口的话就自动吧，不用让人调了。还有内置插件都是像终端那种的，其他的都是
+已安装插件了。」
+
+#### 13.24.1 本地接口端口自动化
+
+原来 `Config.browser_port` 既是"默认端口"又是"用户可调端口"，设置页摆一个
+`DragValue`。问题是它只对**没占用的端口**有效：17800 一旦被别的程序听着（本机
+经常是另一个 aria2 前端），`TcpListener::bind` 直接失败，接管整条链路失效，
+而界面上还写着 17800，用户完全没法判断为什么连不上。
+
+- `api_server::bind_auto(preferred)`：从首选端口往上**试最多 20 个**，第一个
+  绑上的就用。只往一个方向、范围也小 —— 端口号要给人看，扫一大片会让"到底听在
+  哪个"变得不可预测。
+- `Gui.api_port: AtomicU64` 存**实际**端口（0 = 没起来）。`App::new` 时监听器
+  还没建，所以界面不读配置、读这个原子量，`main()` 里 `start()` 返回后才 store。
+- `Config.browser_port` 保留，但**只当首选值**（默认 17800），界面上不再出现。
+  设置页第一张卡改成只读：`● 127.0.0.1:17801 正在监听` + 「端口自动选：优先
+  17800，被占了就顺延。浏览器扩展自己会问出实际端口，不用填。」
+- `App.s_browser_port` 整个删掉 —— 连带草稿重置、`settings_dirty_count` 比较、
+  `settings_json`/`set_settings` 的键。留着一个永远等于配置值的草稿字段只会在
+  "已修改 N 项"里制造幽灵计数。
+- 别名监听器保留：实际端口不是 17800 时仍在 17800 上再绑一个，因为**已安装的
+  扩展是硬编码往 17800 问的**（`DISCOVER_PORT`），它靠 `/bridge` 回的真实端口
+  跳到正确地址。
+
+实测：`Start-Job` 用 `TcpListener(IPAddress.Loopback, 17800)` 占住端口 → 启动 →
+`startup.log` 写 `127.0.0.1:17801`，`GET :17801/bridge` 回 `{"port":17801,...}`，
+界面显示 `127.0.0.1:17801 正在监听`。
+
+#### 13.24.2 内置插件不再看 id 前缀
+
+原来 `plugins.rs::is_builtin()` 判 `id.starts_with("com.adl.")`。但 `plugins/`
+目录里本来就躺着五个用同一前缀的**真插件**（auto-concurrency / block-html /
+notify-on-complete / ua-fixer / ui-demo），于是它们永远被当成"软件自带、不给调"，
+用户装了也找不到开关。
+
+改成看记录里的显式标记：`v.get("builtin").and_then(|x| x.as_bool()).unwrap_or(false)`。
+只有"假装是插件"的页面（终端这种不走 QuickJS 的）在 `collect` 时手工带
+`"builtin": true`，其余一律进「已安装插件」组、有开关。
+
+> 语义修正：内置 = **软件自己实现的功能**，不是"名字带我们前缀"。前缀是可以
+> 被任何人用的字符串，拿它当权限判据必然出错。
+
+#### 13.24.3 扩展渠道：商店为主，目录备用
+
+用户在 Edge 合作伙伴中心建了草稿条目，扩展 ID 由商店分配
+（`ojmgmjjeikafpmldfmlebakickaknmoe`）。所以：
+
+- 「浏览器扩展」卡以商店为主：`const EDGE_STORE_URL` 指向**扩展详情页**（不是
+  搜索结果页 —— 结果列表会随排序变化，还可能混进别人的同名扩展），按钮
+  「打开扩展商店」走 `platform::open_in_browser()`。
+- 解压版降级为「打开扩展目录（备用）」`small_button` + 一句说明，给商店里没有
+  的 Chromium 变体（Chrome / Brave）走"开发者模式 → 加载解压缩的扩展"。
+- 🔴 `platform::open_path()` 会 `create_dir_all` 且走 `cmd /C start ""`，拿它
+  打开一个 URL 会先建一个叫 `https:` 的目录；开网址必须用 `open_in_browser()`。
+- `manifest.json` 不写 `"key"`：本地 key 算出的 ID 与商店分配的不一致，加载
+  解压版和商店版会变成两套 ID、`chrome.storage` 不互通。
+
+### 13.25 待续
 
 - macOS / Linux 的**真机**构建验证仍未做（本机只有 Windows；M 芯片 Mac 无法在本机测）。
   交叉编译也不能替代：`eframe` 的 glow/wgpu 后端要链接平台图形库。

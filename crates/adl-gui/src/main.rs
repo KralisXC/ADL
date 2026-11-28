@@ -99,6 +99,12 @@ pub(crate) struct Gui {
     /// 不知道下载没有多点了好几下，可以弹出一个新建下载，然后获取的
     /// 数据直接填上去」。
     pub(crate) pending_prefill: Mutex<Vec<Prefill>>,
+    /// 本地接口实际监听的端口（0 = 还没起来 / 起失败了）。
+    ///
+    /// 端口是自动选的（用户 m26072：「本地接口的话就自动吧」），17800 被
+    /// 占用时可能顺延到 17801…，所以界面必须显示**真实端口**而不是配置里
+    /// 那个首选值，否则用户按界面上的数字去连会连不上。
+    pub(crate) api_port: AtomicU64,
 }
 
 /// 一条"交给新建下载弹窗预填"的请求。
@@ -236,8 +242,8 @@ struct App {
     s_show_on_boot: bool,
     // 浏览器接管的几项 —— 都是草稿值，点「保存设置」才落盘（用户 m24075：
     // 「浏览器上只有开启关闭，其他的我想能在我们的软件里调」）。
-    // 端口用 u64 存，方便直接喂 DragValue。
-    s_browser_port: u64,
+    // 端口不再由用户配置（用户 m26072：「本地接口的话就自动吧」），
+    // 真实端口在 `Gui::api_port` 里，界面直接读那个。
     s_browser_cookies: bool,
     s_browser_min_mb: u64,
     s_browser_notify_fail: bool,
@@ -477,6 +483,14 @@ fn fade_frame(ctx: &egui::Context, a: f32) -> egui::Frame {
 /// 弹窗淡入时长（秒）。0.14 和 `style.animation_time` 对齐，切换时不打架。
 const FADE_SECS: f32 = 0.14;
 
+/// Edge 扩展商店的详情页（用户 m26072 定的主渠道：让用户从商店装）。
+///
+/// 用 "扩展详情页" 而不是搜索结果页：搜索结果会随商店排序变化，
+/// 里面还可能混进别人的同名扩展；详情页是固定的。ID 由 Edge 分配
+/// （CRX ID `ojmgmjjeikafpmldfmlebakickaknmoe`，见 docs/DESIGN.md §13.21）。
+const EDGE_STORE_URL: &str =
+    "https://microsoftedge.microsoft.com/addons/detail/ojmgmjjeikafpmldfmlebakickaknmoe";
+
 /// 侧栏竖条跨行滑动时长。比弹窗稍长一点，滑得太快就看不出"滑"了。
 const NAV_SLIDE_SECS: f32 = 0.18;
 
@@ -635,7 +649,6 @@ impl App {
             // 页把它关了，那种操作只删注册表项、不会改 config.toml。
             s_auto_start: platform::auto_start_enabled(),
             s_show_on_boot: cfg.show_on_auto_start,
-            s_browser_port: cfg.browser_port as u64,
             s_browser_cookies: cfg.browser_send_cookies,
             s_browser_min_mb: cfg.browser_min_mb,
             s_browser_notify_fail: cfg.browser_notify_fail,
@@ -847,7 +860,6 @@ impl App {
             "show_on_auto_start": self.s_show_on_boot,
             "close_action": self.s_close_action,
             // 浏览器接管：端口/规则都在桌面端调，扩展只留一个开关（m24075）
-            "browser_port": self.s_browser_port,
             "browser_send_cookies": self.s_browser_cookies,
             "browser_min_mb": self.s_browser_min_mb,
             "browser_notify_fail": self.s_browser_notify_fail,
@@ -897,7 +909,6 @@ impl App {
         // 用户改了开关但没保存，取消就该回到"现在真的会怎样"。
         self.s_auto_start = platform::auto_start_enabled();
         self.s_show_on_boot = cfg.show_on_auto_start;
-        self.s_browser_port = cfg.browser_port as u64;
         self.s_browser_cookies = cfg.browser_send_cookies;
         self.s_browser_min_mb = cfg.browser_min_mb;
         self.s_browser_notify_fail = cfg.browser_notify_fail;
@@ -972,9 +983,6 @@ impl App {
             n += 1;
         }
         if self.s_show_on_boot != cfg.show_on_auto_start {
-            n += 1;
-        }
-        if self.s_browser_port != cfg.browser_port as u64 {
             n += 1;
         }
         if self.s_browser_cookies != cfg.browser_send_cookies {
@@ -4324,10 +4332,9 @@ impl App {
         ui.add_space(2.0);
 
         // 「原值」一次抄出来，下面按项比。端口/阈值都是 u64 草稿值。
-        let (was_port, was_cookies, was_min_mb, was_notify, was_launch, was_confirm, mode_name) = {
+        let (was_cookies, was_min_mb, was_notify, was_launch, was_confirm, mode_name) = {
             let cfg = self.gui.cfg.lock().unwrap();
             (
-                cfg.browser_port as u64,
                 cfg.browser_send_cookies,
                 cfg.browser_min_mb,
                 cfg.browser_notify_fail,
@@ -4346,9 +4353,12 @@ impl App {
         adl_ui::widgets::card(ui, |ui| {
             adl_ui::widgets::section_title(ui, "本地接口");
             ui.add_space(4.0);
-            // 端口是不是真的在听：直接连一下最快，别让用户去猜"配了但没生效"。
-            let listening = {
-                let addr = std::net::SocketAddr::from(([127, 0, 0, 1], self.s_browser_port as u16));
+            // 端口不让用户调（用户 m26072：「本地接口的话就自动吧，不用让人调了」）：
+            // 优先 17800，被占了就顺延找一个空闲端口，扩展靠 `/bridge` 问出来。
+            // 界面必须显示**实际监听的那个**，不是配置里的首选值。
+            let port = self.gui.api_port.load(Ordering::Relaxed);
+            let listening = port != 0 && {
+                let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port as u16));
                 std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(120)).is_ok()
             };
             ui.horizontal(|ui| {
@@ -4356,9 +4366,13 @@ impl App {
                 let color = if listening { pal().accent } else { pal().danger };
                 ui.label(egui::RichText::new("●").size(11.0).color(color));
                 ui.label(
-                    egui::RichText::new(format!("127.0.0.1:{}", self.s_browser_port))
-                        .font(egui::FontId::monospace(12.5))
-                        .color(ink()),
+                    egui::RichText::new(if port == 0 {
+                        "127.0.0.1:—".to_string()
+                    } else {
+                        format!("127.0.0.1:{port}")
+                    })
+                    .font(egui::FontId::monospace(12.5))
+                    .color(ink()),
                 );
                 if listening {
                     adl_ui::widgets::badge(ui, "正在监听", pal().accent);
@@ -4366,26 +4380,11 @@ impl App {
                     adl_ui::widgets::badge(ui, "没在监听", pal().danger);
                 }
             });
-            if self.s_browser_port != was_port {
-                ui.add_space(6.0);
-                adl_ui::widgets::hint_was(
-                    ui,
-                    &format!("原：{}，改端口要重启 ADL 才生效", was_port),
-                );
-            }
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 10.0;
-                ui.label("端口");
-                let mut p = self.s_browser_port;
-                if ui
-                    .add(egui::DragValue::new(&mut p).range(1024..=65535).speed(1.0))
-                    .changed()
-                {
-                    self.s_browser_port = p;
-                }
-                adl_ui::widgets::hint(ui, "改了之后扩展仍能从 17800 问出新端口");
-            });
+            ui.add_space(6.0);
+            adl_ui::widgets::hint(
+                ui,
+                "端口自动选：优先 17800，被占了就顺延。浏览器扩展自己会问出实际端口，不用填。",
+            );
         });
 
         ui.add_space(10.0);
@@ -4404,10 +4403,7 @@ impl App {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 let mut on = self.s_browser_confirm;
-                if ui
-                    .checkbox(&mut on, "接管时先弹「新建下载」让我确认")
-                    .changed()
-                {
+                if adl_ui::widgets::checkbox(ui, &mut on, "接管时先弹「新建下载」让我确认").changed() {
                     self.s_browser_confirm = on;
                 }
                 if self.s_browser_confirm != was_confirm {
@@ -4468,10 +4464,7 @@ impl App {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 let mut on = self.s_browser_allow_launch;
-                if ui
-                    .checkbox(&mut on, "ADL 没开时允许浏览器把它拉起来")
-                    .changed()
-                {
+                if adl_ui::widgets::checkbox(ui, &mut on, "ADL 没开时允许浏览器把它拉起来").changed() {
                     self.s_browser_allow_launch = on;
                 }
                 if self.s_browser_allow_launch != was_launch {
@@ -4525,9 +4518,11 @@ impl App {
         adl_ui::widgets::card(ui, |ui| {
             adl_ui::widgets::section_title(ui, "浏览器扩展");
             ui.add_space(4.0);
+            // 主渠道是商店：用户不用碰"开发者模式 / 加载解压缩"，点两下装上就好
+            // （用户 m26072：「直接让用户安装浏览器 edge 的商店插件就行了」）。
             ui.label(
                 egui::RichText::new(
-                    "扩展在仓库的 browser-extension/ 目录里，浏览器里只需一个「接管」开关。",
+                    "在 Edge 扩展商店搜索「ADL 下载器」安装。装好点一下工具栏图标就是接管开关。",
                 )
                 .size(12.5)
                 .color(ink()),
@@ -4536,20 +4531,24 @@ impl App {
             let mut open_dir = false;
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
-                if ui.button("打开扩展目录").clicked() {
-                    open_dir = true;
+                if ui.button("打开扩展商店").clicked() {
+                    platform::open_in_browser(EDGE_STORE_URL);
                 }
                 adl_ui::widgets::hint(
                     ui,
                     &format!("当前插件模式：{mode_name}。扩展只把网址和 Cookie 交给本地接口，不碰别的。"),
                 );
             });
-            ui.add_space(4.0);
+            ui.add_space(8.0);
             adl_ui::widgets::hint(
                 ui,
-                "Edge/Chrome 里打开扩展管理页 → 开发者模式 → 加载解压缩的扩展 → 选这个目录。",
+                "其他 Chromium 浏览器（Chrome / Brave 等）如果商店里没有，可以留一份备用：\
+                 用程序目录里的 browser-extension/ 走「开发者模式 → 加载解压缩的扩展」。",
             );
-            // 扩展源码在仓库里、不在 exe 旁边；找不到就只报状态，别弹不存在的路径。
+            // 备用通道：目录里的解压版扩展。找不到就只报状态，别弹不存在的路径。
+            if ui.small_button("打开扩展目录（备用）").clicked() {
+                open_dir = true;
+            }
             if open_dir {
                 let dir = std::env::current_exe()
                     .ok()
@@ -6328,6 +6327,7 @@ fn main() -> eframe::Result {
         hooks: Mutex::new(build_hooks(&cfg)),
         pending_notices: Mutex::new(Vec::new()),
         pending_prefill: Mutex::new(Vec::new()),
+        api_port: AtomicU64::new(0),
     });
 
     // 插件线程调 `adl.notify()` 时往 pending_notices 里塞，界面每帧取走。
@@ -6360,7 +6360,11 @@ fn main() -> eframe::Result {
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| gui.cfg.lock().unwrap().browser_port);
     match api_server::start(gui.clone(), api_port) {
-        Ok(p) => logfile::log(&format!("[api] 浏览器接管 API 监听 127.0.0.1:{p}")),
+        Ok(p) => {
+            // 界面显示真实端口：17800 被占时会顺延，按首选值显示会误导。
+            gui.api_port.store(p as u64, Ordering::Relaxed);
+            logfile::log(&format!("[api] 浏览器接管 API 监听 127.0.0.1:{p}"))
+        }
         Err(e) => logfile::log(&format!("[api] 启动失败: {e}")),
     }
 
