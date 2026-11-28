@@ -3245,7 +3245,80 @@ notify-on-complete / ua-fixer / ui-demo），于是它们永远被当成"软件�
 - `manifest.json` 不写 `"key"`：本地 key 算出的 ID 与商店分配的不一致，加载
   解压版和商店版会变成两套 ID、`chrome.storage` 不互通。
 
-### 13.25 待续
+### 13.25 CORS 预检漏了一个自定义头，导致扩展"看起来没连上"
+
+用户 m26472：「额现在插件和软件好像没连上，浏览器插件 on 了下载没弹软件的。」
+
+#### 13.25.1 现象与误判方向
+
+桌面端一切正常：`GET /bridge`、`GET /auto-token`、`POST /add` 用命令行带
+`Origin: chrome-extension://...` 打过去全部 200，GUI 也确实弹出了预填好的
+「新建下载」。所以第一反应会去猜扩展侧——端口不对？SW 没唤醒？`looksResumed`
+把新下载当续传拦了？`blob:` URL 被 `/^https?:/` 拒了？商店版和解压版并存？
+
+这些都是错的。**问题在桌面端，而且不是逻辑，是一行响应头。**
+
+#### 13.25.2 根因
+
+扩展每个请求都带自定义头 `X-ADL-Client: extension`（`background.js:72`，用来在
+服务端日志里区分是谁调的）。带自定义头就不再是 CORS 的"简单请求"，浏览器会先
+发 `OPTIONS` 预检，并且**必须在预检响应的 `Access-Control-Allow-Headers` 里
+看到这个头名**，否则浏览器直接掐掉真实请求，`fetch` 抛 `TypeError`。
+
+而 `api_server::write_resp()` 写的是 `content-type, x-adl-token` —— 漏了
+`x-adl-client`。于是：
+
+```
+probeBridge() → fetch 抛错 → catch 返回 null
+   → getBridge() 返回 null
+      → deliver() 先看 policy，拿不到就直接 return false
+         → 浏览器自己下，ADL 一声不响
+```
+
+角标照样显示 ON（那是 `chrome.storage.local` 的本地状态，跟连接无关），
+体感就是"开关开着但没反应"。更坑的是**这个失败在服务端日志里完全看不见**：
+预检通过之前真实请求根本没发出，`handle_conn` 一次都没被调用。
+
+命令行 `curl`/`Invoke-RestMethod` 测不出来，因为它们不做 CORS 检查 —— 这也
+是为什么我先前那轮"全链路验证"全绿却仍然是坏的。
+
+#### 13.25.3 修法
+
+`write_resp()` 现在把允许头改成两段拼接：
+
+1. 固定兜底：`content-type, x-adl-token, x-adl-client`；
+2. **回显浏览器预检里自报的 `Access-Control-Request-Headers`**（小写归一、
+   去重）。
+
+第 2 条让扩展以后再加请求头时不用同步改桌面端。回显前过滤字符集
+（`is_ascii_alphanumeric` / `-` / `_`、长度 ≤ 64），因为响应头里混进 CR/LF
+会被解析成新的头——那是一个注入面。
+
+顺带补了三个头：
+
+- `Access-Control-Max-Age: 600` —— 预检结果缓存 10 分钟，省掉每 30 秒问一次
+  策略时的额外往返。
+- `Access-Control-Allow-Private-Network: true` —— Chromium 的 Private Network
+  Access：公网页面/扩展访问 `127.0.0.1` 时（PNA 全面启用后）需要这个头，
+  否则本地接口会被当成"私有网络请求"拦掉。现在不启用，先写着无害。
+- `Vary: Origin, Access-Control-Request-Headers` —— 响应内容跟着这两个请求头
+  变，不能被中间层缓存成一份复用。
+
+单测钉住三条（`crates/adl-gui/src/api_server.rs` 的 `mod tests`）：
+`allow_headers_covers_extension_custom_header`（回归钉）、
+`allow_headers_echoes_preflight_request`、`allow_headers_rejects_illegal_names`。
+
+#### 13.25.4 复用教训
+
+- **浏览器扩展 + 本地 HTTP 服务的任何"连不上"，先抓预检。** 判据不是"curl
+  能通"，而是"预检响应的 `Allow-Headers` 覆盖了请求里所有非 safelisted 头"。
+- 非 safelisted 头包括：任何 `x-*`、以及 `content-type` 只要不是
+  `text/plain` / `application/x-www-form-urlencoded` / `multipart/form-data`。
+  `application/json` 就是非 safelisted —— 所以发 JSON 也一定触发预检。
+- 桌面端看不到请求 = 预检就被拒了，不是"扩展没发"。这两个方向的排查成本差了
+  一个数量级，先看预检。
+
+### 13.26 待续
 
 - macOS / Linux 的**真机**构建验证仍未做（本机只有 Windows；M 芯片 Mac 无法在本机测）。
   交叉编译也不能替代：`eframe` 的 glow/wgpu 后端要链接平台图形库。

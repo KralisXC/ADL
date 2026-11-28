@@ -371,7 +371,42 @@ fn handle_conn(
         _ => (404, json!({"ok": false, "error": "not found"}).to_string()),
     };
 
-    write_resp(&mut stream, status, &body, &origin)
+    write_resp(&mut stream, status, &body, &origin, &req.headers)
+}
+
+/// 允许的请求头。
+///
+/// 原先这里是写死的 `content-type, x-adl-token`，扩展又额外带了
+/// `X-ADL-Client`（`background.js:72`）→ 预检时浏览器发现允许列表里没有它，
+/// **真实请求根本不发**，扩展侧 `fetch` 直接抛 TypeError。桌面端日志里一片
+/// 安静，看起来像"扩展没连上"，实际是 CORS 把请求掐了（用户 m26472）。
+///
+/// 现在的策略是**以浏览器预检里自报的 `Access-Control-Request-Headers` 为准
+/// 原样回显**：浏览器只会问它这次真要发的头，回显必然覆盖；我们额外再兜一个
+/// 固定列表，防止某些客户端不发 `Access-Control-Request-Headers`。
+fn allow_headers_for(req_headers: &HashMap<String, String>) -> String {
+    let mut out: Vec<String> = vec![
+        "content-type".into(),
+        "x-adl-token".into(),
+        "x-adl-client".into(),
+    ];
+    if let Some(asked) = req_headers.get("access-control-request-headers") {
+        for name in asked.split(',') {
+            let name = name.trim().to_ascii_lowercase();
+            // 只回显合法的头名，避免把请求里的奇怪字节原样塞回响应头
+            // （响应头里出现 CR/LF 会被当成头结束，属于注入面）。
+            if !name.is_empty()
+                && name.len() <= 64
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                && !out.iter().any(|x| *x == name)
+            {
+                out.push(name);
+            }
+        }
+    }
+    out.join(", ")
 }
 
 fn write_resp(
@@ -379,6 +414,7 @@ fn write_resp(
     status: u16,
     body: &str,
     origin: &str,
+    req_headers: &HashMap<String, String>,
 ) -> std::io::Result<()> {
     let reason = match status {
         200 => "OK",
@@ -395,13 +431,23 @@ fn write_resp(
     } else {
         "*".to_string()
     };
+    let allow_headers = allow_headers_for(req_headers);
+    let vary = if origin.is_empty() {
+        "X-ADL-Client"
+    } else {
+        // 响应内容/可放行的头都跟着请求走，中间不能缓存成一份。
+        "Origin, Access-Control-Request-Headers"
+    };
     let head = format!(
         "HTTP/1.1 {status} {reason}\r\n\
          Content-Type: application/json; charset=utf-8\r\n\
          Content-Length: {}\r\n\
          Access-Control-Allow-Origin: {acao}\r\n\
-         Access-Control-Allow-Headers: content-type, x-adl-token\r\n\
+         Access-Control-Allow-Headers: {allow_headers}\r\n\
          Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+         Access-Control-Allow-Private-Network: true\r\n\
+         Access-Control-Max-Age: 600\r\n\
+         Vary: {vary}\r\n\
          X-Content-Type-Options: nosniff\r\n\
          Connection: close\r\n\r\n",
         body.as_bytes().len()
@@ -412,4 +458,47 @@ fn write_resp(
     }
     stream.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hdr(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// 用户 m26472：「插件 on 了下载没弹软件的」—— 根因就是允许头列表没带
+    /// `x-adl-client`，浏览器把真实请求掐掉。这条测试钉住这个回归。
+    #[test]
+    fn allow_headers_covers_extension_custom_header() {
+        let got = allow_headers_for(&hdr(&[]));
+        assert!(got.contains("x-adl-client"), "got: {got}");
+        assert!(got.contains("x-adl-token"), "got: {got}");
+        assert!(got.contains("content-type"), "got: {got}");
+    }
+
+    /// 浏览器预检里自报的头要原样回显（大小写归一），这样扩展以后再加头
+    /// 也不用改桌面端。
+    #[test]
+    fn allow_headers_echoes_preflight_request() {
+        let got = allow_headers_for(&hdr(&[("access-control-request-headers", "X-Foo, x-bar")]));
+        assert!(got.contains("x-foo"), "got: {got}");
+        assert!(got.contains("x-bar"), "got: {got}");
+    }
+
+    /// 回显只限合法头名：响应头里混进 CR/LF 会被解析成新的头（注入面）。
+    #[test]
+    fn allow_headers_rejects_illegal_names() {
+        let got = allow_headers_for(&hdr(&[(
+            "access-control-request-headers",
+            "ok-one, bad\r\nInjected: 1, ," ,
+        )]));
+        assert!(got.contains("ok-one"), "got: {got}");
+        assert!(!got.contains("Injected"), "got: {got}");
+        assert!(!got.contains('\r') && !got.contains('\n'), "got: {got:?}");
+    }
 }
